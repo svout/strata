@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Each language step runs only once that service has its project file,
+# so the workflow passes on the empty skeleton and tightens as code lands.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint workflows (actionlint)
+        uses: docker://rhysd/actionlint:1.7.7
+        with:
+          args: -color
+
+      - name: Set up Go
+        if: hashFiles('gateway/go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: gateway/go.mod
+      - name: Lint Go (golangci-lint)
+        if: hashFiles('gateway/go.mod') != ''
+        uses: golangci/golangci-lint-action@v8
+        with:
+          working-directory: gateway
+
+      - name: Lint Python (ruff)
+        if: hashFiles('control-plane/pyproject.toml', 'harness/pyproject.toml') != ''
+        uses: astral-sh/ruff-action@v3
+
+      - name: Set up pnpm
+        if: hashFiles('console/package.json') != ''
+        uses: pnpm/action-setup@v4
+      - name: Lint console
+        if: hashFiles('console/package.json') != ''
+        working-directory: console
+        run: pnpm install --frozen-lockfile && pnpm lint
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        if: hashFiles('gateway/go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: gateway/go.mod
+      - name: Test gateway
+        if: hashFiles('gateway/go.mod') != ''
+        working-directory: gateway
+        run: go test ./...
+
+      - name: Set up uv
+        if: hashFiles('control-plane/pyproject.toml', 'harness/pyproject.toml') != ''
+        uses: astral-sh/setup-uv@v6
+      - name: Test Python services
+        if: hashFiles('control-plane/pyproject.toml', 'harness/pyproject.toml') != ''
+        run: |
+          for svc in control-plane harness; do
+            [ -f "$svc/pyproject.toml" ] || continue
+            (cd "$svc" && uv run pytest) || [ $? -eq 5 ]  # 5 = no tests collected
+          done
+
+      - name: Set up pnpm
+        if: hashFiles('console/package.json') != ''
+        uses: pnpm/action-setup@v4
+      - name: Test console
+        if: hashFiles('console/package.json') != ''
+        working-directory: console
+        run: pnpm install --frozen-lockfile && pnpm test
+
+      - name: Summary
+        run: |
+          {
+            echo "### Test job"
+            for f in gateway/go.mod control-plane/pyproject.toml harness/pyproject.toml console/package.json; do
+              if [ -f "$f" ]; then echo "- $f: tested"; else echo "- $f: not scaffolded yet (skipped)"; fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
