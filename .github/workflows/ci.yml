@@ -10,10 +10,13 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded PR runs; never cancel runs on main.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Each language step runs only once that service has its project file,
 # so the workflow passes on the empty skeleton and tightens as code lands.
+# TODO: switch the run steps to `make lint` / `make test` once the Makefile lands
+# (Reuse Registry: Make targets are the only entry points).
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -36,14 +39,26 @@ jobs:
         uses: golangci/golangci-lint-action@v8
         with:
           working-directory: gateway
+          version: v2.1.6
 
       - name: Lint Python (ruff)
         if: hashFiles('control-plane/pyproject.toml', 'harness/pyproject.toml') != ''
         uses: astral-sh/ruff-action@v3
+        with:
+          src: control-plane harness
 
       - name: Set up pnpm
         if: hashFiles('console/package.json') != ''
         uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - name: Set up Node
+        if: hashFiles('console/package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: console/pnpm-lock.yaml
       - name: Lint console
         if: hashFiles('console/package.json') != ''
         working-directory: console
@@ -79,6 +94,15 @@ jobs:
       - name: Set up pnpm
         if: hashFiles('console/package.json') != ''
         uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - name: Set up Node
+        if: hashFiles('console/package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: console/pnpm-lock.yaml
       - name: Test console
         if: hashFiles('console/package.json') != ''
         working-directory: console
