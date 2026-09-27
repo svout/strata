@@ -1,0 +1,44 @@
+# AgentGate
+
+A mandate enforcement and risk gateway for AI agent payments. Final year project; the dissertation argues that enforcement at this layer catches what the agentic payment protocols leave open, and measures what it costs.
+
+## Where context lives
+- **VAULT** = the Strata Obsidian vault, added as a directory (path in `$STRATA_VAULT`, set in `.claude/settings.local.json`). It owns planning: phases, specs, ADRs, Reuse Registry, logs. The repo owns code.
+- The vault is the memory: a hook loads its Now block and last Session Log entry at session start; `/wrap-up` updates it at the end of every step. A `[strata]` reminder means work is unrecorded.
+- Start every session with `/next-step`. It reads the **Now** block in `VAULT/Home.md`.
+- Load context in this order, stopping when you have enough: Now block → current spec → its phase note → the relevant rows of `VAULT/Workflow/Reuse Registry.md` → the files the plan names.
+- `docs/specs/` and `docs/adr/` are read-only exports from the vault, stamped with a hash. Edit the vault note and run `make export-docs`; never edit the export.
+
+## Process (one session = one step = one ≤1-day subtask)
+`/next-step` → `/spec` (if no approved spec) → `/plan-step` → build → `/verify` → `/review-step` → `/wrap-up` → `/clear`.
+Procedure: `VAULT/Workflow/Step Loop.md`. Principles: `VAULT/Workflow/Development Operating System.md`.
+
+## Architecture
+- `gateway/` — Go. The hot path: RFC 9421 signature → mandate chain → policy → risk score → decision → audit → rail.
+- `control-plane/` — Python (FastAPI). Policies, agent and merchant registry, keys, model training and ONNX export. Never on the hot path.
+- `console/` — Next.js + TypeScript. Operator view: decisions, reason codes, mandate explorer, dispute replay.
+- `harness/` — Python. Benign agent traffic, the eight attack scenarios, results generation.
+- Postgres (ledger + audit chain), Redis (velocity, nonces, idempotency), Redpanda (decision events).
+
+## Commands
+`make dev` · `make test` · `make lint` · `make bench` (k6) · `make attack` (scenario suite) · `make demo` · `make export-docs` · `make migrate`
+Scoped while building: `go test ./internal/<pkg> -run <Test>` · `uv run pytest <path>::<test>` · `pnpm --filter console vitest related <file>`
+
+## Rules that decide reviews
+- **Fail closed on authorisation, degrade on scoring.** An unverifiable signature or mandate is rejected. A scoring failure falls back to rules and marks the decision `degraded` — never a silent allow.
+- Protocol formats (AP2, ACP, Visa TAP) are known **only** inside `internal/mandate`. Everything downstream sees the canonical mandate type.
+- Every decision carries reason codes. No bare scores, no unexplained blocks.
+- Every state-changing endpoint is idempotent; every money movement is double-entry and sums to zero.
+- Audit records are written in the same transaction as the decision, chained to the previous hash. Never log instead of chaining.
+- Features are defined once in `control-plane/ml/features.py` and mirrored in Go, with parity tests. A feature added on one side only is a bug.
+- No secrets, tokens, mandate bodies or personal data in logs — log IDs and digests.
+- No real payment credentials or personal data anywhere. Sandbox and synthetic only.
+
+## Performance budgets (the dissertation's cost claim)
+Signature 2 ms · mandate 3 ms · policy 4 ms · scoring 8 ms · decision+audit 5 ms · **total added p99 < 25 ms** at 200 rps. A change that breaks a budget is not done; measure with `make bench` before claiming otherwise.
+
+## Stop and ask a human when
+Acceptance criteria are unclear; the change touches a Registry interface, crypto, or the audit chain format; a new dependency is needed; an ADR-worthy decision appears; the step is bigger than one day.
+
+## Commits
+Conventional Commits, one per step, with the spec ID: `feat(gateway): verify cart mandate against intent [SPEC-004]`.
