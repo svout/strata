@@ -1,9 +1,12 @@
 package httpx
 
 import (
+	"context"
+	"crypto/rand"
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -14,7 +17,7 @@ import (
 // payment API on it; for now it serves only /healthz.
 func NewRouter(log *slog.Logger) http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
+	r.Use(requestID)
 	r.Use(requestLog(log))
 	r.Use(middleware.Recoverer)
 
@@ -45,8 +48,37 @@ func requestLog(log *slog.Logger) func(http.Handler) http.Handler {
 				slog.String("path", r.URL.Path),
 				slog.Int("status", ww.Status()),
 				slog.Duration("duration", time.Since(start)),
-				slog.String("request_id", middleware.GetReqID(r.Context())),
+				slog.String("request_id", RequestID(r.Context())),
 			)
 		})
 	}
+}
+
+// RequestIDHeader carries the request ID in and out.
+const RequestIDHeader = "X-Request-Id"
+
+// validRequestID bounds what an inbound X-Request-Id may contain, so a caller
+// can't inject log lines or oversized values. Anything else is replaced.
+var validRequestID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+type requestIDKey struct{}
+
+// requestID keeps a well-formed inbound X-Request-Id or generates a random
+// one (128 bits, no hostname or counter), stores it in the context and echoes
+// it in the response header.
+func requestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get(RequestIDHeader)
+		if !validRequestID.MatchString(id) {
+			id = rand.Text()
+		}
+		w.Header().Set(RequestIDHeader, id)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDKey{}, id)))
+	})
+}
+
+// RequestID returns the request ID stored by the router, or "" outside a request.
+func RequestID(ctx context.Context) string {
+	id, _ := ctx.Value(requestIDKey{}).(string)
+	return id
 }
