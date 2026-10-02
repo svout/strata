@@ -8,19 +8,28 @@ SHELL := bash
 
 PY_SERVICES := control-plane harness
 
-# Go toolchain for gateway lint and tests. Pinned so local runs match CI
-# (setup-go installs the same version) and so golangci-lint v2.1.6 can load
-# packages: it cannot type-check against much newer Go releases. Go downloads
-# this toolchain on first use if it isn't installed.
-GO_TOOLCHAIN ?= go1.23.12
+# Versions (ADR-116), one source each:
+#   Go            → the `go` line of gateway/go.mod (CI reads it via go-version-file)
+#   golangci-lint → GOLANGCI_LINT_VERSION below (CI installs it via `make install-lint`)
+GO_TOOLCHAIN := go$(shell awk '/^go /{print $$2}' gateway/go.mod 2>/dev/null)
+GOLANGCI_LINT_VERSION ?= v2.14.0
 
-.PHONY: help lint test dev
+.PHONY: help install-lint lint test dev
 
 help: ## List the make targets
-	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
+	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-13s %s\n", $$1, $$2}'
+
+install-lint: ## Install the pinned golangci-lint, built with the pinned Go
+	GOTOOLCHAIN=$(GO_TOOLCHAIN) go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 lint: ## Lint every scaffolded service
-	@if [ -f gateway/go.mod ]; then echo "== gateway"; (cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) golangci-lint run ./...); fi
+	@if [ -f gateway/go.mod ]; then \
+	  have=$$(golangci-lint version --short 2>/dev/null || echo none); \
+	  if [ "$$have" != "$(GOLANGCI_LINT_VERSION:v%=%)" ]; then \
+	    echo "golangci-lint $$have installed, $(GOLANGCI_LINT_VERSION) required: run make install-lint" >&2; exit 1; \
+	  fi; \
+	  echo "== gateway"; (cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) golangci-lint run ./...); \
+	fi
 	@for s in $(PY_SERVICES); do \
 	  if [ -f $$s/pyproject.toml ]; then echo "== $$s"; (cd $$s && uv run ruff check .); fi; \
 	done
@@ -35,4 +44,4 @@ test: ## Run every scaffolded service's tests
 
 dev: ## Run the gateway locally (the compose stack arrives in SPEC-002 subtask 3)
 	@echo "Compose stack (PostgreSQL 16, Redis 7) comes with SPEC-002 subtask 3; running the gateway alone."
-	cd gateway && go run ./cmd/gateway
+	cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) go run ./cmd/gateway

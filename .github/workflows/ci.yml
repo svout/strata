@@ -33,14 +33,13 @@ jobs:
         if: hashFiles('gateway/go.mod') != ''
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23.12" # keep in step with GO_TOOLCHAIN in the Makefile
+          go-version-file: gateway/go.mod # the single Go version (ADR-116)
           cache-dependency-path: gateway/go.sum
       - name: Install golangci-lint
         if: hashFiles('gateway/go.mod') != ''
-        # Same install as local (Technology Choices: golangci-lint v2.1.6);
-        # `make lint` runs it, so the action's own runner isn't used.
+        # Version comes from the Makefile (ADR-116); same install as local.
         run: |
-          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.1.6
+          make install-lint
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Set up uv
@@ -73,7 +72,7 @@ jobs:
         if: hashFiles('gateway/go.mod') != ''
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23.12" # keep in step with GO_TOOLCHAIN in the Makefile
+          go-version-file: gateway/go.mod # the single Go version (ADR-116)
           cache-dependency-path: gateway/go.sum
 
       - name: Set up uv
@@ -97,6 +96,7 @@ jobs:
         run: make test
 
       - name: Summary
+        if: always()
         run: |
           {
             echo "### Test job"
