@@ -15,8 +15,8 @@ concurrency:
 
 # Each language step runs only once that service has its project file,
 # so the workflow passes on the empty skeleton and tightens as code lands.
-# TODO: switch the run steps to `make lint` / `make test` once the Makefile lands
-# (Reuse Registry: Make targets are the only entry points).
+# The jobs only install toolchains; `make lint` / `make test` are the entry
+# points, the same commands developers run locally (Reuse Registry).
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -33,19 +33,19 @@ jobs:
         if: hashFiles('gateway/go.mod') != ''
         uses: actions/setup-go@v5
         with:
-          go-version-file: gateway/go.mod
-      - name: Lint Go (golangci-lint)
+          go-version: "1.23.12" # keep in step with GO_TOOLCHAIN in the Makefile
+          cache-dependency-path: gateway/go.sum
+      - name: Install golangci-lint
         if: hashFiles('gateway/go.mod') != ''
-        uses: golangci/golangci-lint-action@v8
-        with:
-          working-directory: gateway
-          version: v2.1.6
+        # Same install as local (Technology Choices: golangci-lint v2.1.6);
+        # `make lint` runs it, so the action's own runner isn't used.
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.1.6
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-      - name: Lint Python (ruff)
+      - name: Set up uv
         if: hashFiles('control-plane/pyproject.toml', 'harness/pyproject.toml') != ''
-        uses: astral-sh/ruff-action@v3
-        with:
-          src: control-plane harness
+        uses: astral-sh/setup-uv@v6
 
       - name: Set up pnpm
         if: hashFiles('console/package.json') != ''
@@ -59,10 +59,9 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: console/pnpm-lock.yaml
-      - name: Lint console
-        if: hashFiles('console/package.json') != ''
-        working-directory: console
-        run: pnpm install --frozen-lockfile && pnpm lint
+
+      - name: Lint (make lint)
+        run: make lint
 
   test:
     runs-on: ubuntu-latest
@@ -74,22 +73,12 @@ jobs:
         if: hashFiles('gateway/go.mod') != ''
         uses: actions/setup-go@v5
         with:
-          go-version-file: gateway/go.mod
-      - name: Test gateway
-        if: hashFiles('gateway/go.mod') != ''
-        working-directory: gateway
-        run: go test ./...
+          go-version: "1.23.12" # keep in step with GO_TOOLCHAIN in the Makefile
+          cache-dependency-path: gateway/go.sum
 
       - name: Set up uv
         if: hashFiles('control-plane/pyproject.toml', 'harness/pyproject.toml') != ''
         uses: astral-sh/setup-uv@v6
-      - name: Test Python services
-        if: hashFiles('control-plane/pyproject.toml', 'harness/pyproject.toml') != ''
-        run: |
-          for svc in control-plane harness; do
-            [ -f "$svc/pyproject.toml" ] || continue
-            (cd "$svc" && uv run pytest) || [ $? -eq 5 ]  # 5 = no tests collected
-          done
 
       - name: Set up pnpm
         if: hashFiles('console/package.json') != ''
@@ -103,10 +92,9 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: console/pnpm-lock.yaml
-      - name: Test console
-        if: hashFiles('console/package.json') != ''
-        working-directory: console
-        run: pnpm install --frozen-lockfile && pnpm test
+
+      - name: Test (make test)
+        run: make test
 
       - name: Summary
         run: |
