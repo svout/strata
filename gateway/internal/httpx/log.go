@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"reflect"
 	"strings"
 	"unicode"
 )
@@ -55,21 +56,22 @@ func (h *redactHandler) Enabled(ctx context.Context, lvl slog.Level) bool {
 func (h *redactHandler) Handle(ctx context.Context, r slog.Record) error {
 	out := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
 	r.Attrs(func(a slog.Attr) bool {
-		out.AddAttrs(sanitize(a, h.redactAll))
+		if c, ok := sanitize(a, h.redactAll); ok {
+			out.AddAttrs(c)
+		}
 		return true
 	})
 	return h.inner.Handle(ctx, out)
 }
 
 func (h *redactHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	clean := make([]slog.Attr, len(attrs))
-	for i, a := range attrs {
-		clean[i] = sanitize(a, h.redactAll)
-	}
-	return &redactHandler{inner: h.inner.WithAttrs(clean), redactAll: h.redactAll}
+	return &redactHandler{inner: h.inner.WithAttrs(sanitizeAll(attrs, h.redactAll)), redactAll: h.redactAll}
 }
 
 func (h *redactHandler) WithGroup(name string) slog.Handler {
+	if name == "" {
+		return h // slog.Handler contract: WithGroup("") returns the receiver
+	}
 	return &redactHandler{inner: h.inner.WithGroup(name), redactAll: h.redactAll || isSensitive(name)}
 }
 
@@ -77,27 +79,65 @@ func (h *redactHandler) WithGroup(name string) slog.Handler {
 // values: maps, structs and slices log as "[OMITTED <type>]". A type that
 // must be logged should implement slog.LogValuer, which resolves to a group and
 // is then redacted key by key. Errors log their message.
-func sanitize(a slog.Attr, redactAll bool) slog.Attr {
+//
+// It follows the slog.Handler contract: ok is false for an empty Attr and for
+// a group with no members, and a group with an empty key is inlined, so its
+// members are cleaned under the parent's redactAll rather than replaced whole.
+func sanitize(a slog.Attr, redactAll bool) (_ slog.Attr, ok bool) {
 	a.Value = a.Value.Resolve()
+	if a.Equal(slog.Attr{}) {
+		return a, false
+	}
+	if a.Key == "" && a.Value.Kind() == slog.KindGroup {
+		return groupAttr("", sanitizeAll(a.Value.Group(), redactAll))
+	}
 	if redactAll || isSensitive(a.Key) {
-		return slog.String(a.Key, redacted)
+		return slog.String(a.Key, redacted), true
 	}
 	switch a.Value.Kind() {
 	case slog.KindGroup:
-		members := a.Value.Group()
-		clean := make([]slog.Attr, len(members))
-		for i, m := range members {
-			clean[i] = sanitize(m, false)
-		}
-		return slog.Attr{Key: a.Key, Value: slog.GroupValue(clean...)}
+		return groupAttr(a.Key, sanitizeAll(a.Value.Group(), false))
 	case slog.KindAny:
-		if err, ok := a.Value.Any().(error); ok {
-			return slog.String(a.Key, err.Error())
+		if err, isErr := a.Value.Any().(error); isErr {
+			return slog.String(a.Key, errorText(err)), true
 		}
-		return slog.String(a.Key, fmt.Sprintf("[OMITTED %T]", a.Value.Any()))
+		return slog.String(a.Key, fmt.Sprintf("[OMITTED %T]", a.Value.Any())), true
 	default:
-		return a
+		return a, true
 	}
+}
+
+func sanitizeAll(attrs []slog.Attr, redactAll bool) []slog.Attr {
+	clean := make([]slog.Attr, 0, len(attrs))
+	for _, a := range attrs {
+		if c, ok := sanitize(a, redactAll); ok {
+			clean = append(clean, c)
+		}
+	}
+	return clean
+}
+
+func groupAttr(key string, members []slog.Attr) (slog.Attr, bool) {
+	if len(members) == 0 {
+		return slog.Attr{}, false
+	}
+	return slog.Attr{Key: key, Value: slog.GroupValue(members...)}, true
+}
+
+// errorText returns err.Error() without letting a broken error take the
+// logger down: a typed-nil pointer logs "<nil>" (as slog's own handlers do),
+// and any other panic in Error() logs a fixed marker, never the panic value.
+func errorText(err error) (s string) {
+	defer func() {
+		if recover() != nil {
+			if v := reflect.ValueOf(err); v.Kind() == reflect.Pointer && v.IsNil() {
+				s = "<nil>"
+			} else {
+				s = "[error text unavailable: Error() panicked]"
+			}
+		}
+	}()
+	return err.Error()
 }
 
 func isSensitive(key string) bool {

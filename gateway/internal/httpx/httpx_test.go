@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
+	"testing/slogtest"
 )
 
 func TestHealthz_ReturnsOK(t *testing.T) {
@@ -168,8 +170,8 @@ func TestRequestID_GeneratedWhenAbsent(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 		id := rec.Header().Get(RequestIDHeader)
-		if len(id) != 26 {
-			t.Fatalf("generated id %q: want 26 chars", id)
+		if !generatedID.MatchString(id) {
+			t.Fatalf("generated id %q: want >= 26 base32 chars", id)
 		}
 		if host != "" && strings.Contains(id, host) {
 			t.Fatalf("id %q contains hostname", id)
@@ -208,8 +210,80 @@ func TestRequestID_InboundValidation(t *testing.T) {
 		if tt.keep && got != tt.in {
 			t.Errorf("inbound %q: got %q, want it kept", tt.in, got)
 		}
-		if !tt.keep && (got == tt.in || len(got) != 26) {
+		if !tt.keep && (got == tt.in || !generatedID.MatchString(got)) {
 			t.Errorf("inbound %q: got %q, want a generated id", tt.in, got)
 		}
+	}
+}
+
+// rand.Text documents "at least 128 bits" of base32, not an exact length.
+var generatedID = regexp.MustCompile(`^[A-Z2-7]{26,}$`)
+
+type nilErr struct{ msg string }
+
+func (e *nilErr) Error() string { return e.msg } // dereferences: panics on a typed nil
+
+type panicErr struct{}
+
+func (panicErr) Error() string { panic("boom: sk_live_secret") }
+
+func TestLogger_BrokenErrorsDoNotPanic(t *testing.T) {
+	var buf bytes.Buffer
+	log := NewLogger(&buf, slog.LevelInfo)
+
+	var typedNil *nilErr
+	log.Info("errs", slog.Any("nil_err", error(typedNil)), slog.Any("bad_err", panicErr{}))
+
+	out := buf.String()
+	if !strings.Contains(out, `"nil_err":"<nil>"`) {
+		t.Errorf("typed-nil error not logged as <nil>:\n%s", out)
+	}
+	if !strings.Contains(out, `"bad_err":"[error text unavailable: Error() panicked]"`) || strings.Contains(out, "sk_live_secret") {
+		t.Errorf("panicking Error() not contained:\n%s", out)
+	}
+}
+
+func TestLogger_EmptyAttrsAndInlineGroups(t *testing.T) {
+	var buf bytes.Buffer
+	log := NewLogger(&buf, slog.LevelInfo)
+
+	log.Info("empty", slog.Attr{}, slog.Group("g"), slog.String("k", "v"))
+	log.WithGroup("auth").With(slog.Group("", slog.String("a", "x"))).Info("inline", slog.Group("", slog.String("b", "y")))
+	log.Info("inline-ok", slog.Group("", slog.String("c", "z"), slog.String("api_key", "s3")))
+
+	out := buf.String()
+	for _, bad := range []string{`"":`, `"g":`, "OMITTED <nil>", "s3"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("unexpected %s in:\n%s", bad, out)
+		}
+	}
+	for _, want := range []string{`"k":"v"`, `"auth":{"a":"[REDACTED]","b":"[REDACTED]"}`, `"c":"z"`, `"api_key":"[REDACTED]"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %s in:\n%s", want, out)
+		}
+	}
+}
+
+// The standard handler conformance suite. Attribute values used by slogtest
+// are scalars, so the [OMITTED] policy for non-scalar Any doesn't interfere.
+func TestRedactHandler_Slogtest(t *testing.T) {
+	var buf bytes.Buffer
+	h := NewLogger(&buf, slog.LevelDebug).Handler()
+	results := func() []map[string]any {
+		var ms []map[string]any
+		for _, line := range bytes.Split(buf.Bytes(), []byte{'\n'}) {
+			if len(line) == 0 {
+				continue
+			}
+			var m map[string]any
+			if err := json.Unmarshal(line, &m); err != nil {
+				t.Fatal(err)
+			}
+			ms = append(ms, m)
+		}
+		return ms
+	}
+	if err := slogtest.TestHandler(h, results); err != nil {
+		t.Fatal(err)
 	}
 }
