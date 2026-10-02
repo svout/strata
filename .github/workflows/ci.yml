@@ -37,10 +37,11 @@ jobs:
           cache-dependency-path: gateway/go.sum
       - name: Install golangci-lint
         if: hashFiles('gateway/go.mod') != ''
-        uses: golangci/golangci-lint-action@v8
-        with:
-          install-only: true
-          version: v2.1.6
+        # Same install as local (Technology Choices: golangci-lint v2.1.6);
+        # `make lint` runs it, so the action's own runner isn't used.
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.1.6
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Set up uv
         if: hashFiles('control-plane/pyproject.toml', 'harness/pyproject.toml') != ''
