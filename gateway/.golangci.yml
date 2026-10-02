@@ -1,0 +1,23 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose
+    - errorlint
+    - gosec
+  # errcheck, govet, ineffassign, staticcheck and unused are on by default.
+  exclusions:
+    rules:
+      # Tests use deliberately fake secrets (e.g. the log-redaction test).
+      - path: _test\.go
+        linters: [gosec]
+        text: G101
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/svout/agentgate
