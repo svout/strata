@@ -14,7 +14,13 @@ PY_SERVICES := control-plane harness
 GO_TOOLCHAIN := go$(shell awk '/^go /{print $$2}' gateway/go.mod 2>/dev/null)
 GOLANGCI_LINT_VERSION ?= v2.14.0
 
-.PHONY: help install-lint lint test dev export-docs check-docs
+# Local stack (SPEC-002/3b). Compose interpolates GO_VERSION for the gateway
+# image build on every command (even `down` and `config`), so export it.
+GO_VERSION := $(GO_TOOLCHAIN:go%=%)
+export GO_VERSION
+COMPOSE := docker compose -f infra/compose/compose.yml
+
+.PHONY: help install-lint lint test dev dev-down export-docs check-docs
 
 help: ## List the make targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-13s %s\n", $$1, $$2}'
@@ -35,6 +41,11 @@ lint: ## Lint every scaffolded service
 	done
 	@if [ -f console/package.json ]; then echo "== console"; (cd console && pnpm install --frozen-lockfile && pnpm lint); fi
 	@echo "== scripts"; python3 -m py_compile scripts/*.py
+	@if [ -f infra/compose/compose.yml ]; then \
+	  echo "== compose"; \
+	  command -v docker >/dev/null || { echo "docker CLI not found: needed to validate infra/compose/compose.yml" >&2; exit 1; }; \
+	  $(COMPOSE) config -q; \
+	fi
 	@$(MAKE) --no-print-directory check-docs
 
 test: ## Run every scaffolded service's tests
@@ -45,9 +56,18 @@ test: ## Run every scaffolded service's tests
 	@if [ -f console/package.json ]; then echo "== console"; (cd console && pnpm install --frozen-lockfile && pnpm test); fi
 	@echo "== scripts"; python3 -m unittest discover -s scripts -p 'test_*.py'
 
-dev: ## Run the gateway locally (the compose stack arrives in SPEC-002 subtask 3)
-	@echo "Compose stack (PostgreSQL 16, Redis 7) comes with SPEC-002 subtask 3; running the gateway alone."
-	cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) go run ./cmd/gateway
+dev: ## Start the local stack (gateway, PostgreSQL 16, Redis 7) and wait until /readyz is 200
+	@docker info >/dev/null 2>&1 || { echo "Docker is not running: start Docker Desktop" >&2; exit 1; }
+	$(COMPOSE) up -d --build --wait --wait-timeout 120
+	@for i in $$(seq 30); do \
+	  if curl -fsS http://127.0.0.1:8080/readyz; then echo; exit 0; fi; \
+	  sleep 1; \
+	done; \
+	curl -sS http://127.0.0.1:8080/readyz >&2 || true; \
+	echo "gateway not ready after 30 s; see: $(COMPOSE) logs gateway" >&2; exit 1
+
+dev-down: ## Stop the local stack (keeps the pgdata volume)
+	$(COMPOSE) down
 
 export-docs: ## Export vault specs into docs/specs (one-way, ADR-107; needs STRATA_VAULT)
 	@python3 scripts/export_docs.py export
