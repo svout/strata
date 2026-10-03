@@ -1,0 +1,8 @@
+# Deny by default, so .env files, bin/ and coverage output can never reach the
+# image. Whitelist only what the build needs. When the ONNX model lands (P4),
+# add `!models/**` here.
+*
+!go.mod
+!go.sum
+!cmd/**
+!internal/**

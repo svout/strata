@@ -1,0 +1,56 @@
+# Local development stack (SPEC-002/3b). Run it with `make dev`, stop it with
+# `make dev-down`. All ports bind to 127.0.0.1 only.
+#
+# The credentials below are DEV-ONLY placeholders for a throwaway local
+# database: they are not secrets and must never be reused anywhere else.
+name: agentgate
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agentgate      # dev-only
+      POSTGRES_PASSWORD: agentgate  # dev-only
+      POSTGRES_DB: agentgate
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "agentgate", "-d", "agentgate"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  gateway:
+    build:
+      context: ../../gateway
+      args:
+        GO_VERSION: "${GO_VERSION:?run via make dev, which sets GO_VERSION from gateway/go.mod}"
+    environment:
+      GATEWAY_ADDR: ":8080"
+      LOG_LEVEL: info
+      DATABASE_URL: "postgres://agentgate:agentgate@postgres:5432/agentgate?sslmode=disable"  # dev-only
+      REDIS_ADDR: "redis:6379"
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # No healthcheck: the distroless image has no shell or curl. `make dev`
+    # polls /readyz from the host instead.
+
+volumes:
+  pgdata: {}

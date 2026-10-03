@@ -12,7 +12,7 @@ adr:
   - ADR-115
 created: 2026-10-03
 ---
-<!-- DO NOT EDIT: exported from vault "Specs/SPEC-002 Payment Core and Ledger.md" by make export-docs | source-sha256: 2e278abb908d8c30e930b904a4fcb3bc2667b3d2660216c6b603c6d6cd5cc339 | content-sha256: a2b61e6add0554607fb0f9cace971f3f6730cad94edee68ba8902e168dcf6919 -->
+<!-- DO NOT EDIT: exported from vault "Specs/SPEC-002 Payment Core and Ledger.md" by make export-docs | source-sha256: 82c6d1a69fdad419db64327dc52f809d388eff14d423eb9303d02bc602b628ae | content-sha256: 47ed5f42d21cba3d6bd478d1d03b7f763cf92b6d0c0e03bdcca15cd792b3049e -->
 
 # SPEC-002 Payment Core and Ledger
 
@@ -108,7 +108,7 @@ Each takes at most a day, fits one session and leaves `make test` green. Under A
   - **Small fixes:** write the BOM as `\ufeff` (not an invisible literal); the src-mismatch refusal says "delete it if the old source was renamed" instead of "move your change into the vault note".
   - **Tests:** the warning (code span split across lines), a U+2028 line, lone CR, tilde fence and a backtick info string, the existing export of a collision-blocked note not reported as an orphan, and a hand-edited orphan.
   - Touches `scripts/export_docs.py`, `scripts/test_export_docs.py`.
-- [ ] 3a. **Readiness (Go).** Split from 3 at planning (2026-10-03, Ivan); no Docker needed.
+- [x] 3a. **Readiness (Go).** *(PR #9, c976cc4, main 89251e6, CI green, 2026-10-03)* Split from 3 at planning (2026-10-03, Ivan); no Docker needed.
   - `internal/httpx`: `ReadyCheck{Name, Check}`; `NewRouter(log, checks ...ReadyCheck)` (additive Registry change, approved). `/readyz` runs checks in parallel with a 1 s timeout each: 200 `ready` or 503 `not_ready` with `ok`/`fail`/`timeout` per check. Error text never goes in the response or the log.
   - `internal/config`: `DATABASE_URL` required (`ErrMissingDatabaseURL`); `REDIS_ADDR` defaults to `localhost:6379`; config never logged.
   - `cmd/gateway`: lazy `pgxpool` and go-redis clients (start even if DB or Redis is down; `/readyz` reports it); a malformed `DATABASE_URL` fails startup with a fixed message; close both on shutdown.
@@ -127,6 +127,7 @@ Each takes at most a day, fits one session and leaves `make test` green. Under A
 - [ ] 5. **Ledger.**
   - `internal/ledger`: `Post(ctx, tx, entries)` with a balanced-sum check, `SERIALIZABLE` plus retry, and `Balance(account)`.
   - Unit and integration tests.
+  - **Follow-up from the 3a review:** this is the first step where the API shares the PostgreSQL pool, so stop `/readyz` from draining it: cache the readiness result for about 1 s (or singleflight), or give readiness its own 1-connection pool.
 - [ ] 6. **Ledger properties.**
   - `internal/ledger/property_test.go` (`rapid`): AC1 at 10k operations, and AC2 by fault injection.
 - [ ] 7. **Payment API + state machine.**
