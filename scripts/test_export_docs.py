@@ -37,7 +37,8 @@ class ExportDocsTest(unittest.TestCase):
         # keep the script's progress and error messages out of the test output
         quiet = contextlib.ExitStack()
         quiet.enter_context(contextlib.redirect_stdout(io.StringIO()))
-        quiet.enter_context(contextlib.redirect_stderr(io.StringIO()))
+        self.err = io.StringIO()
+        quiet.enter_context(contextlib.redirect_stderr(self.err))
         self.addCleanup(quiet.close)
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
@@ -153,6 +154,7 @@ class ExportDocsTest(unittest.TestCase):
         self.out.write_bytes(other)
         self.assertEqual(self.run_export(), 1)
         self.assertEqual(self.out.read_bytes(), other)
+        self.assertIn("Delete it if the old source was renamed", self.err.getvalue())
 
     def test_crlf_source_matches_lf_export(self):
         self.run_export()
@@ -180,26 +182,26 @@ class ExportDocsTest(unittest.TestCase):
         self.assertEqual(ed.check(self.repo), 0)
 
     def test_four_backtick_fence_not_closed_by_three(self):
-        body = ed._strip_body("````md\n```\n[[x]] %%keep%%\n```\n````\nafter [[y]] %%gone%%\n")
+        body = ed._strip_body("````md\n```\n[[x]] %%keep%%\n```\n````\nafter [[y]] %%gone%%\n")[0]
         self.assertIn("[[x]] %%keep%%", body)
         self.assertIn("after y \n", body)
         self.assertNotIn("gone", body)
 
     def test_comment_spanning_fence_is_hidden(self):
-        body = ed._strip_body("a %%secret1\n```\ncode secret2\n```\nstill hidden%% b\n")
+        body = ed._strip_body("a %%secret1\n```\ncode secret2\n```\nstill hidden%% b\n")[0]
         self.assertNotIn("secret1", body)
         self.assertNotIn("secret2", body)
         self.assertNotIn("still hidden", body)
         self.assertEqual(body, "a  b\n")
 
     def test_percent_in_inline_code_is_literal(self):
-        body = ed._strip_body("strip `%%…%%` here; an unclosed `%%` stays; ``a ` %% b`` too %%gone%% end\nnext line\n")
+        body = ed._strip_body("strip `%%…%%` here; an unclosed `%%` stays; ``a ` %% b`` too %%gone%% end\nnext line\n")[0]
         self.assertEqual(body, "strip `%%…%%` here; an unclosed `%%` stays; ``a ` %% b`` too  end\nnext line\n")
         # an unmatched backtick doesn't hide a real comment
-        self.assertEqual(ed._strip_body("a ` b %%x%% c\n"), "a ` b  c\n")
+        self.assertEqual(ed._strip_body("a ` b %%x%% c\n")[0], "a ` b  c\n")
 
     def test_unclosed_comment_hides_to_eof(self):
-        body = ed._strip_body("keep\n%% private\nmore private\n```\nx\n```\n")
+        body = ed._strip_body("keep\n%% private\nmore private\n```\nx\n```\n")[0]
         self.assertEqual(body, "keep\n")
 
     def test_check_fails_on_renamed_export(self):
@@ -212,6 +214,59 @@ class ExportDocsTest(unittest.TestCase):
         self.assertEqual(self.run_export(), 1)
         self.assertTrue(self.out.exists())  # SPEC-099 still exported
         self.assertFalse((self.repo / "docs" / "specs" / "SPEC-400-bad.md").exists())
+
+    # --- 2c: no silent loss ----------------------------------------------
+
+    def test_unclosed_comment_warns_with_note_line(self):
+        self.src.unlink()
+        # a code span wrapped across lines: its %% opens a comment that never closes
+        self.note("SPEC-500 Wrap.md", "---\ntype: spec\n---\n\nkeep\na `x\n%% y` b\nlost\n")
+        self.assertEqual(self.run_export(), 0)  # Obsidian hides to EOF too: not an error
+        self.assertIn("warning: Specs/SPEC-500 Wrap.md:7: %% comment opened here is never closed", self.err.getvalue())
+        out = (self.repo / "docs" / "specs" / "SPEC-500-wrap.md").read_text(encoding="utf-8")
+        self.assertNotIn("lost", out)
+
+    def test_no_warning_for_closed_comments(self):
+        self.assertEqual(self.run_export(), 0)
+        self.assertNotIn("warning", self.err.getvalue())
+
+    def test_u2028_does_not_split_line(self):
+        body, open_line = ed._strip_body("a\u2028```\n%%secret%%\n")
+        self.assertNotIn("secret", body)  # no fence opened mid-line, so the comment is stripped
+        self.assertIsNone(open_line)
+        fm, _ = ed.transform("---\ntitle: a\u2028exported: x\n---\nbody\n")
+        self.assertIn("title: a\u2028exported: x", fm)  # U+2028 doesn't split a frontmatter value
+
+    def test_lone_cr_is_line_break(self):
+        body, _ = ed._strip_body(ed.load(b"a\r```\r%%k%%\r```\r"))
+        self.assertEqual(body, "a\n```\n%%k%%\n```\n")
+
+    def test_tilde_fence_and_backtick_info_string(self):
+        body, _ = ed._strip_body("~~~ a`b\n%%keep%%\n~~~\n```a`b\n%%gone%%\n")
+        self.assertIn("%%keep%%", body)  # tilde fences may have a backtick in the info string
+        self.assertNotIn("gone", body)  # a backtick fence may not, so it's prose
+
+    def test_collision_blocked_export_not_orphan(self):
+        self.note("SPEC-200 A.md", "# one\n")
+        self.assertEqual(self.run_export(), 0)
+        existing = self.repo / "docs" / "specs" / "SPEC-200-a.md"
+        before = existing.read_bytes()
+        self.note("SPEC-200 a!.md", "# two\n")
+        self.assertEqual(self.run_export(), 1)
+        err = self.err.getvalue()
+        self.assertIn("all export to", err)
+        self.assertNotIn("orphan", err)
+        self.assertEqual(existing.read_bytes(), before)
+
+    def test_hand_edited_orphan(self):
+        self.run_export()
+        edited = self.out.read_text(encoding="utf-8").replace("Tail", "Tale")
+        self.out.write_text(edited, encoding="utf-8")
+        self.src.unlink()
+        self.assertEqual(self.run_export(), 1)
+        self.assertIn("edited by hand", self.err.getvalue())
+        self.assertEqual(self.out.read_text(encoding="utf-8"), edited)
+        self.assertEqual(ed.check(self.repo), 1)
 
     def test_slug(self):
         self.assertEqual(ed.slug("SPEC-002 Payment Core and Ledger.md"), "SPEC-002-payment-core-and-ledger.md")
