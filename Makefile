@@ -14,7 +14,7 @@ PY_SERVICES := control-plane harness
 GO_TOOLCHAIN := go$(shell awk '/^go /{print $$2}' gateway/go.mod 2>/dev/null)
 GOLANGCI_LINT_VERSION ?= v2.14.0
 
-.PHONY: help install-lint lint test dev
+.PHONY: help install-lint lint test dev export-docs check-docs
 
 help: ## List the make targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-13s %s\n", $$1, $$2}'
@@ -34,6 +34,8 @@ lint: ## Lint every scaffolded service
 	  if [ -f $$s/pyproject.toml ]; then echo "== $$s"; (cd $$s && uv run ruff check .); fi; \
 	done
 	@if [ -f console/package.json ]; then echo "== console"; (cd console && pnpm install --frozen-lockfile && pnpm lint); fi
+	@echo "== scripts"; python3 -m py_compile scripts/*.py
+	@$(MAKE) --no-print-directory check-docs
 
 test: ## Run every scaffolded service's tests
 	@if [ -f gateway/go.mod ]; then echo "== gateway"; (cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) go test -race ./...); fi
@@ -41,7 +43,14 @@ test: ## Run every scaffolded service's tests
 	  if [ -f $$s/pyproject.toml ]; then echo "== $$s"; (cd $$s && uv run pytest) || [ $$? -eq 5 ]; fi; \
 	done
 	@if [ -f console/package.json ]; then echo "== console"; (cd console && pnpm install --frozen-lockfile && pnpm test); fi
+	@echo "== scripts"; python3 -m unittest discover -s scripts -p 'test_*.py'
 
 dev: ## Run the gateway locally (the compose stack arrives in SPEC-002 subtask 3)
 	@echo "Compose stack (PostgreSQL 16, Redis 7) comes with SPEC-002 subtask 3; running the gateway alone."
 	cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) go run ./cmd/gateway
+
+export-docs: ## Export vault specs into docs/specs (one-way, ADR-107; needs STRATA_VAULT)
+	@python3 scripts/export_docs.py export
+
+check-docs: ## Check docs/ exports are stamped and unedited (no vault needed; CI runs it)
+	@python3 scripts/export_docs.py check && echo "check-docs: ok"
