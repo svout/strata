@@ -58,7 +58,7 @@ def load(raw: bytes) -> str:
     Raises UnicodeDecodeError for non-UTF-8 input.
     """
     text = raw.decode("utf-8")
-    if text.startswith("﻿"):
+    if text.startswith("\ufeff"):
         text = text[1:]
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
@@ -131,25 +131,33 @@ def _comment_start(text: str) -> int:
     return -1
 
 
-def _strip_body(body: str) -> str:
+def _lines(text: str) -> List[str]:
+    """Split on "\n" only, keeping it (unlike str.splitlines, which also splits
+    on U+2028, \x85, \f and \v and could open a fence mid-line)."""
+    return [line for line in re.split(r"(?<=\n)", text) if line]
+
+
+def _strip_body(body: str) -> Tuple[str, Optional[int]]:
     """Remove %% comments %% and flatten [[wikilinks]] outside fenced code.
 
     One left-to-right scan. Outside a comment, a fence is copied verbatim to
     its matching close (or EOF), and %% inside an inline code span is literal.
     Inside a comment everything is hidden up to the next %%, fences included
     ("the comment wins"); an unclosed %% hides the rest of the note, as
-    Obsidian does.
+    Obsidian does. Returns (body, line) where line is the 1-based body line on
+    which a still-open comment started, or None.
     """
     out: List[str] = []
     prose: List[str] = []
     fence: Optional[Tuple[str, int]] = None
     in_comment = False
+    open_line: Optional[int] = None
 
     def flush() -> None:
         out.append(WIKILINK_RE.sub(_link, "".join(prose)))
         prose.clear()
 
-    for line in body.splitlines(keepends=True):
+    for lineno, line in enumerate(_lines(body), start=1):
         if fence is not None:
             out.append(line)
             if _fence_closes(line, *fence):
@@ -163,6 +171,7 @@ def _strip_body(body: str) -> str:
                     rest = ""
                     break
                 in_comment, rest, at_line_start = False, rest[end + 2:], False
+                open_line = None
                 continue
             if at_line_start:
                 opened = _fence_open(rest)
@@ -178,8 +187,9 @@ def _strip_body(body: str) -> str:
             else:
                 prose.append(rest[:start])
                 in_comment, rest, at_line_start = True, rest[start + 2:], False
+                open_line = lineno
     flush()
-    return "".join(out)
+    return "".join(out), open_line
 
 
 def transform(text: str) -> Tuple[str, str]:
@@ -189,13 +199,27 @@ def transform(text: str) -> Tuple[str, str]:
     frontmatter values), drops the vault-only `exported:` key, and leaves
     fenced code untouched.
     """
-    fm, body = split_frontmatter(text)
-    fm = "".join(WIKILINK_RE.sub(_link, line) for line in fm.splitlines(keepends=True) if not line.startswith("exported:"))
-    return fm, _strip_body(body)
+    return _transform(text)[:2]
+
+
+def _transform(text: str) -> Tuple[str, str, Optional[int]]:
+    """transform() plus the note line (1-based) of a %% comment left open at EOF."""
+    raw_fm, body = split_frontmatter(text)
+    fm = "".join(WIKILINK_RE.sub(_link, line) for line in _lines(raw_fm) if not line.startswith("exported:"))
+    body, open_line = _strip_body(body)
+    if open_line is not None:
+        open_line += raw_fm.count("\n")
+    return fm, body, open_line
 
 
 def render(rel_src: str, text: str) -> bytes:
-    fm, body = transform(text)
+    fm, body, open_line = _transform(text)
+    if open_line is not None:
+        # Obsidian also hides an unclosed comment to EOF, so this isn't an error,
+        # but the loss must never be silent (e.g. a code span wrapped across
+        # lines with %% inside). Repeats on every run, even if unchanged.
+        print(f"export-docs: warning: {rel_src}:{open_line}: %% comment opened here is never closed;"
+              " the rest of the note is not exported", file=sys.stderr)
     content = (fm + body).encode("utf-8")
     stamp = (
         f'<!-- DO NOT EDIT: exported from vault "{rel_src}" by make export-docs'
@@ -286,11 +310,13 @@ def export(vault: Path, repo: Path) -> int:
             new = render(rel, text)
             if target.exists():
                 stamp, problem = _read_export(target)
+                advice = "Move your change into the vault note, delete the file, and re-run."
                 if not problem and stamp is not None and stamp.group("src") != rel:
                     problem = f'it was exported from "{stamp.group("src")}", not "{rel}"'
+                    advice = "Delete it if the old source was renamed, and re-run."
                 if problem:
-                    print(f"export-docs: refusing to overwrite {target.relative_to(repo)}: {problem}."
-                          " Move your change into the vault note, delete the file, and re-run.", file=sys.stderr)
+                    print(f"export-docs: refusing to overwrite {target.relative_to(repo)}: {problem}. {advice}",
+                          file=sys.stderr)
                     errors += 1
                     reported.add(target)
                     continue

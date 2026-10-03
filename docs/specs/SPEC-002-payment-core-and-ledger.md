@@ -12,7 +12,7 @@ adr:
   - ADR-115
 created: 2026-10-03
 ---
-<!-- DO NOT EDIT: exported from vault "Specs/SPEC-002 Payment Core and Ledger.md" by make export-docs | source-sha256: 7f0316e92e4bfc14a27f60657b7262e70c2e21401ec81a2cc95871536ceb7cca | content-sha256: a2cd3d6d912a274c45438f7ff57b682a6af3e8aa42604d8b8956914b18235c8b -->
+<!-- DO NOT EDIT: exported from vault "Specs/SPEC-002 Payment Core and Ledger.md" by make export-docs | source-sha256: 56ec807ab6a483ea8e8ce5b8733844021a7a44a8d74f2b960342c873608cbe5f | content-sha256: c148ee7c64991bba8bcb57bc45ea4e63479025f261ea08b6e403f115746dc3f4 -->
 
 # SPEC-002 Payment Core and Ledger
 
@@ -101,6 +101,12 @@ Each takes at most a day, fits one session and leaves `make test` green. Under A
   - **Comments:** strip `%%…%%` across the whole body except inside fenced code (a comment spanning a fence no longer leaks); an unclosed `%%` hides everything to EOF, as Obsidian does.
   - **`check`:** also fail when a file's name isn't `slug(stamp src)` (a renamed or copied export).
   - **Tests:** one per item above (collision, src mismatch, CRLF, BOM, EOF frontmatter, 4-backtick fence, comment across a fence, unclosed comment, renamed export).
+  - Touches `scripts/export_docs.py`, `scripts/test_export_docs.py`.
+- [ ] 2c. **Export: no silent loss** (added 2026-10-03 after the subtask-2b review; no change to current exports).
+  - **Warning:** when a `%%` comment is still open at end of file (e.g. an inline code span wrapped across lines with `%%` inside), print a stderr warning naming the note and the line where the comment opened. The exit code is unchanged, because Obsidian also hides to EOF.
+  - **Line splitting:** split the body on `\n` only, not `str.splitlines()`, so U+2028, `\x85`, `\f` and `\v` can't open a fence mid-line and let a comment through.
+  - **Small fixes:** write the BOM as `\ufeff` (not an invisible literal); the src-mismatch refusal says "delete it if the old source was renamed" instead of "move your change into the vault note".
+  - **Tests:** the warning (code span split across lines), a U+2028 line, lone CR, tilde fence and a backtick info string, the existing export of a collision-blocked note not reported as an orphan, and a hand-edited orphan.
   - Touches `scripts/export_docs.py`, `scripts/test_export_docs.py`.
 - [ ] 3. **Compose stack + readiness.**
   - `infra/compose/compose.yml` (gateway, PostgreSQL 16, Redis 7); `make dev`.
