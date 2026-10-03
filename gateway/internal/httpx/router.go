@@ -14,14 +14,18 @@ import (
 )
 
 // NewRouter builds the gateway's HTTP handler. Later subtasks mount the
-// payment API on it; for now it serves only /healthz.
-func NewRouter(log *slog.Logger) http.Handler {
+// payment API on it. It serves /healthz (liveness), and /readyz when
+// readiness checks are given.
+func NewRouter(log *slog.Logger, checks ...ReadyCheck) http.Handler {
 	r := chi.NewRouter()
 	r.Use(requestID)
 	r.Use(requestLog(log))
 	r.Use(middleware.Recoverer)
 
 	r.Get("/healthz", healthz)
+	if len(checks) > 0 {
+		r.Get("/readyz", readyz(log, checks))
+	}
 	return r
 }
 

@@ -91,6 +91,7 @@ func TestIsSensitive(t *testing.T) {
 		"card_number": true, "pan": true, "cvv": true, "client-token": true, "auth": true, "auth_token": true,
 		"signature": true, "signing_key": true, "hmac_key": true, "credential": true, "cookie": true,
 		"body": true, "payload": true, "mandate": true, "private_key": true, "password": true,
+		"dsn": true, "pg_dsn": true, "database_url": true, "DATABASE_URL": true, "databaseURL": true,
 		// logged
 		"signature_valid": false, "signature_alg": false, "token_count": false, "auth_result": false,
 		"mandate_id": false, "payload_digest": false, "signing_key_id": false,

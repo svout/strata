@@ -8,19 +8,27 @@ import (
 	"strings"
 )
 
-// ErrInvalidLogLevel is returned when LOG_LEVEL is not one of debug, info, warn or error.
-var ErrInvalidLogLevel = errors.New("invalid log level")
+var (
+	// ErrInvalidLogLevel is returned when LOG_LEVEL is not one of debug, info, warn or error.
+	ErrInvalidLogLevel = errors.New("invalid log level")
+	// ErrMissingDatabaseURL is returned when DATABASE_URL is unset: there is
+	// deliberately no default DSN in code.
+	ErrMissingDatabaseURL = errors.New("DATABASE_URL is required")
+)
 
-// Config holds the gateway's runtime settings.
+// Config holds the gateway's runtime settings. It contains the database DSN,
+// so it is never logged.
 type Config struct {
-	Addr     string     // listen address, from GATEWAY_ADDR
-	LogLevel slog.Level // from LOG_LEVEL
+	Addr        string     // listen address, from GATEWAY_ADDR
+	LogLevel    slog.Level // from LOG_LEVEL
+	DatabaseURL string     // PostgreSQL DSN, from DATABASE_URL (required)
+	RedisAddr   string     // host:port, from REDIS_ADDR
 }
 
 // Load reads the configuration through getenv (os.Getenv in production),
 // applying defaults for anything unset.
 func Load(getenv func(string) string) (Config, error) {
-	cfg := Config{Addr: ":8080", LogLevel: slog.LevelInfo}
+	cfg := Config{Addr: ":8080", LogLevel: slog.LevelInfo, RedisAddr: "localhost:6379"}
 
 	if v := getenv("GATEWAY_ADDR"); v != "" {
 		cfg.Addr = v
@@ -32,6 +40,14 @@ func Load(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("%w: %q", ErrInvalidLogLevel, v)
 		}
 		cfg.LogLevel = lvl
+	}
+
+	cfg.DatabaseURL = getenv("DATABASE_URL")
+	if cfg.DatabaseURL == "" {
+		return Config{}, ErrMissingDatabaseURL
+	}
+	if v := getenv("REDIS_ADDR"); v != "" {
+		cfg.RedisAddr = v
 	}
 
 	return cfg, nil

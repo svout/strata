@@ -12,7 +12,7 @@ adr:
   - ADR-115
 created: 2026-10-03
 ---
-<!-- DO NOT EDIT: exported from vault "Specs/SPEC-002 Payment Core and Ledger.md" by make export-docs | source-sha256: 56ec807ab6a483ea8e8ce5b8733844021a7a44a8d74f2b960342c873608cbe5f | content-sha256: c148ee7c64991bba8bcb57bc45ea4e63479025f261ea08b6e403f115746dc3f4 -->
+<!-- DO NOT EDIT: exported from vault "Specs/SPEC-002 Payment Core and Ledger.md" by make export-docs | source-sha256: 2e278abb908d8c30e930b904a4fcb3bc2667b3d2660216c6b603c6d6cd5cc339 | content-sha256: a2b61e6add0554607fb0f9cace971f3f6730cad94edee68ba8902e168dcf6919 -->
 
 # SPEC-002 Payment Core and Ledger
 
@@ -94,7 +94,7 @@ Each takes at most a day, fits one session and leaves `make test` green. Under A
 - [x] 2. **Spec export.** *(PR #6, 26fda74, main 4c82d1f, 2026-10-03; AC9 met)*
   - `scripts/export-docs` + `make export-docs`: copy `Specs/SPEC-*.md` from `$STRATA_VAULT` into `docs/specs/`, stamp a SHA-256, and fail if an export was hand-edited.
   - Export this spec.
-- [ ] 2b. **Export hardening** (added 2026-10-03 after the subtask-2 review; no change to current exports).
+- [x] 2b. **Export hardening** *(PR #7, eba23d4, main f87956d, CI green, 2026-10-03)* (added 2026-10-03 after the subtask-2 review; no change to current exports).
   - **Collisions:** fail if two vault notes slug to the same file, or if a target's stamp `src` differs from the note being exported (no silent overwrite).
   - **Input forms:** normalise CRLF to LF before hashing and writing; handle a UTF-8 BOM and frontmatter that ends at EOF without a newline; clear error (exit 1) on non-UTF-8 input.
   - **Fences:** match the closing fence by character and length (≥ the opening run), so a ```` block isn't closed by ```.
@@ -102,16 +102,24 @@ Each takes at most a day, fits one session and leaves `make test` green. Under A
   - **`check`:** also fail when a file's name isn't `slug(stamp src)` (a renamed or copied export).
   - **Tests:** one per item above (collision, src mismatch, CRLF, BOM, EOF frontmatter, 4-backtick fence, comment across a fence, unclosed comment, renamed export).
   - Touches `scripts/export_docs.py`, `scripts/test_export_docs.py`.
-- [ ] 2c. **Export: no silent loss** (added 2026-10-03 after the subtask-2b review; no change to current exports).
+- [x] 2c. **Export: no silent loss** *(PR #8, 798ba37, main edb1b48, CI green, 2026-10-03)* (added 2026-10-03 after the subtask-2b review; no change to current exports).
   - **Warning:** when a `%%` comment is still open at end of file (e.g. an inline code span wrapped across lines with `%%` inside), print a stderr warning naming the note and the line where the comment opened. The exit code is unchanged, because Obsidian also hides to EOF.
   - **Line splitting:** split the body on `\n` only, not `str.splitlines()`, so U+2028, `\x85`, `\f` and `\v` can't open a fence mid-line and let a comment through.
   - **Small fixes:** write the BOM as `\ufeff` (not an invisible literal); the src-mismatch refusal says "delete it if the old source was renamed" instead of "move your change into the vault note".
   - **Tests:** the warning (code span split across lines), a U+2028 line, lone CR, tilde fence and a backtick info string, the existing export of a collision-blocked note not reported as an orphan, and a hand-edited orphan.
   - Touches `scripts/export_docs.py`, `scripts/test_export_docs.py`.
-- [ ] 3. **Compose stack + readiness.**
-  - `infra/compose/compose.yml` (gateway, PostgreSQL 16, Redis 7); `make dev`.
-  - `/readyz` checks DB and Redis.
-  - Test: the readiness handler with fakes.
+- [ ] 3a. **Readiness (Go).** Split from 3 at planning (2026-10-03, Ivan); no Docker needed.
+  - `internal/httpx`: `ReadyCheck{Name, Check}`; `NewRouter(log, checks ...ReadyCheck)` (additive Registry change, approved). `/readyz` runs checks in parallel with a 1 s timeout each: 200 `ready` or 503 `not_ready` with `ok`/`fail`/`timeout` per check. Error text never goes in the response or the log.
+  - `internal/config`: `DATABASE_URL` required (`ErrMissingDatabaseURL`); `REDIS_ADDR` defaults to `localhost:6379`; config never logged.
+  - `cmd/gateway`: lazy `pgxpool` and go-redis clients (start even if DB or Redis is down; `/readyz` reports it); a malformed `DATABASE_URL` fails startup with a fixed message; close both on shutdown.
+  - Logger: `dsn` and `database_url` become hard redaction terms (from Q9).
+  - Tests with fake checks (ok, fail, timeout, no secret leak, 404 without checks) and config tests; no Docker. Re-export SPEC-002.
+  - Touches `gateway/internal/httpx/{ready.go,ready_test.go,router.go,log.go,httpx_test.go}`, `gateway/internal/config/*`, `gateway/cmd/gateway/main.go`, `gateway/go.mod`, `gateway/go.sum`, `docs/specs/` (export).
+- [ ] 3b. **Compose stack.** Needs Docker Desktop running.
+  - `gateway/Dockerfile` (multi-stage; `CGO_ENABLED=0`; `gcr.io/distroless/static-debian12:nonroot`; `GO_VERSION` passed from `go.mod`), `gateway/.dockerignore`.
+  - `infra/compose/compose.yml`: gateway, `postgres:16-alpine`, `redis:7-alpine`; healthchecks; named volume `pgdata`; ports on 127.0.0.1 only; dev-only credentials `agentgate/agentgate` inline (approved).
+  - `make dev` (checks Docker, `compose up -d --build --wait`, polls `/readyz` up to 30 s); `make dev-down` (keeps the volume). CI stays unit-only.
+  - Touches `gateway/Dockerfile`, `gateway/.dockerignore`, `infra/compose/compose.yml`, `infra/compose/README.md`, `Makefile`.
 - [ ] 4. **Test fixtures + schema v1.**
   - `internal/testutil` (containerised PostgreSQL/Redis; open question 1).
   - Migration tool wiring + migration `0001` (`accounts`, `payments`, `ledger_entries`, `idempotency_keys`); `make migrate`.

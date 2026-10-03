@@ -27,8 +27,8 @@ import (
 //
 // Free-text messages are not inspected: never put secrets in a message.
 var (
-	hardSubstrings = []string{"secret", "passw", "authorization", "credential", "cookie", "privatekey"}
-	hardWords      = set("pan", "cvc", "cvv", "pin", "private")
+	hardSubstrings = []string{"secret", "passw", "authorization", "credential", "cookie", "privatekey", "databaseurl"}
+	hardWords      = set("pan", "cvc", "cvv", "pin", "private", "dsn")
 	softWords      = set("token", "tokens", "signature", "sig", "auth", "mandate", "body", "payload", "card", "apikey", "signingkey", "hmackey")
 	softPairs      = set("api key", "signing key", "hmac key")
 	keepSuffixes   = set("valid", "alg", "count", "result", "ok", "len", "type", "id", "digest", "hash")
