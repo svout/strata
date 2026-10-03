@@ -12,7 +12,7 @@ adr:
   - ADR-115
 created: 2026-10-03
 ---
-<!-- DO NOT EDIT: exported from vault "Specs/SPEC-002 Payment Core and Ledger.md" by make export-docs | source-sha256: 4c64082591d27715d58574a527cf91c5f739840fc171c6d4d8656c337ea18660 | content-sha256: 2f38229b1d931a1c2fa281fcb3b9f06efd02cc2b957ce487568aca11932e6654 -->
+<!-- DO NOT EDIT: exported from vault "Specs/SPEC-002 Payment Core and Ledger.md" by make export-docs | source-sha256: 7f0316e92e4bfc14a27f60657b7262e70c2e21401ec81a2cc95871536ceb7cca | content-sha256: a2cd3d6d912a274c45438f7ff57b682a6af3e8aa42604d8b8956914b18235c8b -->
 
 # SPEC-002 Payment Core and Ledger
 
@@ -91,9 +91,17 @@ Each takes at most a day, fits one session and leaves `make test` green. Under A
   - Tests: group and map redaction, the key list (including words that must *not* be redacted), and request-ID generation and validation.
   - **Decided at planning (Ivan, 2026-10-03):** non-scalar `slog.Any` values (maps, structs, slices, `[]byte`) are **never emitted**: they log as `[OMITTED <type>]`. Errors log their message. A type that must be logged implements `slog.LogValuer` and is then redacted key by key. Adds a `make install-lint` target.
   - Touches `gateway/internal/httpx/{log.go,router.go,httpx_test.go}`, and `Makefile`, `.github/workflows/ci.yml`, `gateway/go.mod` if ADR-116 is accepted.
-- [ ] 2. **Spec export.**
+- [x] 2. **Spec export.** *(PR #6, 26fda74, main 4c82d1f, 2026-10-03; AC9 met)*
   - `scripts/export-docs` + `make export-docs`: copy `Specs/SPEC-*.md` from `$STRATA_VAULT` into `docs/specs/`, stamp a SHA-256, and fail if an export was hand-edited.
   - Export this spec.
+- [ ] 2b. **Export hardening** (added 2026-10-03 after the subtask-2 review; no change to current exports).
+  - **Collisions:** fail if two vault notes slug to the same file, or if a target's stamp `src` differs from the note being exported (no silent overwrite).
+  - **Input forms:** normalise CRLF to LF before hashing and writing; handle a UTF-8 BOM and frontmatter that ends at EOF without a newline; clear error (exit 1) on non-UTF-8 input.
+  - **Fences:** match the closing fence by character and length (≥ the opening run), so a ```` block isn't closed by ```.
+  - **Comments:** strip `%%…%%` across the whole body except inside fenced code (a comment spanning a fence no longer leaks); an unclosed `%%` hides everything to EOF, as Obsidian does.
+  - **`check`:** also fail when a file's name isn't `slug(stamp src)` (a renamed or copied export).
+  - **Tests:** one per item above (collision, src mismatch, CRLF, BOM, EOF frontmatter, 4-backtick fence, comment across a fence, unclosed comment, renamed export).
+  - Touches `scripts/export_docs.py`, `scripts/test_export_docs.py`.
 - [ ] 3. **Compose stack + readiness.**
   - `infra/compose/compose.yml` (gateway, PostgreSQL 16, Redis 7); `make dev`.
   - `/readyz` checks DB and Redis.
