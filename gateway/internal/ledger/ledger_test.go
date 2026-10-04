@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,16 +19,16 @@ import (
 // Fixed ids for the validation table: validation runs before any I/O, so the
 // rows don't need to exist.
 var (
-	idA = pgtype.UUID{Bytes: [16]byte{1}, Valid: true}
-	idB = pgtype.UUID{Bytes: [16]byte{2}, Valid: true}
-	idP = pgtype.UUID{Bytes: [16]byte{3}, Valid: true}
+	idA = uuid.UUID{1}
+	idB = uuid.UUID{2}
+	idP = uuid.UUID{3}
 )
 
 func TestPostRejectsInvalidPostings(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name    string
-		payment pgtype.UUID
+		payment uuid.UUID
 		entries []Entry
 		want    error
 	}{
@@ -50,8 +51,8 @@ func TestPostRejectsInvalidPostings(t *testing.T) {
 			{idA, Debit, math.MaxInt64}, {idA, Debit, math.MaxInt64}, {idA, Debit, 2},
 			{idB, Credit, math.MaxInt64}, {idB, Credit, math.MaxInt64}, {idB, Credit, 2},
 		}, ErrOverflow},
-		{"null payment id", pgtype.UUID{}, []Entry{{idA, Debit, 1}, {idB, Credit, 1}}, ErrMissingID},
-		{"null account id", idP, []Entry{{pgtype.UUID{}, Debit, 1}, {idB, Credit, 1}}, ErrMissingID},
+		{"nil payment id", uuid.Nil, []Entry{{idA, Debit, 1}, {idB, Credit, 1}}, ErrMissingID},
+		{"nil account id", idP, []Entry{{uuid.Nil, Debit, 1}, {idB, Credit, 1}}, ErrMissingID},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -128,7 +129,7 @@ func TestPostWritesBalancedLegs(t *testing.T) {
 	var signed int64
 	err = pool.QueryRow(ctx, `
 		SELECT sum(CASE direction WHEN 'credit' THEN amount ELSE -amount END)
-		FROM ledger_entries WHERE payment_id = $1`, f.payment).Scan(&signed)
+		FROM ledger_entries WHERE payment_id = $1`, pgUUID(f.payment)).Scan(&signed)
 	if err != nil {
 		t.Fatalf("signed sum: %v", err)
 	}
@@ -163,7 +164,7 @@ func TestFailedPostingLeavesNoRows(t *testing.T) {
 		// A leg referencing a missing account fails inside the INSERT; no
 		// other leg of the same statement may survive.
 		{"unknown account", func(tx pgx.Tx) error {
-			missing := pgtype.UUID{Bytes: [16]byte{0xff}, Valid: true}
+			missing := uuid.UUID{0xff}
 			return Post(ctx, tx, f.payment, []Entry{{f.payer, Debit, 100}, {missing, Credit, 100}})
 		}, nil},
 	}
@@ -211,7 +212,7 @@ func TestBalanceAcrossPostings(t *testing.T) {
 	}
 
 	want := map[string]struct {
-		id      pgtype.UUID
+		id      uuid.UUID
 		balance int64
 	}{
 		"user":     {user, 10_000 - 2_500 - 1_000 + 400},
@@ -249,7 +250,7 @@ func TestBalanceAcrossPostings(t *testing.T) {
 
 // fixture is a payer, a payee and a payment between them.
 type fixture struct {
-	payer, payee, payment pgtype.UUID
+	payer, payee, payment uuid.UUID
 }
 
 func newFixture(ctx context.Context, t *testing.T, pool *pgxpool.Pool) fixture {
@@ -264,32 +265,34 @@ func (f fixture) balanced(amount int64) []Entry {
 	return []Entry{{f.payer, Debit, amount}, {f.payee, Credit, amount}}
 }
 
-func newAccount(ctx context.Context, t *testing.T, pool *pgxpool.Pool, kind string) pgtype.UUID {
+// The helpers below talk to the database directly, so they convert at the SQL
+// boundary the same way ledger does (pgUUID, and back with uuid.UUID(id.Bytes)).
+func newAccount(ctx context.Context, t *testing.T, pool *pgxpool.Pool, kind string) uuid.UUID {
 	t.Helper()
 	var id pgtype.UUID
 	err := pool.QueryRow(ctx, "INSERT INTO accounts (kind, currency) VALUES ($1, 'GBP') RETURNING id", kind).Scan(&id)
 	if err != nil {
 		t.Fatalf("insert account: %v", err)
 	}
-	return id
+	return uuid.UUID(id.Bytes)
 }
 
-func newPayment(ctx context.Context, t *testing.T, pool *pgxpool.Pool, payer, payee pgtype.UUID, amount int64) pgtype.UUID {
+func newPayment(ctx context.Context, t *testing.T, pool *pgxpool.Pool, payer, payee uuid.UUID, amount int64) uuid.UUID {
 	t.Helper()
 	var id pgtype.UUID
 	err := pool.QueryRow(ctx, `
 		INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail)
-		VALUES ($1, $2, $3, 'GBP', 'internal') RETURNING id`, payer, payee, amount).Scan(&id)
+		VALUES ($1, $2, $3, 'GBP', 'internal') RETURNING id`, pgUUID(payer), pgUUID(payee), amount).Scan(&id)
 	if err != nil {
 		t.Fatalf("insert payment: %v", err)
 	}
-	return id
+	return uuid.UUID(id.Bytes)
 }
 
-func countEntries(ctx context.Context, t *testing.T, pool *pgxpool.Pool, payment pgtype.UUID) int {
+func countEntries(ctx context.Context, t *testing.T, pool *pgxpool.Pool, payment uuid.UUID) int {
 	t.Helper()
 	var n int
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM ledger_entries WHERE payment_id = $1", payment).Scan(&n); err != nil {
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM ledger_entries WHERE payment_id = $1", pgUUID(payment)).Scan(&n); err != nil {
 		t.Fatalf("count entries: %v", err)
 	}
 	return n

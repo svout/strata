@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -31,7 +32,7 @@ const (
 // Entry is one leg of a posting: Amount minor units (pence) moved on
 // AccountID, on the Direction side.
 type Entry struct {
-	AccountID pgtype.UUID
+	AccountID uuid.UUID
 	Direction Direction
 	Amount    int64
 }
@@ -48,7 +49,7 @@ var (
 	ErrInvalidDirection = fmt.Errorf("%w: direction must be debit or credit", ErrInvalidPosting)
 	ErrUnbalanced       = fmt.Errorf("%w: debits do not equal credits", ErrInvalidPosting)
 	ErrOverflow         = fmt.Errorf("%w: total exceeds int64", ErrInvalidPosting)
-	ErrMissingID        = fmt.Errorf("%w: payment or account id is null", ErrInvalidPosting)
+	ErrMissingID        = fmt.Errorf("%w: payment or account id is the nil UUID", ErrInvalidPosting)
 )
 
 // ErrNotSerializable means Post was handed a transaction below SERIALIZABLE.
@@ -64,7 +65,10 @@ var ErrNotSerializable = errors.New("ledger: transaction is not SERIALIZABLE")
 // SERIALIZABLE, then inserts every leg in a single statement. If any step
 // fails nothing is written by Post; the caller's transaction decides what
 // happens to anything else it did.
-func Post(ctx context.Context, tx pgx.Tx, paymentID pgtype.UUID, entries []Entry) error {
+//
+// Post does not stop the same payment being posted twice: each call adds its
+// legs. Idempotency is SPEC-002 subtask 7.
+func Post(ctx context.Context, tx pgx.Tx, paymentID uuid.UUID, entries []Entry) error {
 	if err := validate(paymentID, entries); err != nil {
 		return err
 	}
@@ -86,13 +90,13 @@ func Post(ctx context.Context, tx pgx.Tx, paymentID pgtype.UUID, entries []Entry
 	directions := make([]string, len(entries))
 	amounts := make([]int64, len(entries))
 	for i, e := range entries {
-		accounts[i], directions[i], amounts[i] = e.AccountID, string(e.Direction), e.Amount
+		accounts[i], directions[i], amounts[i] = pgUUID(e.AccountID), string(e.Direction), e.Amount
 	}
 	_, err := tx.Exec(ctx, `
 		INSERT INTO ledger_entries (payment_id, account_id, direction, amount)
 		SELECT $1, a, d, m
 		FROM unnest($2::uuid[], $3::text[], $4::bigint[]) AS t (a, d, m)`,
-		paymentID, accounts, directions, amounts)
+		pgUUID(paymentID), accounts, directions, amounts)
 	if err != nil {
 		return fmt.Errorf("ledger: insert entries: %w", err)
 	}
@@ -100,8 +104,8 @@ func Post(ctx context.Context, tx pgx.Tx, paymentID pgtype.UUID, entries []Entry
 }
 
 // validate checks a posting without any I/O.
-func validate(paymentID pgtype.UUID, entries []Entry) error {
-	if !paymentID.Valid {
+func validate(paymentID uuid.UUID, entries []Entry) error {
+	if paymentID == uuid.Nil {
 		return ErrMissingID
 	}
 	if len(entries) < 2 {
@@ -109,7 +113,7 @@ func validate(paymentID pgtype.UUID, entries []Entry) error {
 	}
 	var debits, credits int64
 	for i, e := range entries {
-		if !e.AccountID.Valid {
+		if e.AccountID == uuid.Nil {
 			return fmt.Errorf("leg %d: %w", i, ErrMissingID)
 		}
 		if e.Amount <= 0 {
@@ -148,7 +152,7 @@ type Querier interface {
 // The sign convention is the same for every account kind. The schema's kinds
 // (user, merchant, clearing) say who owns an account, not whether it is an
 // asset or a liability, so there is no debit-normal kind to flip.
-func Balance(ctx context.Context, q Querier, accountID pgtype.UUID) (int64, error) {
+func Balance(ctx context.Context, q Querier, accountID uuid.UUID) (int64, error) {
 	// sum(bigint) is numeric, so it cannot overflow mid-sum; the ::bigint
 	// cast then fails loudly (22003) rather than wrapping if the result does
 	// not fit.
@@ -156,9 +160,15 @@ func Balance(ctx context.Context, q Querier, accountID pgtype.UUID) (int64, erro
 	err := q.QueryRow(ctx, `
 		SELECT COALESCE(sum(CASE direction WHEN 'credit' THEN amount ELSE -amount END), 0)::bigint
 		FROM ledger_entries
-		WHERE account_id = $1`, accountID).Scan(&balance)
+		WHERE account_id = $1`, pgUUID(accountID)).Scan(&balance)
 	if err != nil {
 		return 0, fmt.Errorf("ledger: balance: %w", err)
 	}
 	return balance, nil
+}
+
+// pgUUID converts an id to pgx's own UUID type at the SQL boundary, so the
+// exported API speaks google/uuid without registering a codec with pgx.
+func pgUUID(id uuid.UUID) pgtype.UUID {
+	return pgtype.UUID{Bytes: id, Valid: true}
 }

@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,7 +17,9 @@ import (
 	"github.com/svout/agentgate/gateway/internal/testutil"
 )
 
-// maxAttempts mirrors store's unexported retry policy (SPEC-002 subtask 5a).
+// maxAttempts mirrors defaultRetry.attempts in tx.go (SPEC-002 subtask 5a),
+// which this external test package cannot see; tx_internal_test.go checks the
+// two agree.
 const maxAttempts = 5
 
 func TestSerializableCommitsInSerializableTx(t *testing.T) {
@@ -54,6 +57,7 @@ func TestSerializableRetriesSerializationFailure(t *testing.T) {
 	const workers = 2
 	var (
 		bothRead  sync.WaitGroup
+		readOnce  [workers]sync.Once
 		attempts  [workers]atomic.Int32
 		results   [workers]error
 		finished  sync.WaitGroup
@@ -66,6 +70,11 @@ func TestSerializableRetriesSerializationFailure(t *testing.T) {
 		finished.Go(func() {
 			results[w] = store.Serializable(ctx, pool, func(tx pgx.Tx) error {
 				n := attempts[w].Add(1)
+				// Each worker counts itself as having read exactly once, on
+				// its first attempt, even if that attempt fails before or
+				// during the read; otherwise the other worker would wait
+				// for the whole ctx timeout.
+				defer readOnce[w].Do(bothRead.Done)
 				var count int
 				if err := tx.QueryRow(ctx, "SELECT count(*) FROM accounts WHERE kind = 'clearing'").Scan(&count); err != nil {
 					return err
@@ -73,7 +82,7 @@ func TestSerializableRetriesSerializationFailure(t *testing.T) {
 				if n == 1 {
 					// Only the first attempt waits, so both transactions have
 					// read before either writes. A retry runs on its own.
-					bothRead.Done()
+					readOnce[w].Do(bothRead.Done)
 					select {
 					case <-firstPass:
 					case <-ctx.Done():
@@ -105,14 +114,26 @@ func TestSerializableStopsAtRetryLimit(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
 
-	for _, code := range []string{"40001", "40P01"} {
-		t.Run(code, func(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		code string
+	}{
+		{"40001", &pgconn.PgError{Code: "40001"}, "40001"},
+		{"40P01", &pgconn.PgError{Code: "40P01"}, "40P01"},
+		// fn usually wraps the database error with context; the retry must
+		// still see the SQLSTATE through the wrapping.
+		{"wrapped 40001", fmt.Errorf("x: %w", &pgconn.PgError{Code: "40001"}), "40001"},
+	}
+	for _, tt := range tests {
+		code := tt.code
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			ctx := testContext(t)
 			var attempts int
 			err := store.Serializable(ctx, pool, func(pgx.Tx) error {
 				attempts++
-				return &pgconn.PgError{Code: code}
+				return tt.err
 			})
 			if attempts != maxAttempts {
 				t.Errorf("attempts = %d, want %d", attempts, maxAttempts)

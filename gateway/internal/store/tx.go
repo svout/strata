@@ -36,8 +36,9 @@ type retryPolicy struct {
 
 // SPEC-002 subtask 5a: 5 attempts, jittered 10–200 ms backoff. Under the
 // gateway's contention (two payments touching the same account at once) one
-// retry almost always succeeds; 5 attempts with at most ~0.5 s of waiting in
-// total is a ceiling, not the expected cost.
+// retry almost always succeeds. The four retries wait at most 40, 80, 160 and
+// 200 ms, so the worst-case total wait is 480 ms: a ceiling, not the
+// expected cost.
 var defaultRetry = retryPolicy{attempts: 5, minBackoff: 10 * time.Millisecond, maxBackoff: 200 * time.Millisecond}
 
 // Serializable runs fn inside a SERIALIZABLE transaction on pool and commits
@@ -47,7 +48,10 @@ var defaultRetry = retryPolicy{attempts: 5, minBackoff: 10 * time.Millisecond, m
 // Any other error is returned at once, after rolling back.
 //
 // fn may therefore run more than once: it must do all its work through the tx
-// it is given and have no other side effects (no HTTP calls, no Redis writes).
+// it is given and have no side effects outside it (no HTTP calls, no Redis
+// writes). It must also return database errors rather than swallow them: a
+// 40001 that fn hides makes the transaction fail at commit instead, and a
+// commit failure caused that way is not retried.
 //
 // The retry has to live here, around the whole transaction, rather than in
 // ledger.Post: once PostgreSQL reports 40001 the transaction is aborted, and
@@ -96,19 +100,24 @@ func retryable(err error) bool {
 }
 
 // backoff returns the wait before retry number n (1 for the first retry).
-// The upper bound doubles from 2×minBackoff with each retry, capped at
-// maxBackoff, and the wait is drawn uniformly between minBackoff and that
-// bound. The randomness ("jitter") stops two transactions that just collided
+// The upper bound is minBackoff<<(n+1) (4×minBackoff for the first retry,
+// doubling after), capped at maxBackoff, and the wait is drawn uniformly
+// between minBackoff and that bound. The randomness ("jitter") stops two transactions that just collided
 // from retrying in lockstep and colliding again.
 func (p retryPolicy) backoff(n int) time.Duration {
-	upper := p.maxBackoff
-	if shift := min(n, 30); p.minBackoff<<shift < upper {
-		upper = p.minBackoff << shift
-	}
+	upper := p.ceiling(n)
 	if upper <= p.minBackoff {
 		return p.minBackoff
 	}
 	// Jitter only needs to be unpredictable between two goroutines, not
 	// cryptographically, so math/rand/v2 is the right tool.
 	return p.minBackoff + rand.N(upper-p.minBackoff+1) //nolint:gosec // G404: jitter, not security
+}
+
+// ceiling is the longest backoff(n) can return.
+func (p retryPolicy) ceiling(n int) time.Duration {
+	if shift := min(n+1, 30); p.minBackoff<<shift < p.maxBackoff {
+		return p.minBackoff << shift
+	}
+	return p.maxBackoff
 }
