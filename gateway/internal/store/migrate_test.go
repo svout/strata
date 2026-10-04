@@ -7,12 +7,14 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/pressly/goose/v3/lock"
 
 	"github.com/svout/agentgate/gateway/internal/store"
 	"github.com/svout/agentgate/gateway/internal/testutil"
@@ -73,6 +75,102 @@ func TestDownRemovesSchemaAndUpRestoresIt(t *testing.T) {
 	for _, table := range schemaTables {
 		if !tableExists(ctx, t, pool, table) {
 			t.Errorf("table %s missing after Up following Down", table)
+		}
+	}
+}
+
+// TestConcurrentUpIsSerialised starts several Up runs at once against an empty
+// schema. goose's advisory lock lets one apply version 1 while the others
+// wait and then find nothing pending, so all succeed, version 1 is recorded
+// exactly once, and the lock is released afterwards.
+func TestConcurrentUpIsSerialised(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	ctx := testContext(t)
+	db := sqlDB(t, pool)
+
+	if err := store.Down(ctx, db); err != nil {
+		t.Fatalf("Down: %v", err)
+	}
+
+	// 4 runs: each holds up to two connections (the lock session plus a
+	// pending check), and the test pool is capped at 8.
+	const runs = 4
+	errs := make([]error, runs)
+	var wg sync.WaitGroup
+	for i := range runs {
+		wg.Go(func() { errs[i] = store.Up(ctx, db) })
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("Up run %d: %v", i, err)
+		}
+	}
+
+	var applied int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM goose_db_version WHERE version_id = 1").Scan(&applied); err != nil {
+		t.Fatalf("count version rows: %v", err)
+	}
+	if applied != 1 {
+		t.Errorf("goose_db_version rows for version 1 = %d, want 1", applied)
+	}
+	if n := advisoryLocks(ctx, t, pool); n != 0 {
+		t.Errorf("%d advisory locks left in this database after Up, want 0", n)
+	}
+}
+
+// TestUpWaitsForHeldLock holds goose's lock on another session, as a
+// concurrent migrator would, and checks that Up applies nothing until the lock
+// is released and then completes.
+func TestUpWaitsForHeldLock(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	ctx := testContext(t)
+	db := sqlDB(t, pool)
+
+	if err := store.Down(ctx, db); err != nil {
+		t.Fatalf("Down: %v", err)
+	}
+
+	holder, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire holder connection: %v", err)
+	}
+	defer holder.Release()
+	if _, err := holder.Exec(ctx, "SELECT pg_advisory_lock($1)", lock.DefaultLockID); err != nil {
+		t.Fatalf("take goose lock: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- store.Up(ctx, db) }()
+
+	// Longer than the 1 s lock retry period, so Up has polled at least twice.
+	select {
+	case err := <-done:
+		t.Fatalf("Up returned (%v) while the lock was held", err)
+	case <-time.After(2500 * time.Millisecond):
+	}
+	for _, table := range schemaTables {
+		if tableExists(ctx, t, pool, table) {
+			t.Errorf("table %s created while the lock was held", table)
+		}
+	}
+
+	if _, err := holder.Exec(ctx, "SELECT pg_advisory_unlock($1)", lock.DefaultLockID); err != nil {
+		t.Fatalf("release goose lock: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Up after the lock was released: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Up did not finish within 10 s of the lock being released")
+	}
+	for _, table := range schemaTables {
+		if !tableExists(ctx, t, pool, table) {
+			t.Errorf("table %s missing after Up", table)
 		}
 	}
 }
@@ -187,6 +285,20 @@ func sqlDB(t *testing.T, pool *pgxpool.Pool) *sql.DB {
 	db := stdlib.OpenDBFromPool(pool)
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+// advisoryLocks counts advisory locks held in the test's own database. Advisory
+// locks are scoped per database, and other parallel tests share the server.
+func advisoryLocks(ctx context.Context, t *testing.T, pool *pgxpool.Pool) int {
+	t.Helper()
+	var n int
+	err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM pg_locks l JOIN pg_database d ON d.oid = l.database
+		 WHERE l.locktype = 'advisory' AND d.datname = current_database()`).Scan(&n)
+	if err != nil {
+		t.Fatalf("count advisory locks: %v", err)
+	}
+	return n
 }
 
 func tableExists(ctx context.Context, t *testing.T, pool *pgxpool.Pool, table string) bool {

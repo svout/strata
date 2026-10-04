@@ -12,7 +12,7 @@ adr:
   - ADR-115
 created: 2026-10-03
 ---
-<!-- DO NOT EDIT: exported from vault "Specs/SPEC-002 Payment Core and Ledger.md" by make export-docs | source-sha256: 82c6d1a69fdad419db64327dc52f809d388eff14d423eb9303d02bc602b628ae | content-sha256: 47ed5f42d21cba3d6bd478d1d03b7f763cf92b6d0c0e03bdcca15cd792b3049e -->
+<!-- DO NOT EDIT: exported from vault "Specs/SPEC-002 Payment Core and Ledger.md" by make export-docs | source-sha256: 76f7f81aca0dd55e86471781aec20e89c8741cbfee44fcbf5a1e8be3845b6dd0 | content-sha256: ceae8063d3911d5ef61f882e3fe15269fcc2c254884446aa3f4ac28a2e0dfdfa -->
 
 # SPEC-002 Payment Core and Ledger
 
@@ -53,9 +53,9 @@ Each criterion maps to at least one automated test that runs in CI, unless marke
 **States:** `created → settling → settled | failed`; `refunded` is a stretch goal. Transitions only ever move forward, enforced in SQL.
 
 **Data:**
-- **Tables:** `accounts` (id, owner, kind: user, merchant or clearing; currency), `payments` (as in Architecture › Data model (first cut), plus `state` and `rail_ref`), `ledger_entries` (payment_id, account_id, direction, amount; **sum per payment = 0**) and `idempotency_keys` (key, request hash, response, status, created_at).
+- **Tables:** `accounts` (id, owner, kind: user, merchant or clearing; currency), `payments` (as in Architecture › Data model (first cut), plus `state` and `rail_ref`), `ledger_entries` (payment_id, account_id, direction, amount; **sum per payment = 0**) and `idempotency_keys` (key, request hash, response, status, created_at). Exact columns and constraints as built: subtask 4a.
 - **Isolation:** postings run at `SERIALIZABLE` and retry on serialization failure.
-- **Migrations:** run by a migration tool (open question 1); never hand-edited after merge.
+- **Migrations:** goose v3.28.0 Provider in `internal/store`, run with `make migrate` (`gateway/cmd/migrate up`) under goose's advisory lock; never hand-edited after merge.
 
 **Idempotency:** PostgreSQL's unique key on `idempotency_keys` is the source of truth. Redis holds a short-lived in-flight lock, so concurrent duplicates wait rather than race. If Redis is down, correctness still comes from the PostgreSQL constraint.
 
@@ -115,15 +115,25 @@ Each takes at most a day, fits one session and leaves `make test` green. Under A
   - Logger: `dsn` and `database_url` become hard redaction terms (from Q9).
   - Tests with fake checks (ok, fail, timeout, no secret leak, 404 without checks) and config tests; no Docker. Re-export SPEC-002.
   - Touches `gateway/internal/httpx/{ready.go,ready_test.go,router.go,log.go,httpx_test.go}`, `gateway/internal/config/*`, `gateway/cmd/gateway/main.go`, `gateway/go.mod`, `gateway/go.sum`, `docs/specs/` (export).
-- [ ] 3b. **Compose stack.** Needs Docker Desktop running.
+- [x] 3b. **Compose stack.** *(PR #10, 71e6b9c, main d211656, CI green, 2026-10-03; AC7 met)* Needs Docker Desktop running.
   - `gateway/Dockerfile` (multi-stage; `CGO_ENABLED=0`; `gcr.io/distroless/static-debian12:nonroot`; `GO_VERSION` passed from `go.mod`), `gateway/.dockerignore`.
   - `infra/compose/compose.yml`: gateway, `postgres:16-alpine`, `redis:7-alpine`; healthchecks; named volume `pgdata`; ports on 127.0.0.1 only; dev-only credentials `agentgate/agentgate` inline (approved).
   - `make dev` (checks Docker, `compose up -d --build --wait`, polls `/readyz` up to 30 s); `make dev-down` (keeps the volume). CI stays unit-only.
   - Touches `gateway/Dockerfile`, `gateway/.dockerignore`, `infra/compose/compose.yml`, `infra/compose/README.md`, `Makefile`.
-- [ ] 4. **Test fixtures + schema v1.**
+- [x] 4. **Test fixtures + schema v1.** *(done via 4a + 4b, 2026-10-04)* Split into 4a/4b at planning (2026-10-04, Ivan): 10 files was over the ~8-file guideline.
   - `internal/testutil` (containerised PostgreSQL/Redis; open question 1).
   - Migration tool wiring + migration `0001` (`accounts`, `payments`, `ledger_entries`, `idempotency_keys`); `make migrate`.
   - Test: migrations apply cleanly, up and down.
+- [x] 4a. **Schema v1 + test fixtures (Go).** *(0b661dd on `feat/spec-002-4a-schema`, 2026-10-04; not yet pushed/merged)*
+  - `gateway/internal/store`: `migrations/00001_schema_v1.sql` (embedded), `Up`/`Down(ctx, *sql.DB)` through a goose v3.28.0 Provider (no globals).
+  - `gateway/internal/testutil`: `Postgres(t)` (fresh migrated database per test, dropped WITH FORCE; pool capped at 8, container `max_connections=300`; a leaked connection fails the test after 30 s), `Redis(t)` (one of 16 logical DBs per test, flushed in and out). One container per test binary, Ryuk cleanup; skips without Docker locally, fails when `CI` is set. testcontainers-go v0.44.0.
+  - Schema decisions (Ivan, 2026-10-04): uuid ids for accounts/payments, identity for ledger_entries; `direction` + positive `bigint` amount; GBP CHECK; `accounts.owner text NULL`; `payments.rail text NOT NULL` (CHECK added by subtask 9), `rail_ref`, nullable `mandate_id` (no FK until P2), payer ≠ payee CHECK, state text + CHECK; no `merchant_id` or `idempotency_key` on payments; `ledger_entries.payment_id NOT NULL`; `idempotency_keys` PK `(scope, key)` (scope default `''`), 32-byte `request_hash`, `completed` ⇔ `response_code` set (100–599). Zero-sum per payment is enforced by `ledger.Post` (subtask 5), not by 0001.
+  - Tests: migrate up/down/up, 27 bad rows by SQLSTATE, testutil isolation tests. Suite ~3–4 s.
+- [x] 4b. **Migration tooling + 3b follow-ups.** *(on `feat/spec-002-4b-migrate`, stacked on 4a, 2026-10-04; not yet pushed/merged)* `gateway/cmd/migrate` (with goose's Postgres session locker, from the 4a review), `make migrate`, `make dev-logs`, compose `pg_isready -h`, compose README, SPEC-002 re-export.
+  - **Follow-ups from the 3b review:** make the `make dev` failure hint runnable (it prints a `docker compose … logs` command that fails without `GO_VERSION`; prefix it or add `make dev-logs`); add `-h 127.0.0.1` to the `pg_isready` healthcheck before migrations depend on it.
+  - As built (Ivan, 2026-10-04): `cmd/migrate up` only (no `down`; `store.Down` stays test-only), exit 0/1/2, fixed-message errors, never prints the DSN. `store.Up`/`Down` take goose's PostgreSQL session advisory lock (1 s poll, 5 min), so concurrent runs serialise. `make migrate` runs on the host via `go run` with `DATABASE_URL ?=` the dev DSN (exported for that target only, unexpanded via `$(value)`); `make dev` does not migrate. `make dev-logs`; `pg_isready -h 127.0.0.1`.
+  - Tests: concurrent Up ×4 (one version row, no lock left), Up waits on a held lock, `cmd/migrate` usage/config errors, password never printed (AC8), success path up-then-no-op.
+  - Review nits deferred: second Ctrl-C doesn't kill during shutdown; no applied/no-op log (needs `store.Up` to return results — Registry interface change); fold both mains' pool setup into `store.OpenPool` at subtask 5; test lock-holder connection not unlocked on early fatal; comment that a failed goose unlock returns a locked session to the pool (matters before the gateway ever calls `store.Up`); `migrate -h` exits 2.
 - [ ] 5. **Ledger.**
   - `internal/ledger`: `Post(ctx, tx, entries)` with a balanced-sum check, `SERIALIZABLE` plus retry, and `Balance(account)`.
   - Unit and integration tests.
@@ -133,6 +143,7 @@ Each takes at most a day, fits one session and leaves `make test` green. Under A
 - [ ] 7. **Payment API + state machine.**
   - `internal/payments` (service + handlers): create and get, forward-only transitions, error codes.
   - Tests: handler tests, and state transitions that refuse to go backwards.
+  - **Follow-up from the 4a review:** `payments.updated_at` has no trigger, so every transition must set `updated_at = now()`; test that it moves.
 - [ ] 8. **Idempotency.**
   - `internal/idem` middleware: PostgreSQL key as source of truth, Redis in-flight lock, request hash, 409 on mismatch.
   - Test: AC3 with 100 concurrent goroutines against real containers.

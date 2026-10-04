@@ -6,6 +6,8 @@ Local development stack: the gateway, PostgreSQL 16 and Redis 7 (SPEC-002/3b). R
 
 ```sh
 make dev        # build the gateway image, start the stack, wait until /readyz is 200
+make migrate    # apply pending schema migrations to the stack's PostgreSQL
+make dev-logs   # follow every service's logs (Ctrl-C to stop)
 make dev-down   # stop the stack (keeps the PostgreSQL data volume)
 ```
 
@@ -20,6 +22,14 @@ make dev-down   # stop the stack (keeps the PostgreSQL data volume)
 If you already run PostgreSQL or Redis locally, ports 5432 or 6379 may be taken; stop the local service first.
 
 The credentials are dev-only placeholders for a throwaway local database, not secrets.
+
+## Migrations
+
+`make dev` does not migrate the database: run `make migrate` after starting the stack, and again whenever a new migration lands. It runs `gateway/cmd/migrate up` on the host with the pinned Go (not in the gateway image), against `127.0.0.1:5432` with the dev credentials above. Set `DATABASE_URL` in the environment to migrate a different database; the DSN is never printed.
+
+It only moves forward (`up`). Running it when nothing is pending is a no-op, and it is safe to run concurrently: each run takes a PostgreSQL advisory lock, so a second run waits (polling every second, for up to 5 minutes) and then finds nothing left to apply.
+
+If `make dev` reports that the gateway is not ready, `make dev-logs` shows why.
 
 ## Reset the data
 
