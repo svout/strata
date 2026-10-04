@@ -1,0 +1,63 @@
+// Package store owns the gateway's PostgreSQL schema and the code that
+// migrates it.
+package store
+
+import (
+	"context"
+	"database/sql"
+	"embed"
+	"fmt"
+	"io/fs"
+
+	"github.com/pressly/goose/v3"
+)
+
+// The SQL files are compiled into the binary, so a migration run never
+// depends on the working directory or on files shipped beside the binary.
+//
+//go:embed migrations/*.sql
+var embedded embed.FS
+
+// Up applies every pending migration to db. db must use a PostgreSQL
+// database/sql driver; the gateway uses pgx's stdlib adapter
+// (stdlib.OpenDBFromPool or sql.Open("pgx", ...)).
+func Up(ctx context.Context, db *sql.DB) error {
+	p, err := newProvider(db)
+	if err != nil {
+		return err
+	}
+	if _, err := p.Up(ctx); err != nil {
+		return fmt.Errorf("store: migrate up: %w", err)
+	}
+	return nil
+}
+
+// Down rolls back every applied migration, leaving an empty schema (goose's
+// own version table stays, recording version 0). It exists for tests and
+// local resets; production schemas only move forward.
+func Down(ctx context.Context, db *sql.DB) error {
+	p, err := newProvider(db)
+	if err != nil {
+		return err
+	}
+	if _, err := p.DownTo(ctx, 0); err != nil {
+		return fmt.Errorf("store: migrate down: %w", err)
+	}
+	return nil
+}
+
+// newProvider builds a goose Provider rather than using goose's package-level
+// functions: those keep the dialect, base FS and logger in globals, which
+// would make two tests migrating different databases in parallel race.
+func newProvider(db *sql.DB) (*goose.Provider, error) {
+	// Strip the "migrations/" prefix so goose sees the .sql files at the root.
+	fsys, err := fs.Sub(embedded, "migrations")
+	if err != nil {
+		return nil, fmt.Errorf("store: migrations fs: %w", err)
+	}
+	p, err := goose.NewProvider(goose.DialectPostgres, db, fsys)
+	if err != nil {
+		return nil, fmt.Errorf("store: goose provider: %w", err)
+	}
+	return p, nil
+}
