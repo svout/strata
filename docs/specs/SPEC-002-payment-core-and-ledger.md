@@ -12,7 +12,7 @@ adr:
   - ADR-115
 created: 2026-10-03
 ---
-<!-- DO NOT EDIT: exported from vault "Specs/SPEC-002 Payment Core and Ledger.md" by make export-docs | source-sha256: 76f7f81aca0dd55e86471781aec20e89c8741cbfee44fcbf5a1e8be3845b6dd0 | content-sha256: ceae8063d3911d5ef61f882e3fe15269fcc2c254884446aa3f4ac28a2e0dfdfa -->
+<!-- DO NOT EDIT: exported from vault "Specs/SPEC-002 Payment Core and Ledger.md" by make export-docs | source-sha256: 248fd1cc8b723ec289c12628c06ae40d95a477e93700e77e7de7df9ebea3a183 | content-sha256: 55cdfb4971e63c0ef80822bf85469a051d222f3483d84b52b7965cd17836d2d0 -->
 
 # SPEC-002 Payment Core and Ledger
 
@@ -134,10 +134,16 @@ Each takes at most a day, fits one session and leaves `make test` green. Under A
   - As built (Ivan, 2026-10-04): `cmd/migrate up` only (no `down`; `store.Down` stays test-only), exit 0/1/2, fixed-message errors, never prints the DSN. `store.Up`/`Down` take goose's PostgreSQL session advisory lock (1 s poll, 5 min), so concurrent runs serialise. `make migrate` runs on the host via `go run` with `DATABASE_URL ?=` the dev DSN (exported for that target only, unexpanded via `$(value)`); `make dev` does not migrate. `make dev-logs`; `pg_isready -h 127.0.0.1`.
   - Tests: concurrent Up ×4 (one version row, no lock left), Up waits on a held lock, `cmd/migrate` usage/config errors, password never printed (AC8), success path up-then-no-op.
   - Review nits deferred: second Ctrl-C doesn't kill during shutdown; no applied/no-op log (needs `store.Up` to return results — Registry interface change); fold both mains' pool setup into `store.OpenPool` at subtask 5; test lock-holder connection not unlocked on early fatal; comment that a failed goose unlock returns a locked session to the pool (matters before the gateway ever calls `store.Up`); `migrate -h` exits 2.
-- [ ] 5. **Ledger.**
-  - `internal/ledger`: `Post(ctx, tx, entries)` with a balanced-sum check, `SERIALIZABLE` plus retry, and `Balance(account)`.
-  - Unit and integration tests.
-  - **Follow-up from the 3a review:** this is the first step where the API shares the PostgreSQL pool, so stop `/readyz` from draining it: cache the readiness result for about 1 s (or singleflight), or give readiness its own 1-connection pool.
+- [ ] 5. **Ledger.** Split at planning (Ivan, 2026-10-04) into 5a and 5b; they share no files.
+  - [x] 5a. **Ledger.** Commits a8c23aa + ed7a0db on `feat/spec-002-5a-ledger` (stacked on 4b, not pushed).
+    - `internal/ledger`: `Post(ctx, tx, paymentID, entries)` with a balanced-sum check (≥ 2 legs, amounts > 0, debits = credits, overflow-checked). `Post` requires a `SERIALIZABLE` transaction and rejects any other; it can't retry inside the caller's transaction, so the retry lives in `store.Serializable(ctx, pool, fn)` (retries 40001/40P01, 5 attempts, jittered 10–200 ms backoff, respects `ctx`).
+    - `Balance(account)` = credits − debits for every account kind (the schema's `user`/`merchant`/`clearing` kinds aren't asset/liability classes, so there is no debit-normal kind).
+    - Unit and integration tests.
+    - Ids are `uuid.UUID` (google/uuid) in the exported API; converted to `pgtype.UUID` only at the SQL boundary (Ivan at review, 2026-10-04: driver types stay in the data layer).
+    - Review nits deferred: fold the isolation check into the INSERT (`WHERE current_setting('transaction_isolation') = 'serializable'`, `ErrNotSerializable` on 0 rows) to save a round trip per `Post`; explicit `$1::uuid` cast in the `INSERT … SELECT unnest`.
+  - [ ] 5b. **Pool and readiness** (must land before subtask 7).
+    - **Follow-up from the 3a review:** this is the first step where the API shares the PostgreSQL pool, so stop `/readyz` from draining it: cache the readiness result for about 1 s with one shared in-flight check (a mutex, no new dependency); no second pool.
+    - Fold both mains' pool setup into `store.OpenPool` (4b review nit), keeping each main's current error messages.
 - [ ] 6. **Ledger properties.**
   - `internal/ledger/property_test.go` (`rapid`): AC1 at 10k operations, and AC2 by fault injection.
 - [ ] 7. **Payment API + state machine.**
