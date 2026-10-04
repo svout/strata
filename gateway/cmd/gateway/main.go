@@ -12,11 +12,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/svout/agentgate/gateway/internal/config"
 	"github.com/svout/agentgate/gateway/internal/httpx"
+	"github.com/svout/agentgate/gateway/internal/store"
 )
 
 func main() {
@@ -34,14 +34,13 @@ func run() error {
 	log := httpx.NewLogger(os.Stdout, cfg.LogLevel)
 
 	// Both clients connect lazily: the gateway starts even if PostgreSQL or
-	// Redis is down, and /readyz reports it until they are up. Parse errors
+	// Redis is down, and /readyz reports it until they are up. Setup errors
 	// are reported with a fixed message, since the DSN or its error text
-	// may contain credentials.
-	pgCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
-	if err != nil {
+	// may contain credentials (OpenPool only returns its sentinels).
+	pool, err := store.OpenPool(context.Background(), cfg.DatabaseURL)
+	if errors.Is(err, store.ErrInvalidDSN) {
 		return errors.New("invalid DATABASE_URL")
 	}
-	pool, err := pgxpool.NewWithConfig(context.Background(), pgCfg)
 	if err != nil {
 		return errors.New("could not set up the PostgreSQL pool")
 	}

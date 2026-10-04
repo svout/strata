@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -103,5 +105,197 @@ func TestReadyz_NotMountedWithoutChecks(t *testing.T) {
 	rec, _ := getReadyz(t, NewLogger(io.Discard, slog.LevelInfo))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404 when no checks are configured", rec.Code)
+	}
+}
+
+// fakeClock is a settable clock for the /readyz cache.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+// countingCheck counts its runs; it blocks until release is closed (if
+// non-nil) or its ctx ends, and then returns err.
+type countingCheck struct {
+	calls   atomic.Int32
+	started chan struct{} // receives once per run
+	release chan struct{}
+	err     error
+}
+
+func newCountingCheck(release chan struct{}, err error) *countingCheck {
+	return &countingCheck{started: make(chan struct{}, 100), release: release, err: err}
+}
+
+func (c *countingCheck) Check(ctx context.Context) error {
+	c.calls.Add(1)
+	c.started <- struct{}{}
+	if c.release != nil {
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return c.err
+}
+
+// serveCached sends one /readyz request through a readyCache's handler.
+func serveCached(c *readyCache, ctx context.Context) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	c.handler(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil).WithContext(ctx))
+	return rec
+}
+
+func TestReadyz_ConcurrentCallersShareOneRun(t *testing.T) {
+	release := make(chan struct{})
+	check := newCountingCheck(release, nil)
+	cache := newReadyCache(NewLogger(io.Discard, slog.LevelInfo),
+		[]ReadyCheck{{"postgres", check.Check}}, (&fakeClock{t: time.Unix(0, 0)}).Now)
+
+	const n = 50
+	codes := make(chan int, n)
+	var wg sync.WaitGroup
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes <- serveCached(cache, context.Background()).Code
+		}()
+	}
+	<-check.started
+	// Give the other callers time to join the in-flight run. Any that arrive
+	// after release hit the cache instead (the fake clock never moves), so
+	// the assertion below holds either way.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	close(codes)
+
+	for code := range codes {
+		if code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", code)
+		}
+	}
+	if got := check.calls.Load(); got != 1 {
+		t.Fatalf("check ran %d times for %d concurrent callers, want 1", got, n)
+	}
+}
+
+func TestReadyz_CachedWithinTTLThenRerun(t *testing.T) {
+	check := newCountingCheck(nil, nil)
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	cache := newReadyCache(NewLogger(io.Discard, slog.LevelInfo),
+		[]ReadyCheck{{"postgres", check.Check}}, clock.Now)
+
+	serveCached(cache, context.Background())
+	clock.Advance(readyCacheTTL - time.Millisecond)
+	if rec := serveCached(cache, context.Background()); rec.Code != http.StatusOK {
+		t.Fatalf("cached status = %d, want 200", rec.Code)
+	}
+	if got := check.calls.Load(); got != 1 {
+		t.Fatalf("check ran %d times within the TTL, want 1", got)
+	}
+
+	clock.Advance(time.Millisecond)
+	serveCached(cache, context.Background())
+	if got := check.calls.Load(); got != 2 {
+		t.Fatalf("check ran %d times after the TTL, want 2", got)
+	}
+}
+
+func TestReadyz_Cached503StaysWithinTTL(t *testing.T) {
+	var fail atomic.Bool
+	fail.Store(true)
+	flaky := func(context.Context) error {
+		if fail.Load() {
+			return errors.New("connection refused")
+		}
+		return nil
+	}
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	cache := newReadyCache(NewLogger(io.Discard, slog.LevelInfo),
+		[]ReadyCheck{{"redis", flaky}}, clock.Now)
+
+	if rec := serveCached(cache, context.Background()); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("first status = %d, want 503", rec.Code)
+	}
+	fail.Store(false) // the dependency recovers, but the cached 503 holds
+	clock.Advance(readyCacheTTL / 2)
+	rec := serveCached(cache, context.Background())
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), `"redis":"fail"`) {
+		t.Fatalf("within TTL got %d %s, want cached 503 with redis fail", rec.Code, rec.Body)
+	}
+	clock.Advance(readyCacheTTL)
+	if rec := serveCached(cache, context.Background()); rec.Code != http.StatusOK {
+		t.Fatalf("after TTL status = %d, want 200", rec.Code)
+	}
+}
+
+func TestReadyz_FailureLoggedOncePerRun(t *testing.T) {
+	var buf bytes.Buffer
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	cache := newReadyCache(NewLogger(&buf, slog.LevelInfo),
+		[]ReadyCheck{{"redis", func(context.Context) error { return errors.New("refused") }}}, clock.Now)
+
+	for range 5 {
+		serveCached(cache, context.Background())
+	}
+	if got := strings.Count(buf.String(), "readiness check failed"); got != 1 {
+		t.Fatalf("logged %d failures for one run, want 1:\n%s", got, buf.String())
+	}
+	clock.Advance(readyCacheTTL)
+	serveCached(cache, context.Background())
+	if got := strings.Count(buf.String(), "readiness check failed"); got != 2 {
+		t.Fatalf("logged %d failures for two runs, want 2:\n%s", got, buf.String())
+	}
+}
+
+func TestReadyz_CancelledCallerDoesNotTimeOutOthers(t *testing.T) {
+	release := make(chan struct{})
+	check := newCountingCheck(release, nil) // returns ctx.Err() if its ctx ends
+	cache := newReadyCache(NewLogger(io.Discard, slog.LevelInfo),
+		[]ReadyCheck{{"postgres", check.Check}}, (&fakeClock{t: time.Unix(0, 0)}).Now)
+
+	// The first caller starts the run, then disconnects.
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		serveCached(cache, firstCtx)
+	}()
+	<-check.started
+	cancelFirst()
+	select {
+	case <-firstDone: // a cancelled waiter returns early
+	case <-time.After(time.Second):
+		t.Fatal("cancelled caller did not return")
+	}
+
+	// A second caller joins (or, if it arrives late, reads the cache). Had the
+	// run used the first caller's context, the check would already have
+	// ended as "timeout".
+	second := make(chan *httptest.ResponseRecorder, 1)
+	go func() { second <- serveCached(cache, context.Background()) }()
+	close(release)
+	rec := <-second
+
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"postgres":"ok"`) {
+		t.Fatalf("second caller got %d %s, want 200 with postgres ok", rec.Code, rec.Body)
+	}
+	if got := check.calls.Load(); got != 1 {
+		t.Fatalf("check ran %d times, want 1", got)
 	}
 }
