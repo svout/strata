@@ -12,7 +12,7 @@ adr:
   - ADR-115
 created: 2026-10-03
 ---
-<!-- DO NOT EDIT: exported from vault "Specs/SPEC-002 Payment Core and Ledger.md" by make export-docs | source-sha256: 248fd1cc8b723ec289c12628c06ae40d95a477e93700e77e7de7df9ebea3a183 | content-sha256: 55cdfb4971e63c0ef80822bf85469a051d222f3483d84b52b7965cd17836d2d0 -->
+<!-- DO NOT EDIT: exported from vault "Specs/SPEC-002 Payment Core and Ledger.md" by make export-docs | source-sha256: fd74baa431a87283e634f53abf77216338fdfb20b505492221b4bd75053d15d6 | content-sha256: d30d81eaf317d762d62789172d384f2b1e1b7e9b13efc5704f82e182848d4454 -->
 
 # SPEC-002 Payment Core and Ledger
 
@@ -124,26 +124,29 @@ Each takes at most a day, fits one session and leaves `make test` green. Under A
   - `internal/testutil` (containerised PostgreSQL/Redis; open question 1).
   - Migration tool wiring + migration `0001` (`accounts`, `payments`, `ledger_entries`, `idempotency_keys`); `make migrate`.
   - Test: migrations apply cleanly, up and down.
-- [x] 4a. **Schema v1 + test fixtures (Go).** *(0b661dd on `feat/spec-002-4a-schema`, 2026-10-04; not yet pushed/merged)*
+- [x] 4a. **Schema v1 + test fixtures (Go).** *(PR #12, 0b661dd, main d14140e, 2026-10-04)*
   - `gateway/internal/store`: `migrations/00001_schema_v1.sql` (embedded), `Up`/`Down(ctx, *sql.DB)` through a goose v3.28.0 Provider (no globals).
   - `gateway/internal/testutil`: `Postgres(t)` (fresh migrated database per test, dropped WITH FORCE; pool capped at 8, container `max_connections=300`; a leaked connection fails the test after 30 s), `Redis(t)` (one of 16 logical DBs per test, flushed in and out). One container per test binary, Ryuk cleanup; skips without Docker locally, fails when `CI` is set. testcontainers-go v0.44.0.
   - Schema decisions (Ivan, 2026-10-04): uuid ids for accounts/payments, identity for ledger_entries; `direction` + positive `bigint` amount; GBP CHECK; `accounts.owner text NULL`; `payments.rail text NOT NULL` (CHECK added by subtask 9), `rail_ref`, nullable `mandate_id` (no FK until P2), payer ≠ payee CHECK, state text + CHECK; no `merchant_id` or `idempotency_key` on payments; `ledger_entries.payment_id NOT NULL`; `idempotency_keys` PK `(scope, key)` (scope default `''`), 32-byte `request_hash`, `completed` ⇔ `response_code` set (100–599). Zero-sum per payment is enforced by `ledger.Post` (subtask 5), not by 0001.
   - Tests: migrate up/down/up, 27 bad rows by SQLSTATE, testutil isolation tests. Suite ~3–4 s.
-- [x] 4b. **Migration tooling + 3b follow-ups.** *(on `feat/spec-002-4b-migrate`, stacked on 4a, 2026-10-04; not yet pushed/merged)* `gateway/cmd/migrate` (with goose's Postgres session locker, from the 4a review), `make migrate`, `make dev-logs`, compose `pg_isready -h`, compose README, SPEC-002 re-export.
+- [x] 4b. **Migration tooling + 3b follow-ups.** *(PR #11, a24b6a8, main a660315, 2026-10-04)* `gateway/cmd/migrate` (with goose's Postgres session locker, from the 4a review), `make migrate`, `make dev-logs`, compose `pg_isready -h`, compose README, SPEC-002 re-export.
   - **Follow-ups from the 3b review:** make the `make dev` failure hint runnable (it prints a `docker compose … logs` command that fails without `GO_VERSION`; prefix it or add `make dev-logs`); add `-h 127.0.0.1` to the `pg_isready` healthcheck before migrations depend on it.
   - As built (Ivan, 2026-10-04): `cmd/migrate up` only (no `down`; `store.Down` stays test-only), exit 0/1/2, fixed-message errors, never prints the DSN. `store.Up`/`Down` take goose's PostgreSQL session advisory lock (1 s poll, 5 min), so concurrent runs serialise. `make migrate` runs on the host via `go run` with `DATABASE_URL ?=` the dev DSN (exported for that target only, unexpanded via `$(value)`); `make dev` does not migrate. `make dev-logs`; `pg_isready -h 127.0.0.1`.
   - Tests: concurrent Up ×4 (one version row, no lock left), Up waits on a held lock, `cmd/migrate` usage/config errors, password never printed (AC8), success path up-then-no-op.
   - Review nits deferred: second Ctrl-C doesn't kill during shutdown; no applied/no-op log (needs `store.Up` to return results — Registry interface change); fold both mains' pool setup into `store.OpenPool` at subtask 5; test lock-holder connection not unlocked on early fatal; comment that a failed goose unlock returns a locked session to the pool (matters before the gateway ever calls `store.Up`); `migrate -h` exits 2.
-- [ ] 5. **Ledger.** Split at planning (Ivan, 2026-10-04) into 5a and 5b; they share no files.
-  - [x] 5a. **Ledger.** Commits a8c23aa + ed7a0db on `feat/spec-002-5a-ledger` (stacked on 4b, not pushed).
+- [x] 5. **Ledger.** *(done via 5a + 5b, 2026-10-04)* Split at planning (Ivan, 2026-10-04) into 5a and 5b; they share no files.
+  - [x] 5a. **Ledger.** Commits a8c23aa + ed7a0db + 2e3f090 on `feat/spec-002-5a-ledger` (pushed 2026-10-04; PR to open against `main`).
     - `internal/ledger`: `Post(ctx, tx, paymentID, entries)` with a balanced-sum check (≥ 2 legs, amounts > 0, debits = credits, overflow-checked). `Post` requires a `SERIALIZABLE` transaction and rejects any other; it can't retry inside the caller's transaction, so the retry lives in `store.Serializable(ctx, pool, fn)` (retries 40001/40P01, 5 attempts, jittered 10–200 ms backoff, respects `ctx`).
     - `Balance(account)` = credits − debits for every account kind (the schema's `user`/`merchant`/`clearing` kinds aren't asset/liability classes, so there is no debit-normal kind).
     - Unit and integration tests.
     - Ids are `uuid.UUID` (google/uuid) in the exported API; converted to `pgtype.UUID` only at the SQL boundary (Ivan at review, 2026-10-04: driver types stay in the data layer).
     - Review nits deferred: fold the isolation check into the INSERT (`WHERE current_setting('transaction_isolation') = 'serializable'`, `ErrNotSerializable` on 0 rows) to save a round trip per `Post`; explicit `$1::uuid` cast in the `INSERT … SELECT unnest`.
-  - [ ] 5b. **Pool and readiness** (must land before subtask 7).
+  - [x] 5b. **Pool and readiness** (must land before subtask 7). *(on `feat/spec-002-5b-pool-readiness`, stacked on 5a, 2026-10-04; not pushed)*
     - **Follow-up from the 3a review:** this is the first step where the API shares the PostgreSQL pool, so stop `/readyz` from draining it: cache the readiness result for about 1 s with one shared in-flight check (a mutex, no new dependency); no second pool.
     - Fold both mains' pool setup into `store.OpenPool` (4b review nit), keeping each main's current error messages.
+    - As built: `store.OpenPool(ctx, dsn)` is lazy (pgx defaults, no connect) and returns only `ErrInvalidDSN`/`ErrPoolSetup`; each main maps them with `errors.Is` to its unchanged messages. `/readyz` caches its result (503 included) for 1 s from the end of a run; concurrent callers share one run (mutex + done channel) on a detached context, so a disconnecting caller can't cut it short; failures are logged once per run. `NewRouter` signature unchanged; no new dependency.
+    - Tests: OpenPool hides the password on a malformed DSN, stays lazy on an unreachable host; readyz: 50 callers → 1 run, TTL cache then rerun, cached 503, one log per run, cancelled caller doesn't time out others. Gateway suite 7.8 s with `-race`; readyz ×10 no flakes.
+    - Review nits deferred: no `cmd/gateway` test for its error strings (give `run` a `getenv` seam); `ErrPoolSetup` branch untested (defensive); a disconnected `/readyz` caller logs status 0 instead of 503; put `run`'s store/close block in a `defer`; `context.Background()` reads clearer than `WithoutCancel`; tests for TTL-from-finish and all-callers-cancel; move the store package doc to `doc.go`.
 - [ ] 6. **Ledger properties.**
   - `internal/ledger/property_test.go` (`rapid`): AC1 at 10k operations, and AC2 by fault injection.
 - [ ] 7. **Payment API + state machine.**

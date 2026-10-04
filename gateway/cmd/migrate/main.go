@@ -10,13 +10,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/svout/agentgate/gateway/internal/config"
@@ -56,21 +56,20 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 	}
 	log := httpx.NewLogger(stdout, cfg.LogLevel)
 
-	// Fixed message: the DSN, and pgx's parse error about it, may contain
-	// the password.
-	pgCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
-	if err != nil {
-		printErr(stderr, "migrate: invalid DATABASE_URL\n")
-		return 1
-	}
-
 	// Ctrl-C cancels the run; goose then releases its lock on a detached
 	// context, and PostgreSQL drops it anyway when the session ends.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, runTimeout)
 	defer cancel()
-	pool, err := pgxpool.NewWithConfig(ctx, pgCfg)
+
+	// Fixed messages: the DSN, and pgx's parse error about it, may contain
+	// the password (OpenPool only returns its sentinels).
+	pool, err := store.OpenPool(ctx, cfg.DatabaseURL)
+	if errors.Is(err, store.ErrInvalidDSN) {
+		printErr(stderr, "migrate: invalid DATABASE_URL\n")
+		return 1
+	}
 	if err != nil {
 		printErr(stderr, "migrate: could not set up the PostgreSQL pool\n")
 		return 1

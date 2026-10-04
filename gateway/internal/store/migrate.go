@@ -1,5 +1,5 @@
-// Package store owns the gateway's PostgreSQL schema and the code that
-// migrates it.
+// Package store owns the gateway's PostgreSQL schema, the code that migrates
+// it, pool setup (OpenPool) and the transaction helper (Serializable).
 package store
 
 import (
