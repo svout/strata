@@ -17,7 +17,10 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "agentgate", "-d", "agentgate"]
+      # -h 127.0.0.1: probe over TCP, as clients connect. Without it pg_isready
+      # uses the Unix socket, which is up during initdb's temporary server, so
+      # the check could pass before the real server is listening.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "agentgate", "-d", "agentgate"]
       interval: 2s
       timeout: 3s
       retries: 15

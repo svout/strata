@@ -20,7 +20,13 @@ GO_VERSION := $(GO_TOOLCHAIN:go%=%)
 export GO_VERSION
 COMPOSE := docker compose -f infra/compose/compose.yml
 
-.PHONY: help install-lint lint test dev dev-down export-docs check-docs
+# Database for `make migrate` (SPEC-002/4b): defaults to the `make dev`
+# PostgreSQL, with the same dev-only placeholder credentials as compose.yml.
+# Set DATABASE_URL in the environment to migrate another database. Recipes
+# must never echo it: it can hold a real password.
+DATABASE_URL ?= postgres://agentgate:agentgate@127.0.0.1:5432/agentgate?sslmode=disable
+
+.PHONY: help install-lint lint test dev dev-down dev-logs migrate export-docs check-docs
 
 help: ## List the make targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-13s %s\n", $$1, $$2}'
@@ -64,10 +70,22 @@ dev: ## Start the local stack (gateway, PostgreSQL 16, Redis 7) and wait until /
 	  sleep 1; \
 	done; \
 	curl -sS http://127.0.0.1:8080/readyz >&2 || true; \
-	echo "gateway not ready after 30 s; see: $(COMPOSE) logs gateway" >&2; exit 1
+	echo "gateway not ready after 30 s; see: make dev-logs" >&2; exit 1
 
 dev-down: ## Stop the local stack (keeps the pgdata volume)
 	$(COMPOSE) down
+
+dev-logs: ## Follow the local stack's logs (Ctrl-C to stop)
+	$(COMPOSE) logs -f
+
+# Runs on the host with the pinned Go, not in the gateway image. The DSN is
+# passed through the environment (exported for this target only), so it never
+# appears in the echoed command line. Safe to run concurrently: runs are
+# serialised by goose's PostgreSQL advisory lock. $(value) passes it through
+# unexpanded, so a `$` in a real password isn't eaten by make.
+migrate: export DATABASE_URL := $(value DATABASE_URL)
+migrate: ## Apply pending schema migrations to DATABASE_URL (default: the make dev database)
+	cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) go run ./cmd/migrate up
 
 export-docs: ## Export vault specs into docs/specs (one-way, ADR-107; needs STRATA_VAULT)
 	@python3 scripts/export_docs.py export
