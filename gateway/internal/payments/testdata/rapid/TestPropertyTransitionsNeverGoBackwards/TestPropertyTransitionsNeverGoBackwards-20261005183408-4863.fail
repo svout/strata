@@ -1,0 +1,11 @@
+# 2026/10/05 18:34:08.146690 [TestPropertyTransitionsNeverGoBackwards] [rapid] draw steps: []payments.State{"settling", "settling"}
+# 2026/10/05 18:34:08.147089 [TestPropertyTransitionsNeverGoBackwards] settling -> settling: err = <nil>, legal = false
+# 
+v0.4.8#13977507093744929525
+0x0
+0x0
+0x0
+0x71c71c71c71c7
+0x0
+0x0
+0x0
