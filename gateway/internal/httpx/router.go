@@ -1,12 +1,15 @@
 package httpx
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/json"
 	"log/slog"
+	"net"
 	"net/http"
 	"regexp"
+	"runtime/debug"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -24,7 +27,7 @@ func NewRouter(log *slog.Logger, checks ...ReadyCheck) *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(requestID)
 	r.Use(requestLog(log))
-	r.Use(middleware.Recoverer)
+	r.Use(recoverer(log))
 
 	r.Get("/healthz", healthz)
 	if len(checks) > 0 {
@@ -104,6 +107,77 @@ func requestLog(log *slog.Logger) func(http.Handler) http.Handler {
 		})
 	}
 }
+
+// recoverer turns a handler panic into a 500 internal_error problem. It logs a
+// fixed message with the request ID and stack, never the panic value: that can
+// be anything the handler held (a card number, a DSN), and chi's Recoverer
+// printed it to stderr, past the redacting logger. http.ErrAbortHandler is
+// re-panicked so net/http aborts the response as it intends.
+//
+// It sits inside requestLog, so the request log records the 500. If the
+// handler already started the response (a status, a byte, a flush or a
+// hijack), nothing more is written: a problem body appended to a partial
+// response would corrupt it. startedWriter tracks that itself, because chi's
+// writer leaves Status at 0 after a bare Flush or Hijack.
+//
+// The stack shows frame arguments only as hex words, never dereferenced, so
+// strings and errors (the panic value included) can't appear in it.
+func recoverer(log *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			sw := &startedWriter{ResponseWriter: w}
+			defer func() {
+				rec := recover()
+				if rec == nil {
+					return
+				}
+				if rec == http.ErrAbortHandler { //nolint:errorlint // net/http compares by identity too
+					panic(rec)
+				}
+				log.LogAttrs(r.Context(), slog.LevelError, "handler panicked",
+					slog.String("request_id", RequestID(r.Context())),
+					slog.String("stack", string(debug.Stack())),
+				)
+				if !sw.started {
+					WriteProblem(w, http.StatusInternalServerError, "internal_error", "Internal Server Error")
+				}
+			}()
+			next.ServeHTTP(sw, r)
+		})
+	}
+}
+
+// startedWriter records whether the response has started. It implements
+// Flusher and Hijacker itself so handlers keep both, and Unwrap so
+// http.ResponseController reaches the underlying writer.
+type startedWriter struct {
+	http.ResponseWriter
+	started bool
+}
+
+func (w *startedWriter) WriteHeader(code int) {
+	if code >= 200 || code == http.StatusSwitchingProtocols { // other 1xx are interim
+		w.started = true
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *startedWriter) Write(b []byte) (int, error) {
+	w.started = true
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *startedWriter) Flush() {
+	w.started = true
+	_ = http.NewResponseController(w.ResponseWriter).Flush() // like http.Flusher: no error to report
+}
+
+func (w *startedWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	w.started = true
+	return http.NewResponseController(w.ResponseWriter).Hijack()
+}
+
+func (w *startedWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // RequestIDHeader carries the request ID in and out.
 const RequestIDHeader = "X-Request-Id"

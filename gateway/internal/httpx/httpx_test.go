@@ -365,6 +365,136 @@ func TestNewRouter_MountedSubrouterGetsMiddleware(t *testing.T) {
 	}
 }
 
+// AC8: a panic becomes a 500 internal_error problem; the log has the request
+// ID and stack under a fixed message, and the panic value appears nowhere: not
+// in the log, the body or stderr (where chi's Recoverer used to print it).
+func TestRecoverer_HidesPanicValue(t *testing.T) {
+	const secret = "sk_live_recoverer_4242"
+	for name, v := range map[string]any{
+		"string": secret,
+		"error":  errors.New("dial postgres://app:" + secret + "@db"),
+		"struct": struct{ Card string }{secret},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			r := NewRouter(NewLogger(&buf, slog.LevelInfo))
+			r.Get("/boom", func(http.ResponseWriter, *http.Request) { panic(v) })
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/boom", nil)
+			req.Header.Set(RequestIDHeader, "req-panic-1")
+			stderr := captureStderr(t, func() { r.ServeHTTP(rec, req) })
+
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500", rec.Code)
+			}
+			if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+				t.Fatalf("Content-Type = %q, want application/problem+json", ct)
+			}
+			if got := rec.Body.String(); got != string(internalErrorBody) {
+				t.Fatalf("body = %s, want the fixed internal_error problem", got)
+			}
+			assertSafetyHeaders(t, rec)
+
+			out := buf.String()
+			for _, want := range []string{`"msg":"handler panicked"`, `"request_id":"req-panic-1"`, `"stack":"goroutine `, `"status":500`} {
+				if !strings.Contains(out, want) {
+					t.Errorf("log missing %s:\n%s", want, out)
+				}
+			}
+			for where, got := range map[string]string{"log": out, "body": rec.Body.String(), "stderr": stderr} {
+				if strings.Contains(got, secret) {
+					t.Errorf("panic value leaked to %s:\n%s", where, got)
+				}
+			}
+			if stderr != "" {
+				t.Errorf("recoverer wrote to stderr:\n%s", stderr)
+			}
+		})
+	}
+}
+
+// net/http uses http.ErrAbortHandler to abort a response silently; the
+// recoverer must hand it back rather than turn it into a 500.
+func TestRecoverer_RepanicsErrAbortHandler(t *testing.T) {
+	var buf bytes.Buffer
+	r := NewRouter(NewLogger(&buf, slog.LevelInfo))
+	r.Get("/abort", func(http.ResponseWriter, *http.Request) { panic(http.ErrAbortHandler) })
+
+	defer func() {
+		if got := recover(); got != http.ErrAbortHandler { //nolint:errorlint // identity, as net/http checks
+			t.Fatalf("recovered %v, want http.ErrAbortHandler re-panicked", got)
+		}
+		if strings.Contains(buf.String(), "handler panicked") {
+			t.Errorf("abort logged as a panic:\n%s", buf.String())
+		}
+	}()
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/abort", nil))
+	t.Fatal("ServeHTTP returned; want ErrAbortHandler re-panicked")
+}
+
+// A handler that already started its response can't be given a problem body:
+// the response keeps what was sent and gets nothing appended. Flush and a
+// bare Write count as started, though chi's writer still reports Status 0
+// after a Flush.
+func TestRecoverer_AfterResponseStartedAddsNothing(t *testing.T) {
+	for name, tc := range map[string]struct {
+		handler  func(http.ResponseWriter)
+		wantCode int
+		wantBody string
+	}{
+		"WriteHeader": {func(w http.ResponseWriter) { w.WriteHeader(http.StatusAccepted) }, http.StatusAccepted, ""},
+		"Write":       {func(w http.ResponseWriter) { _, _ = w.Write([]byte("partial")) }, http.StatusOK, "partial"},
+		"Flush":       {func(w http.ResponseWriter) { _ = http.NewResponseController(w).Flush() }, http.StatusOK, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			r := NewRouter(NewLogger(&buf, slog.LevelInfo))
+			r.Get("/late", func(w http.ResponseWriter, _ *http.Request) {
+				tc.handler(w)
+				panic("late")
+			})
+
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/late", nil))
+
+			if rec.Code != tc.wantCode || rec.Body.String() != tc.wantBody {
+				t.Fatalf("got %d %q, want %d %q untouched", rec.Code, rec.Body.String(), tc.wantCode, tc.wantBody)
+			}
+			if !strings.Contains(buf.String(), `"msg":"handler panicked"`) {
+				t.Fatalf("late panic not logged:\n%s", buf.String())
+			}
+		})
+	}
+}
+
+// captureStderr runs fn with os.Stderr redirected and returns what it wrote.
+// Tests in this package don't run in parallel, so swapping the global is safe.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	rd, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan string)
+	go func() {
+		b, _ := io.ReadAll(rd) // drains concurrently, so a large write can't block fn
+		done <- string(b)
+	}()
+	orig := os.Stderr
+	os.Stderr = wr
+	defer func() { // also runs if fn fails the test, so the reader always ends
+		os.Stderr = orig
+		_ = wr.Close()
+	}()
+	fn()
+	os.Stderr = orig
+	_ = wr.Close()
+	out := <-done
+	_ = rd.Close()
+	return out
+}
+
 func TestRequestID_GeneratedWhenAbsent(t *testing.T) {
 	var buf bytes.Buffer
 	h := NewRouter(NewLogger(&buf, slog.LevelInfo))
