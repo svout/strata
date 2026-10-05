@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +18,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/svout/agentgate/gateway/internal/httpx"
+	"github.com/svout/agentgate/gateway/internal/idem"
+	"github.com/svout/agentgate/gateway/internal/store"
 	"github.com/svout/agentgate/gateway/internal/testutil"
 )
 
@@ -44,7 +48,7 @@ func (a *testAPI) do(method, path, key, body string, header ...string) *httptest
 	a.t.Helper()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	if key != "" {
-		req.Header.Set(IdempotencyKeyHeader, key)
+		req.Header.Set(idem.Header, key)
 	}
 	for i := 0; i+1 < len(header); i += 2 {
 		req.Header.Set(header[i], header[i+1])
@@ -104,10 +108,15 @@ func TestHTTP_CreateThenGet(t *testing.T) {
 		}
 	}
 
-	// Subtask 7 checks the key but stores nothing (subtask 8 does).
-	var keys int
-	if err := a.pool.QueryRow(t.Context(), "SELECT count(*) FROM idempotency_keys").Scan(&keys); err != nil || keys != 0 {
-		t.Fatalf("idempotency_keys rows = %d (%v), want 0", keys, err)
+	// The key is stored, completed, with the exact 201 response (ADR-118).
+	var (
+		status string
+		code   int
+		body   []byte
+	)
+	err := a.pool.QueryRow(t.Context(), "SELECT status, response_code, response_body FROM idempotency_keys WHERE key = 'key-1'").Scan(&status, &code, &body)
+	if err != nil || status != "completed" || code != http.StatusCreated || string(body)+"\n" != rec.Body.String() {
+		t.Fatalf("stored key = %s %d %s (%v), want completed 201 with the response body", status, code, body, err)
 	}
 }
 
@@ -235,6 +244,148 @@ func TestHTTP_ClientCancelled(t *testing.T) {
 	}
 	if !strings.Contains(a.log.String(), `"status":0`) {
 		t.Fatalf("request log should record status 0:\n%s", a.log)
+	}
+}
+
+// AC3: 100 concurrent requests with the same Idempotency-Key and body create
+// exactly one payment and one key, and all 100 get the same response.
+func TestHTTP_AC3_ConcurrentSameKeyExactlyOnce(t *testing.T) {
+	t.Parallel()
+	a := newTestAPI(t)
+	const n = 100
+	body := a.body("")
+
+	type result struct {
+		code     int
+		body     string
+		location string
+	}
+	results := make([]result, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range n {
+		wg.Go(func() {
+			<-start
+			rec := a.do(http.MethodPost, "/v1/payments", "ac3-key", body)
+			results[i] = result{rec.Code, rec.Body.String(), rec.Header().Get("Location")}
+		})
+	}
+	close(start)
+	wg.Wait()
+
+	for i, r := range results {
+		if r.code != http.StatusCreated || r != results[0] {
+			t.Fatalf("response %d = %+v, want the same 201 as response 0 (%+v)", i, r, results[0])
+		}
+	}
+	var payments, keys int
+	ctx := t.Context()
+	if err := a.pool.QueryRow(ctx, "SELECT count(*) FROM payments").Scan(&payments); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.pool.QueryRow(ctx, "SELECT count(*) FROM idempotency_keys").Scan(&keys); err != nil {
+		t.Fatal(err)
+	}
+	if payments != 1 || keys != 1 {
+		t.Fatalf("payments = %d, keys = %d; want exactly 1 each", payments, keys)
+	}
+	if c, r := strings.Count(a.log.String(), `"msg":"payment created"`), strings.Count(a.log.String(), `"msg":"payment replayed"`); c != 1 || r != n-1 {
+		t.Fatalf("log: %d created, %d replayed; want 1 and %d", c, r, n-1)
+	}
+}
+
+// AC3: the same key with a different body is 409, and creates nothing.
+func TestHTTP_SameKeyDifferentBody(t *testing.T) {
+	t.Parallel()
+	a := newTestAPI(t)
+	first := a.do(http.MethodPost, "/v1/payments", "k-mismatch", a.body(""))
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first = %d: %s", first.Code, first.Body)
+	}
+	changed := strings.Replace(a.body(""), "1250", "1251", 1)
+	assertProblem(t, a.do(http.MethodPost, "/v1/payments", "k-mismatch", changed), http.StatusConflict, "idempotency_key_mismatch")
+
+	// Same body with different whitespace and member order is the same request.
+	reordered := `{ "payee_account_id":"` + a.payee.String() + `", "currency":"GBP", "amount":1250, "payer_account_id":"` + a.payer.String() + `" }`
+	replay := a.do(http.MethodPost, "/v1/payments", "k-mismatch", reordered)
+	if replay.Code != http.StatusCreated || replay.Body.String() != first.Body.String() {
+		t.Fatalf("reordered body: %d %s, want the replayed 201", replay.Code, replay.Body)
+	}
+	var payments int
+	if err := a.pool.QueryRow(t.Context(), "SELECT count(*) FROM payments").Scan(&payments); err != nil || payments != 1 {
+		t.Fatalf("payments = %d (%v), want 1", payments, err)
+	}
+}
+
+// Only a 201 is stored: a failed request leaves the key free, so a corrected
+// retry with the same key succeeds.
+func TestHTTP_FailureIsNotStored(t *testing.T) {
+	t.Parallel()
+	a := newTestAPI(t)
+	unknown := strings.Replace(a.body(""), a.payee.String(), uuid.NewString(), 1)
+	assertProblem(t, a.do(http.MethodPost, "/v1/payments", "k-retry", unknown), http.StatusUnprocessableEntity, "account_not_found")
+	assertProblem(t, a.do(http.MethodPost, "/v1/payments", "k-retry", strings.Replace(a.body(""), "1250", "0", 1)), http.StatusUnprocessableEntity, "invalid_amount")
+
+	var keys int
+	if err := a.pool.QueryRow(t.Context(), "SELECT count(*) FROM idempotency_keys").Scan(&keys); err != nil || keys != 0 {
+		t.Fatalf("keys after failures = %d (%v), want 0", keys, err)
+	}
+	if rec := a.do(http.MethodPost, "/v1/payments", "k-retry", a.body("")); rec.Code != http.StatusCreated {
+		t.Fatalf("corrected retry = %d: %s, want 201", rec.Code, rec.Body)
+	}
+}
+
+// Decision 6: a replay is byte-identical and logged at Info with the payment
+// id and the key's digest, never the key.
+func TestHTTP_ReplayLogged(t *testing.T) {
+	t.Parallel()
+	a := newTestAPI(t)
+	const key = "replay-sk_live_keytext"
+	first := a.do(http.MethodPost, "/v1/payments", key, a.body(""))
+	again := a.do(http.MethodPost, "/v1/payments", key, a.body(""))
+	if again.Code != first.Code || again.Body.String() != first.Body.String() || again.Header().Get("Location") != first.Header().Get("Location") {
+		t.Fatalf("replay differs: %d %s vs %d %s", again.Code, again.Body, first.Code, first.Body)
+	}
+	var p Payment
+	if err := json.Unmarshal(first.Body.Bytes(), &p); err != nil {
+		t.Fatal(err)
+	}
+	digest := idem.Key{Value: key}.Digest()
+	out := a.log.String()
+	if !strings.Contains(out, `"msg":"payment replayed","payment_id":"`+p.ID.String()+`","amount":1250,"idempotency_key_digest":"`+digest+`"`) {
+		t.Fatalf("replay log line missing:\n%s", out)
+	}
+	if strings.Contains(out, "sk_live_keytext") {
+		t.Fatalf("raw key logged:\n%s", out)
+	}
+}
+
+// fail maps service errors that are hard to provoke through a real database:
+// retry exhaustion (decided by Ivan: 503 try_again_later with Retry-After) and
+// a wrapped mismatch.
+func TestFail_Mapping(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err        error
+		status     int
+		code       string
+		retryAfter string
+	}{
+		"retry limit": {fmt.Errorf("store: 5 attempts: %w", store.ErrRetryLimit), http.StatusServiceUnavailable, "try_again_later", "1"},
+		"mismatch":    {fmt.Errorf("wrapped: %w", idem.ErrMismatch), http.StatusConflict, "idempotency_key_mismatch", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			h := handler{log: httpx.NewLogger(&buf, slog.LevelInfo)}
+			rec := httptest.NewRecorder()
+			h.fail(rec, httptest.NewRequest(http.MethodPost, "/v1/payments", nil), tc.err)
+			assertProblem(t, rec, tc.status, tc.code)
+			if got := rec.Header().Get("Retry-After"); got != tc.retryAfter {
+				t.Errorf("Retry-After = %q, want %q", got, tc.retryAfter)
+			}
+			if strings.Contains(buf.String(), "store: 5 attempts") {
+				t.Errorf("error text reached the log at the mapped level:\n%s", buf.String())
+			}
+		})
 	}
 }
 
