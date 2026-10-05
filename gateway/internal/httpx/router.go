@@ -13,10 +13,14 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 )
 
-// NewRouter builds the gateway's HTTP handler. Later subtasks mount the
-// payment API on it. It serves /healthz (liveness), and /readyz when
-// readiness checks are given.
-func NewRouter(log *slog.Logger, checks ...ReadyCheck) http.Handler {
+// NewRouter builds the gateway's HTTP handler. It serves /healthz (liveness),
+// and /readyz when readiness checks are given.
+//
+// It returns the concrete *chi.Mux so APIs are mounted on it
+// (r.Mount("/v1/payments", h)) rather than on a second router: middleware
+// added here with Use applies to every route, mounted ones included, so each
+// API gets the request ID, request log and panic recovery for free.
+func NewRouter(log *slog.Logger, checks ...ReadyCheck) *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(requestID)
 	r.Use(requestLog(log))
@@ -30,13 +34,56 @@ func NewRouter(log *slog.Logger, checks ...ReadyCheck) http.Handler {
 }
 
 func healthz(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
+// WriteJSON writes v as an application/json response with the given status.
+func WriteJSON(w http.ResponseWriter, status int, v any) {
+	writeBody(w, status, "application/json", v)
+}
+
+// problem is an RFC 9457 problem details body. Type is always "about:blank",
+// so Title is the HTTP status phrase or a short fixed summary; Code is the
+// machine-readable error code agents branch on.
+type problem struct {
+	Type   string `json:"type"`
+	Title  string `json:"title"`
+	Status int    `json:"status"`
+	Code   string `json:"code"`
+}
+
+// WriteProblem writes an RFC 9457 application/problem+json error. It takes a
+// fixed code and title, not an error, on purpose: error text can carry
+// internal detail (driver messages, hosts, query strings), and nothing internal
+// may reach an agent (gateway/CLAUDE.md). Log the error separately if needed.
+func WriteProblem(w http.ResponseWriter, status int, code, title string) {
+	writeBody(w, status, "application/problem+json",
+		problem{Type: "about:blank", Title: title, Status: status, Code: code})
+}
+
+// internalErrorBody is sent when a response body can't be encoded. It is a
+// constant, so the fallback itself can't fail.
+var internalErrorBody = []byte(`{"type":"about:blank","title":"Internal Server Error","status":500,"code":"internal_error"}` + "\n")
+
+// writeBody marshals v before sending any header, so a value that can't be
+// encoded (NaN, a channel, a failing MarshalJSON) becomes a 500 problem
+// instead of the intended status with an empty body. The request log records
+// the 500; the encode error itself is not logged, as it may quote the value.
+// Every API response is marked nosniff and no-store: payment data must not be
+// content-sniffed or cached by intermediaries.
+func writeBody(w http.ResponseWriter, status int, contentType string, v any) {
+	body, err := json.Marshal(v)
+	if err != nil {
+		status, contentType, body = http.StatusInternalServerError, "application/problem+json", internalErrorBody
+	} else {
+		body = append(body, '\n') // as json.Encoder did
+	}
+	h := w.Header()
+	h.Set("Content-Type", contentType)
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v) // the status line is already sent; nothing useful to do on error
+	_, _ = w.Write(body) // the status line is already sent; nothing useful to do on error
 }
 
 // requestLog logs one line per request: method, path, status, duration and

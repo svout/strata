@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"testing/slogtest"
+
+	"github.com/go-chi/chi/v5"
 )
 
 func TestHealthz_ReturnsOK(t *testing.T) {
@@ -97,9 +100,47 @@ func TestIsSensitive(t *testing.T) {
 		"mandate_id": false, "payload_digest": false, "signing_key_id": false,
 		"span_id": false, "company": false, "payment_id": false, "amount": false,
 		"request_id": false, "idempotency_key": false, "": false,
+
+		// open question 9 (7a): new hard terms ignore keep-suffixes
+		"cardholder": true, "cardholder_name": true, "cardholderId": true,
+		"bearer": true, "bearer_token": true, "bearerToken": true, "jwt": true, "id_jwt": true, "jwt_alg": true,
+		"otp": true, "otp_code": true, "accesskey": true, "access_key": true, "awsAccessKeyId": true,
+		// card data stays redacted, even partly
+		"pan_last4": true, "card_last4": true, "cardLast4": true,
+		// session is soft
+		"session": true, "session_token": true, "sessionKey": true, "sessions": true,
+		"session_id": false, "sessionId": false, "session_count": false,
+		// plural and digit forms
+		"signatures": true, "apiKeys": true, "api_keys": true, "cvv2": true, "CVV2": true, "tokens": true,
+		"bodies": true, "cards": true, "pins": true, "jwts": true, "otps": true, "secrets": true,
+		"auth_tokens": true, "token_2": true, "sig1": true,
+		"signatures_valid": false, "token_counts": false, "mandate_ids": false, "payload_hashes": false,
+		// leaks found at 7a verify: one-word compounds and missing terms
+		"totp_code": true, "totp": true, "hotp_secret": true, "passcode": true, "user_passcode": true,
+		"sessionkey": true, "pinblock": true, "pin_block": true, "track2": true, "track1_data": true,
+		"trackData": true, "trackdata": true,
+		"sessionkey_id": false, "track_id": false, "tracking_number": false,
 	} {
 		if got := isSensitive(key); got != want {
 			t.Errorf("isSensitive(%q) = %v, want %v", key, got, want)
+		}
+	}
+}
+
+// Keys the gateway logs routinely, plus ordinary words that end in s or
+// contain a short term, must survive the plural, digit and substring rules.
+func TestIsSensitive_MustNotRedact(t *testing.T) {
+	for _, key := range []string{
+		"request_id", "requestId", "payment_id", "paymentID", "amount", "amount_minor", "status", "statuses",
+		"state", "from_state", "currency", "passes", "processes", "process", "address", "addresses",
+		"rail", "rails", "account_id", "accounts", "entries", "ledger_entry_id", "attempts", "retries",
+		"duration", "method", "path", "checks", "idempotency_key", "span_id", "company", "spans",
+		"options", "footprint", "pinned", "opinion", "panel", "expansion", "pending", "sha256", "v2",
+		"session_id", "mandate_id", "signature_valid", "token_count", "types", "ids", "is_ok",
+		"tracking_number", "tracks_id", "topic", "spinner", "opt_in", "author", "authority",
+	} {
+		if isSensitive(key) {
+			t.Errorf("isSensitive(%q) = true, want false", key)
 		}
 	}
 }
@@ -158,6 +199,169 @@ func TestLogger_OmitsNonScalarAny(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %s in:\n%s", want, out)
 		}
+	}
+}
+
+type (
+	paymentID string
+	state     string
+	minor     int64
+	attempt   uint8
+	settled   bool
+	rate      float64
+)
+
+// A Stringer that must never be called: named scalars log their underlying value.
+type loudID string
+
+func (loudID) String() string { return "via-stringer" }
+
+func TestLogger_NamedScalarsLogUnderlyingKind(t *testing.T) {
+	var buf bytes.Buffer
+	log := NewLogger(&buf, slog.LevelInfo)
+
+	log.Info("named",
+		slog.Any("payment_id", paymentID("pay_123")),
+		slog.Any("state", state("settling")),
+		slog.Any("amount", minor(-1500)),
+		slog.Any("attempt", attempt(3)),
+		slog.Any("settled", settled(true)),
+		slog.Any("rate", rate(0.5)),
+		slog.Any("loud", loudID("raw")),
+		slog.Any("session", paymentID("sess_secret")), // redaction by key comes first
+	)
+
+	out := buf.String()
+	for _, want := range []string{
+		`"payment_id":"pay_123"`, `"state":"settling"`, `"amount":-1500`, `"attempt":3`,
+		`"settled":true`, `"rate":0.5`, `"loud":"raw"`, `"session":"[REDACTED]"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %s in:\n%s", want, out)
+		}
+	}
+	for _, bad := range []string{"OMITTED", "via-stringer", "sess_secret"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("unexpected %s in:\n%s", bad, out)
+		}
+	}
+}
+
+func TestWriteJSON(t *testing.T) {
+	rec := httptest.NewRecorder()
+	WriteJSON(rec, http.StatusCreated, map[string]int{"n": 1})
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+	if got := strings.TrimSpace(rec.Body.String()); got != `{"n":1}` {
+		t.Fatalf("body = %s", got)
+	}
+	assertSafetyHeaders(t, rec)
+}
+
+// A value json can't encode must not go out as the intended status with an
+// empty body: it becomes a fixed 500 problem that quotes nothing from v.
+func TestWriteJSON_EncodeFailureIs500Problem(t *testing.T) {
+	for name, v := range map[string]any{
+		"NaN":     math.NaN(),
+		"channel": map[string]any{"c": make(chan int)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			WriteJSON(rec, http.StatusCreated, v)
+
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500", rec.Code)
+			}
+			if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+				t.Fatalf("Content-Type = %q, want application/problem+json", ct)
+			}
+			var body map[string]any
+			if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			if body["code"] != "internal_error" || body["status"] != float64(500) || len(body) != 4 {
+				t.Fatalf("body = %v, want the fixed internal_error problem", body)
+			}
+			assertSafetyHeaders(t, rec)
+		})
+	}
+}
+
+func assertSafetyHeaders(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
+}
+
+func TestWriteProblem(t *testing.T) {
+	rec := httptest.NewRecorder()
+	WriteProblem(rec, http.StatusNotFound, "payment_not_found", "Payment not found")
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("Content-Type = %q, want application/problem+json", ct)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	// Exactly these members: no "detail", "instance" or anything carrying error text.
+	want := map[string]any{"type": "about:blank", "title": "Payment not found", "status": float64(404), "code": "payment_not_found"}
+	if len(body) != len(want) {
+		t.Fatalf("body = %v, want exactly %v", body, want)
+	}
+	for k, v := range want {
+		if body[k] != v {
+			t.Errorf("body[%q] = %v, want %v", k, body[k], v)
+		}
+	}
+	assertSafetyHeaders(t, rec)
+}
+
+// 7b mounts the payment API on NewRouter; mounted routes must get the same
+// request ID, request log and panic recovery as the router's own.
+func TestNewRouter_MountedSubrouterGetsMiddleware(t *testing.T) {
+	var buf bytes.Buffer
+	r := NewRouter(NewLogger(&buf, slog.LevelInfo))
+	sub := chi.NewRouter()
+	sub.Get("/{id}", func(w http.ResponseWriter, r *http.Request) {
+		WriteJSON(w, http.StatusOK, map[string]string{"request_id": RequestID(r.Context())})
+	})
+	sub.Get("/boom/x", func(http.ResponseWriter, *http.Request) { panic("boom") })
+	r.Mount("/v1/things", sub)
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/things/abc", nil))
+	id := rec.Header().Get(RequestIDHeader)
+	if rec.Code != http.StatusOK || !generatedID.MatchString(id) {
+		t.Fatalf("status = %d, %s = %q; want 200 and a generated id", rec.Code, RequestIDHeader, id)
+	}
+	if !strings.Contains(rec.Body.String(), id) {
+		t.Fatalf("handler did not see the request id in its context: %s", rec.Body.String())
+	}
+	if !strings.Contains(buf.String(), `"path":"/v1/things/abc","status":200`) {
+		t.Fatalf("mounted request not logged:\n%s", buf.String())
+	}
+
+	buf.Reset()
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/things/boom/x", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("panic: status = %d, want 500", rec.Code)
+	}
+	if !strings.Contains(buf.String(), `"status":500`) {
+		t.Fatalf("recovered panic not logged as 500:\n%s", buf.String())
 	}
 }
 

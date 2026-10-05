@@ -77,7 +77,7 @@ func (c *readyCache) handler(w http.ResponseWriter, r *http.Request) {
 	if res.code != http.StatusOK {
 		status = "not_ready"
 	}
-	writeJSON(w, res.code, map[string]any{"status": status, "checks": res.statuses})
+	WriteJSON(w, res.code, map[string]any{"status": status, "checks": res.statuses})
 }
 
 // get returns a fresh cached result, or joins (or starts) the in-flight run
