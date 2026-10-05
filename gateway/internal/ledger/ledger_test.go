@@ -126,14 +126,7 @@ func TestPostWritesBalancedLegs(t *testing.T) {
 	if n := countEntries(ctx, t, pool, f.payment); n != len(entries) {
 		t.Errorf("entries = %d, want %d", n, len(entries))
 	}
-	var signed int64
-	err = pool.QueryRow(ctx, `
-		SELECT sum(CASE direction WHEN 'credit' THEN amount ELSE -amount END)
-		FROM ledger_entries WHERE payment_id = $1`, pgUUID(f.payment)).Scan(&signed)
-	if err != nil {
-		t.Fatalf("signed sum: %v", err)
-	}
-	if signed != 0 {
+	if signed := paymentSum(ctx, t, pool, f.payment); signed != 0 {
 		t.Errorf("signed sum for payment = %d, want 0", signed)
 	}
 }
@@ -296,6 +289,20 @@ func countEntries(ctx context.Context, t *testing.T, pool *pgxpool.Pool, payment
 		t.Fatalf("count entries: %v", err)
 	}
 	return n
+}
+
+// paymentSum is the signed sum (credits − debits) of payment's entries: 0 for
+// a balanced payment, and for one with no entries.
+func paymentSum(ctx context.Context, t *testing.T, pool *pgxpool.Pool, payment uuid.UUID) int64 {
+	t.Helper()
+	var signed int64
+	err := pool.QueryRow(ctx, `
+		SELECT COALESCE(sum(CASE direction WHEN 'credit' THEN amount ELSE -amount END), 0)::bigint
+		FROM ledger_entries WHERE payment_id = $1`, pgUUID(payment)).Scan(&signed)
+	if err != nil {
+		t.Fatalf("signed sum: %v", err)
+	}
+	return signed
 }
 
 func testContext(t *testing.T) context.Context {
