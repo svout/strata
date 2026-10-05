@@ -22,16 +22,32 @@ import (
 //     hardSubstrings, or a word in hardWords.
 //   - Soft terms (softWords, softPairs) are redacted unless the key's last word
 //     is a verdict or identifier in keepSuffixes, so "signature_valid",
-//     "token_count" and "mandate_id" are logged while "signature",
-//     "auth_token" and "apiKey" are not.
+//     "token_count", "mandate_id" and "session_id" are logged while
+//     "signature", "auth_token", "apiKey" and "session" are not.
+//   - Before word matching, trailing digits are dropped ("cvv2" → cvv,
+//     "last4" → last; an all-digit word disappears) and a word also matches a
+//     term when it is that term's plural ("signatures", "apiKeys", "bodies";
+//     see hasTerm). Plurals are matched against the term lists rather than
+//     stemmed, so ordinary words ending in s ("status", "passes",
+//     "processes") are never cut down and can't collide with a term.
+//   - Card data is never loggable, not even partly: "pan_last4" and
+//     "card_last4" are redacted (ADR-105), and "cardholder" is hard.
 //
 // Free-text messages are not inspected: never put secrets in a message.
+//
+// Substrings catch compounds written as one word ("bearertoken",
+// "awsAccessKeyId"), so only terms that don't occur inside ordinary words go
+// there; "otp" is a word because it sits inside "footprint".
 var (
-	hardSubstrings = []string{"secret", "passw", "authorization", "credential", "cookie", "privatekey", "databaseurl"}
-	hardWords      = set("pan", "cvc", "cvv", "pin", "private", "dsn")
-	softWords      = set("token", "tokens", "signature", "sig", "auth", "mandate", "body", "payload", "card", "apikey", "signingkey", "hmackey")
-	softPairs      = set("api key", "signing key", "hmac key")
-	keepSuffixes   = set("valid", "alg", "count", "result", "ok", "len", "type", "id", "digest", "hash")
+	hardSubstrings = []string{"secret", "passw", "passcode", "authorization", "credential", "cookie", "privatekey", "databaseurl",
+		"cardholder", "bearer", "jwt", "accesskey"}
+	hardWords = set("pan", "cvc", "cvv", "pin", "pinblock", "private", "dsn", "otp", "totp", "hotp")
+	// "track" is card track data ("track2" → track); soft, so "track_id" is
+	// still logged. One-word compounds of soft terms are listed as words.
+	softWords = set("token", "signature", "sig", "auth", "mandate", "body", "payload", "card", "apikey", "signingkey", "hmackey",
+		"session", "sessionkey", "track", "trackdata")
+	softPairs    = set("api key", "signing key", "hmac key")
+	keepSuffixes = set("valid", "alg", "count", "result", "ok", "len", "type", "id", "digest", "hash")
 )
 
 const redacted = "[REDACTED]"
@@ -78,7 +94,9 @@ func (h *redactHandler) WithGroup(name string) slog.Handler {
 // sanitize redacts a by key, walks groups, and never emits non-scalar Any
 // values: maps, structs and slices log as "[OMITTED <type>]". A type that
 // must be logged should implement slog.LogValuer, which resolves to a group and
-// is then redacted key by key. Errors log their message.
+// is then redacted key by key. Errors log their message. Named scalars
+// (type PaymentID string) log their underlying value; see scalarValue. A
+// pointer, even to a named scalar, is not dereferenced and logs as OMITTED.
 //
 // It follows the slog.Handler contract: ok is false for an empty Attr and for
 // a group with no members, and a group with an empty key is inlined, so its
@@ -100,6 +118,9 @@ func sanitize(a slog.Attr, redactAll bool) (_ slog.Attr, ok bool) {
 	case slog.KindAny:
 		if err, isErr := a.Value.Any().(error); isErr {
 			return slog.String(a.Key, errorText(err)), true
+		}
+		if v, isScalar := scalarValue(a.Value.Any()); isScalar {
+			return slog.Attr{Key: a.Key, Value: v}, true
 		}
 		return slog.String(a.Key, fmt.Sprintf("[OMITTED %T]", a.Value.Any())), true
 	default:
@@ -124,6 +145,31 @@ func groupAttr(key string, members []slog.Attr) (slog.Attr, bool) {
 	return slog.Attr{Key: key, Value: slog.GroupValue(members...)}, true
 }
 
+// scalarValue converts a value of a named scalar type (type PaymentID string,
+// type State string, named ints, uints, floats and bools) to its underlying
+// kind. slog.AnyValue already does this for the unnamed types, so only named
+// ones arrive here as KindAny. The value is read with reflect, never through
+// String() or fmt: a Stringer may mask, expand or panic, and the logged value
+// should be exactly what is stored. Errors are handled before this, so a named
+// string that implements error still logs its message.
+func scalarValue(v any) (slog.Value, bool) {
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.String:
+		return slog.StringValue(rv.String()), true
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return slog.Int64Value(rv.Int()), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64: // not Uintptr: an address, no domain meaning
+		return slog.Uint64Value(rv.Uint()), true
+	case reflect.Float32, reflect.Float64:
+		return slog.Float64Value(rv.Float()), true
+	case reflect.Bool:
+		return slog.BoolValue(rv.Bool()), true
+	default:
+		return slog.Value{}, false
+	}
+}
+
 // errorText returns err.Error() without letting a broken error take the
 // logger down: a typed-nil pointer logs "<nil>" (as slog's own handlers do),
 // and any other panic in Error() logs a fixed marker, never the panic value.
@@ -141,7 +187,7 @@ func errorText(err error) (s string) {
 }
 
 func isSensitive(key string) bool {
-	words := splitWords(key)
+	words := normalizeWords(splitWords(key))
 	if len(words) == 0 {
 		return false
 	}
@@ -153,14 +199,44 @@ func isSensitive(key string) bool {
 	}
 	soft := false
 	for i, w := range words {
-		if hardWords[w] {
+		if hasTerm(hardWords, w) {
 			return true
 		}
-		if softWords[w] || (i > 0 && softPairs[words[i-1]+" "+w]) {
+		if hasTerm(softWords, w) || (i > 0 && hasTerm(softPairs, words[i-1]+" "+w)) {
 			soft = true
 		}
 	}
-	return soft && !keepSuffixes[words[len(words)-1]]
+	return soft && !hasTerm(keepSuffixes, words[len(words)-1])
+}
+
+// normalizeWords drops trailing digits from each word ("cvv2" → cvv) and
+// removes words that were only digits ("token_2" → [token]).
+func normalizeWords(words []string) []string {
+	out := words[:0]
+	for _, w := range words {
+		if w = strings.TrimRightFunc(w, unicode.IsDigit); w != "" {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// hasTerm reports whether w is in terms, either as is or as the plural of a
+// term (+s, +es, y → ies). It only strips a suffix when what remains is a
+// term, so "status" or "processes" can't match unless "statu" or "process"
+// were terms. For a pair ("api keys") the suffix is on the last word.
+func hasTerm(terms map[string]bool, w string) bool {
+	if terms[w] {
+		return true
+	}
+	if base, ok := strings.CutSuffix(w, "ies"); ok && terms[base+"y"] {
+		return true
+	}
+	if base, ok := strings.CutSuffix(w, "es"); ok && terms[base] {
+		return true
+	}
+	base, ok := strings.CutSuffix(w, "s")
+	return ok && terms[base]
 }
 
 // splitWords lower-cases key and splits it on non-alphanumerics and camelCase
