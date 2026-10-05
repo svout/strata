@@ -2,12 +2,14 @@ package payments
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -192,6 +194,47 @@ func TestHTTP_LogsIDAsTextAndNoSecrets(t *testing.T) {
 		if strings.Contains(s, secret) {
 			t.Errorf("secret leaked to %s:\n%s", where, s)
 		}
+	}
+}
+
+// A request whose deadline has passed gets the timeout problem, not a 500.
+func TestHTTP_RequestTimeout(t *testing.T) {
+	t.Parallel()
+	a := newTestAPI(t)
+	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/v1/payments/"+uuid.NewString(), nil)
+	rec := httptest.NewRecorder()
+	a.router.ServeHTTP(rec, req)
+	assertProblem(t, rec, http.StatusServiceUnavailable, "request_timeout")
+	if got := rec.Header().Get("Retry-After"); got != "1" {
+		t.Errorf("Retry-After = %q, want \"1\"", got)
+	}
+	if !strings.Contains(a.log.String(), `"msg":"payment request timed out"`) {
+		t.Fatalf("timeout not logged:\n%s", a.log)
+	}
+}
+
+// A client that disconnected (request context cancelled) is not a server
+// error: nothing is written and nothing is logged at Error.
+func TestHTTP_ClientCancelled(t *testing.T) {
+	t.Parallel()
+	a := newTestAPI(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/v1/payments/"+uuid.NewString(), nil)
+	rec := httptest.NewRecorder()
+	a.router.ServeHTTP(rec, req)
+	if rec.Body.Len() != 0 || rec.Header().Get("Content-Type") != "" {
+		t.Fatalf("wrote a response to a gone client: %d %s", rec.Code, rec.Body)
+	}
+	if strings.Contains(a.log.String(), `"level":"ERROR"`) {
+		t.Fatalf("cancellation logged as an error:\n%s", a.log)
+	}
+	if !strings.Contains(a.log.String(), `"status":0`) {
+		t.Fatalf("request log should record status 0:\n%s", a.log)
 	}
 }
 

@@ -1,6 +1,7 @@
 package payments
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -18,6 +19,11 @@ import (
 // idempotency_keys CHECK counts them in subtask 8, near enough for ASCII keys). Subtask 7
 // only checks it; storing and replaying (subtask 8) comes later.
 const IdempotencyKeyHeader = "Idempotency-Key"
+
+// retryAfterSeconds is sent with 503 request_timeout. A fixed, small value
+// tells an agent to back off briefly instead of retrying at once; with an
+// Idempotency-Key (subtask 8) the retry is safe.
+const retryAfterSeconds = "1"
 
 // maxBodyBytes caps a create request; a payment body is a few hundred bytes.
 const maxBodyBytes = 64 << 10
@@ -121,6 +127,20 @@ func (h handler) fail(w http.ResponseWriter, r *http.Request, err error) {
 		httpx.WriteProblem(w, http.StatusUnprocessableEntity, "same_account", "Payer and payee must be different accounts")
 	case errors.Is(err, ErrAccountNotFound):
 		httpx.WriteProblem(w, http.StatusUnprocessableEntity, "account_not_found", "Payer or payee account not found")
+	case errors.Is(err, context.DeadlineExceeded):
+		// The router's request deadline ran out (httpx requestTimeout).
+		h.log.LogAttrs(r.Context(), slog.LevelError, "payment request timed out",
+			slog.String("request_id", httpx.RequestID(r.Context())),
+		)
+		w.Header().Set("Retry-After", retryAfterSeconds)
+		httpx.WriteProblem(w, http.StatusServiceUnavailable, "request_timeout", "Request timed out")
+	case errors.Is(err, context.Canceled):
+		// The client went away (net/http cancels the request context on
+		// disconnect). Not a server error, and there is no one to answer:
+		// log at Debug and write nothing (status 0 in the request log).
+		h.log.LogAttrs(r.Context(), slog.LevelDebug, "payment request cancelled by client",
+			slog.String("request_id", httpx.RequestID(r.Context())),
+		)
 	default:
 		h.log.LogAttrs(r.Context(), slog.LevelError, "payment request failed",
 			slog.Any("error", err),

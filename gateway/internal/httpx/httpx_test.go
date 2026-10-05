@@ -2,6 +2,7 @@ package httpx
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,10 +13,14 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"testing/slogtest"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+
+	"github.com/svout/agentgate/gateway/internal/testutil"
 )
 
 func TestHealthz_ReturnsOK(t *testing.T) {
@@ -466,6 +471,121 @@ func TestRecoverer_AfterResponseStartedAddsNothing(t *testing.T) {
 			}
 		})
 	}
+}
+
+// AC8: net/http's own error log (here, a panic outside every recoverer)
+// becomes a fixed message; the panic value and stack reach neither the log
+// nor stderr.
+func TestServerErrorLog_PanicOutsideHandler(t *testing.T) {
+	const secret = "sk_live_server_errlog_4242"
+	var buf syncBuffer
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic(secret) }))
+	ts.Config.ErrorLog = NewServerErrorLog(NewLogger(&buf, slog.LevelInfo))
+
+	stderr := captureStderr(t, func() {
+		ts.Start()
+		defer ts.Close()
+		if res, err := ts.Client().Get(ts.URL); err == nil { // net/http drops the connection
+			_ = res.Body.Close()
+			t.Errorf("GET succeeded with %d, want the connection dropped", res.StatusCode)
+		}
+		// net/http logs before closing the connection; poll in case that changes.
+		for deadline := time.Now().Add(2 * time.Second); !strings.Contains(buf.String(), "panic outside handler") && time.Now().Before(deadline); {
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+
+	out := buf.String()
+	if !strings.Contains(out, `"level":"ERROR","msg":"panic outside handler"`) {
+		t.Fatalf("panic not logged as the fixed message:\n%s", out)
+	}
+	for where, got := range map[string]string{"log": out, "stderr": stderr} {
+		for _, bad := range []string{secret, "goroutine ", "http: panic serving"} {
+			if strings.Contains(got, bad) {
+				t.Errorf("%s contains %q:\n%s", where, bad, got)
+			}
+		}
+	}
+}
+
+func TestServerErrorLog_FixedMessages(t *testing.T) {
+	var buf bytes.Buffer
+	l := NewServerErrorLog(NewLogger(&buf, slog.LevelInfo))
+	l.Printf("http: panic serving 10.0.0.1:5555: card 4242424242424242\ngoroutine 7 [running]:\n")
+	l.Printf("http: superfluous response.WriteHeader call from x (secret sk_live_x)")
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], `"msg":"panic outside handler"`) || !strings.Contains(lines[1], `"msg":"http server error"`) {
+		t.Fatalf("got:\n%s", buf.String())
+	}
+	for _, bad := range []string{"4242", "goroutine", "sk_live", "10.0.0.1", "superfluous"} {
+		if strings.Contains(buf.String(), bad) {
+			t.Errorf("log contains %q:\n%s", bad, buf.String())
+		}
+	}
+}
+
+// Every request context carries the router's deadline, on mounted APIs and
+// the router's own routes alike.
+func TestNewRouter_RequestContextHasDeadline(t *testing.T) {
+	r := NewRouter(NewLogger(io.Discard, slog.LevelInfo))
+	var got time.Duration
+	check := func(w http.ResponseWriter, r *http.Request) {
+		if d, ok := r.Context().Deadline(); ok {
+			got = time.Until(d)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+	sub := chi.NewRouter()
+	sub.Get("/x", check)
+	r.Mount("/v1/things", sub)
+	r.Get("/own", check)
+
+	for _, path := range []string{"/v1/things/x", "/own"} {
+		got = 0
+		r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, nil))
+		if got <= requestTimeout-time.Second || got > requestTimeout {
+			t.Errorf("%s: deadline in %v, want about %v", path, got, requestTimeout)
+		}
+	}
+}
+
+// The deadline actually cuts a slow query made with the request context.
+func TestRequestTimeout_CutsSlowQuery(t *testing.T) {
+	pool := testutil.Postgres(t)
+	r := newRouter(NewLogger(io.Discard, slog.LevelInfo), 200*time.Millisecond)
+	var err error
+	var took time.Duration
+	r.Get("/slow", func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		_, err = pool.Exec(r.Context(), "SELECT pg_sleep(30)")
+		took = time.Since(start)
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/slow", nil))
+	if !errors.Is(err, context.DeadlineExceeded) || took > 2*time.Second {
+		t.Fatalf("slow query: err = %v after %v, want DeadlineExceeded within ~200ms", err, took)
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the server goroutine to write while
+// the test reads.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // captureStderr runs fn with os.Stderr redirected and returns what it wrote.

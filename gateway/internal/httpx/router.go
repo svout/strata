@@ -22,12 +22,24 @@ import (
 // It returns the concrete *chi.Mux so APIs are mounted on it
 // (r.Mount("/v1/payments", h)) rather than on a second router: middleware
 // added here with Use applies to every route, mounted ones included, so each
-// API gets the request ID, request log and panic recovery for free.
+// API gets the request ID, request log, panic recovery and request deadline
+// for free.
 func NewRouter(log *slog.Logger, checks ...ReadyCheck) *chi.Mux {
+	return newRouter(log, requestTimeout, checks...)
+}
+
+// requestTimeout bounds every request's context, so each query or call made
+// with r.Context() has a deadline (gateway/CLAUDE.md). It is half the
+// server's WriteTimeout (10 s), so a timeout response can still be written.
+const requestTimeout = 5 * time.Second
+
+// newRouter is NewRouter with the timeout as a parameter, for tests.
+func newRouter(log *slog.Logger, timeout time.Duration, checks ...ReadyCheck) *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(requestID)
 	r.Use(requestLog(log))
 	r.Use(recoverer(log))
+	r.Use(withTimeout(timeout))
 
 	r.Get("/healthz", healthz)
 	if len(checks) > 0 {
@@ -178,6 +190,20 @@ func (w *startedWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 }
 
 func (w *startedWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// withTimeout gives the request context a deadline. It writes nothing: a
+// handler sees the context error from its own calls and renders its own
+// problem. (chi's middleware.Timeout instead writes a bodyless 504 after the
+// handler returns, even over a response the handler already sent.)
+func withTimeout(d time.Duration) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, cancel := context.WithTimeout(r.Context(), d)
+			defer cancel()
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
 
 // RequestIDHeader carries the request ID in and out.
 const RequestIDHeader = "X-Request-Id"

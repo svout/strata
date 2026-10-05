@@ -2,9 +2,11 @@
 package httpx
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"reflect"
 	"strings"
@@ -55,6 +57,35 @@ const redacted = "[REDACTED]"
 // NewLogger returns a JSON logger at lvl that redacts sensitive attributes.
 func NewLogger(w io.Writer, lvl slog.Level) *slog.Logger {
 	return slog.New(&redactHandler{inner: slog.NewJSONHandler(w, &slog.HandlerOptions{Level: lvl})})
+}
+
+// NewServerErrorLog returns the logger for http.Server.ErrorLog. net/http
+// writes plain text there, past the redacting logger: accept errors,
+// "superfluous WriteHeader" warnings and, for a panic that escapes every
+// recoverer (one in requestID or requestLog), "http: panic serving <addr>:
+// <panic value>" followed by the stack. None of that text is logged: each
+// line becomes one fixed Error message, as cmd/gateway's redisLogger does for
+// go-redis. net/http writes a panic and its stack in one call, so both are
+// dropped together.
+func NewServerErrorLog(l *slog.Logger) *log.Logger {
+	return log.New(serverErrorWriter{l}, "", 0)
+}
+
+type serverErrorWriter struct{ log *slog.Logger }
+
+// panicPrefix starts net/http's line for a panic it recovered itself. The
+// bundled HTTP/2 server writes "http2: panic serving …" instead, which logs as
+// "http server error": nothing leaks, only the message is less specific.
+// HTTP/2 is off (no TLS, no h2c); match that prefix too if it is enabled.
+var panicPrefix = []byte("http: panic serving")
+
+func (w serverErrorWriter) Write(p []byte) (int, error) {
+	msg := "http server error"
+	if bytes.HasPrefix(p, panicPrefix) {
+		msg = "panic outside handler"
+	}
+	w.log.LogAttrs(context.Background(), slog.LevelError, msg)
+	return len(p), nil
 }
 
 // redactHandler sanitises every attribute before passing it on. Once a group
