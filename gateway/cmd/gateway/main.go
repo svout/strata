@@ -16,6 +16,7 @@ import (
 
 	"github.com/svout/agentgate/gateway/internal/config"
 	"github.com/svout/agentgate/gateway/internal/httpx"
+	"github.com/svout/agentgate/gateway/internal/payments"
 	"github.com/svout/agentgate/gateway/internal/store"
 )
 
@@ -54,9 +55,13 @@ func run() error {
 		{Name: "redis", Check: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
 	}
 
+	router := httpx.NewRouter(log, checks...)
+	router.Mount("/v1/payments", payments.New(pool).Handler(log))
+
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           httpx.NewRouter(log, checks...),
+		Handler:           router,
+		ErrorLog:          httpx.NewServerErrorLog(log),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
