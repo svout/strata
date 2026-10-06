@@ -3,6 +3,7 @@ package payments
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"pgregory.net/rapid"
 
+	"github.com/svout/agentgate/gateway/internal/idem"
 	"github.com/svout/agentgate/gateway/internal/testutil"
 )
 
@@ -26,7 +28,7 @@ func TestCreateGet_RoundTrip(t *testing.T) {
 	payer, payee := newAccount(ctx, t, pool), newAccount(ctx, t, pool)
 	mandate := uuid.New()
 
-	p, err := svc.Create(ctx, CreateInput{Amount: 1250, Currency: "GBP", PayerAccountID: payer, PayeeAccountID: payee, MandateID: &mandate})
+	p, err := svc.create(ctx, CreateInput{Amount: 1250, Currency: "GBP", PayerAccountID: payer, PayeeAccountID: payee, MandateID: &mandate})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -47,7 +49,7 @@ func TestCreateGet_RoundTrip(t *testing.T) {
 		t.Fatalf("Get = %+v, want %+v", got, p)
 	}
 
-	noMandate, err := svc.Create(ctx, CreateInput{Amount: 1, Currency: "GBP", PayerAccountID: payer, PayeeAccountID: payee})
+	noMandate, err := svc.create(ctx, CreateInput{Amount: 1, Currency: "GBP", PayerAccountID: payer, PayeeAccountID: payee})
 	if err != nil || noMandate.MandateID != nil {
 		t.Fatalf("Create without mandate = %+v, %v; want nil MandateID", noMandate, err)
 	}
@@ -84,7 +86,7 @@ func TestCreate_Rejects(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			in := valid
 			tc.edit(&in)
-			if _, err := svc.Create(ctx, in); !errors.Is(err, tc.want) {
+			if _, err := svc.create(ctx, in); !errors.Is(err, tc.want) {
 				t.Fatalf("Create = %v, want %v", err, tc.want)
 			}
 		})
@@ -116,7 +118,7 @@ func TestTransitions_ForwardOnly(t *testing.T) {
 	// at returns a fresh payment in state s, reached by legal edges.
 	at := func(t *testing.T, s State) Payment {
 		t.Helper()
-		p, err := svc.Create(ctx, CreateInput{Amount: 10, Currency: "GBP", PayerAccountID: payer, PayeeAccountID: payee})
+		p, err := svc.create(ctx, CreateInput{Amount: 10, Currency: "GBP", PayerAccountID: payer, PayeeAccountID: payee})
 		for _, step := range pathTo[s] {
 			if err == nil {
 				p, err = apply(ctx, svc, p.ID, step)
@@ -182,7 +184,7 @@ func TestTransitions_ConcurrentOneWins(t *testing.T) {
 	payer, payee := newAccount(ctx, t, pool), newAccount(ctx, t, pool)
 
 	for range 20 {
-		p, err := svc.Create(ctx, CreateInput{Amount: 10, Currency: "GBP", PayerAccountID: payer, PayeeAccountID: payee})
+		p, err := svc.create(ctx, CreateInput{Amount: 10, Currency: "GBP", PayerAccountID: payer, PayeeAccountID: payee})
 		if err == nil {
 			_, err = svc.MarkSettling(ctx, p.ID, "rail-ref")
 		}
@@ -226,7 +228,7 @@ func TestPropertyTransitionsNeverGoBackwards(t *testing.T) {
 	payer, payee := newAccount(ctx, t, pool), newAccount(ctx, t, pool)
 
 	rapid.Check(t, func(rt *rapid.T) {
-		p, err := svc.Create(ctx, CreateInput{Amount: 1, Currency: "GBP", PayerAccountID: payer, PayeeAccountID: payee})
+		p, err := svc.create(ctx, CreateInput{Amount: 1, Currency: "GBP", PayerAccountID: payer, PayeeAccountID: payee})
 		if err != nil {
 			rt.Fatalf("Create: %v", err)
 		}
@@ -255,7 +257,68 @@ func TestPropertyTransitionsNeverGoBackwards(t *testing.T) {
 	})
 }
 
+// Property: under any sequence of creates with reused keys and bodies, a key
+// is bound to its first successful request: the same request replays the same
+// payment, a different one is ErrMismatch, and the number of payments equals
+// the number of distinct keys used successfully.
+func TestPropertyKeyReuseNeverCreatesSecondPayment(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	ctx := t.Context()
+	svc := New(pool)
+	payer, payee := newAccount(ctx, t, pool), newAccount(ctx, t, pool)
+	var run int
+
+	rapid.Check(t, func(rt *rapid.T) {
+		run++
+		type bound struct {
+			amount int64
+			id     uuid.UUID
+		}
+		model := map[string]bound{}
+		// Count every payment, not only those a key points to: a stray
+		// insert on the replay path must fail the property too.
+		before := countPayments(ctx, rt, pool)
+		steps := rapid.IntRange(1, 12).Draw(rt, "steps")
+		for range steps {
+			key := idem.Key{Value: fmt.Sprintf("run%d-k%d", run, rapid.IntRange(0, 2).Draw(rt, "key"))}
+			amount := rapid.Int64Range(1, 3).Draw(rt, "amount")
+			hash := idem.Hash(idem.Request{Method: "POST", Path: "/v1/payments", Body: []byte(fmt.Sprint(amount))})
+			res, err := svc.CreateIdempotent(ctx, key, hash, CreateInput{Amount: amount, Currency: "GBP", PayerAccountID: payer, PayeeAccountID: payee})
+
+			b, seen := model[key.Value]
+			switch {
+			case !seen:
+				if err != nil || res.Replayed {
+					rt.Fatalf("new key %s: %+v, %v", key.Value, res, err)
+				}
+				model[key.Value] = bound{amount, res.PaymentID}
+			case b.amount == amount:
+				if err != nil || !res.Replayed || res.PaymentID != b.id {
+					rt.Fatalf("reused key %s, same request: %+v, %v; want replay of %s", key.Value, res, err, b.id)
+				}
+			default:
+				if !errors.Is(err, idem.ErrMismatch) {
+					rt.Fatalf("reused key %s, other request: %v, want ErrMismatch", key.Value, err)
+				}
+			}
+		}
+		after := countPayments(ctx, rt, pool)
+		if after-before != len(model) {
+			rt.Fatalf("payments created in this run = %d, distinct keys = %d", after-before, len(model))
+		}
+	})
+}
+
 // --- helpers ----------------------------------------------------------------
+
+func countPayments(ctx context.Context, t interface{ Fatal(...any) }, pool *pgxpool.Pool) int {
+	var n int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM payments").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
 
 var rank = map[State]int{Created: 0, Settling: 1, Settled: 2, Failed: 2}
 

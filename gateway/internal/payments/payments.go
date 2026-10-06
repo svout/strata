@@ -15,11 +15,18 @@ package payments
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/svout/agentgate/gateway/internal/idem"
+	"github.com/svout/agentgate/gateway/internal/store"
 )
 
 // State is a payment's lifecycle state, as stored in payments.state.
@@ -87,22 +94,88 @@ func New(pool *pgxpool.Pool) *Service {
 	return &Service{pool: pool}
 }
 
-// Create validates in and inserts a payment in state created on the internal
+// create validates in and inserts a payment in state created on the internal
 // rail. It posts nothing to the ledger; settlement does (SPEC-002 subtask 10).
-func (s *Service) Create(ctx context.Context, in CreateInput) (Payment, error) {
+// It does not use an Idempotency-Key; the API uses CreateIdempotent, and
+// this stays unexported for the package's own tests.
+func (s *Service) create(ctx context.Context, in CreateInput) (Payment, error) {
+	if err := validate(in); err != nil {
+		return Payment{}, err
+	}
+	return insertPayment(ctx, s.pool, in)
+}
+
+// CreateResult is the answer to an idempotent create: the payment's id and the
+// exact response body, which is byte-identical on every replay.
+type CreateResult struct {
+	PaymentID uuid.UUID
+	Status    int
+	Body      []byte // JSON, without a trailing newline
+	Replayed  bool
+}
+
+// CreateIdempotent is Create guarded by an Idempotency-Key (ADR-118). In one
+// SERIALIZABLE transaction it claims key for the request hash, inserts the
+// payment and stores the 201 response; a retry with the same key and hash
+// gets that stored response back (Replayed) and creates nothing. A different
+// hash is idem.ErrMismatch. Invalid input is rejected before the key is
+// touched, and any failure rolls the claim back, so only a 201 is ever
+// stored.
+func (s *Service) CreateIdempotent(ctx context.Context, key idem.Key, hash [32]byte, in CreateInput) (CreateResult, error) {
+	if err := validate(in); err != nil {
+		return CreateResult{}, err
+	}
+	var out CreateResult
+	err := store.Serializable(ctx, s.pool, func(tx pgx.Tx) error {
+		out = CreateResult{} // the function may run more than once
+		stored, found, err := idem.Claim(ctx, tx, key, hash)
+		if err != nil {
+			return err
+		}
+		if found {
+			// The stored body is a Payment as encoded when the key was
+			// claimed; its "id" member must stay stable for Retention (24 h)
+			// across releases, or replays of older keys fail.
+			var p struct {
+				ID uuid.UUID `json:"id"`
+			}
+			if err := json.Unmarshal(stored.Body, &p); err != nil {
+				return fmt.Errorf("payments: stored response: %w", err)
+			}
+			out = CreateResult{PaymentID: p.ID, Status: stored.Status, Body: stored.Body, Replayed: true}
+			return nil
+		}
+		p, err := insertPayment(ctx, tx, in)
+		if err != nil {
+			return err
+		}
+		body, err := json.Marshal(p)
+		if err != nil {
+			return fmt.Errorf("payments: encode response: %w", err)
+		}
+		out = CreateResult{PaymentID: p.ID, Status: http.StatusCreated, Body: body}
+		return idem.Complete(ctx, tx, key, hash, idem.Response{Status: out.Status, Body: body})
+	})
+	if err != nil {
+		return CreateResult{}, err
+	}
+	return out, nil
+}
+
+func validate(in CreateInput) error {
 	// A missing account is a malformed request (400), so it is checked
 	// before the business rules (422).
 	switch {
 	case in.PayerAccountID == uuid.Nil || in.PayeeAccountID == uuid.Nil:
-		return Payment{}, ErrMissingAccount
+		return ErrMissingAccount
 	case in.Amount <= 0:
-		return Payment{}, ErrInvalidAmount
+		return ErrInvalidAmount
 	case in.Currency != Currency:
-		return Payment{}, ErrUnsupportedCurrency
+		return ErrUnsupportedCurrency
 	case in.PayerAccountID == in.PayeeAccountID:
-		return Payment{}, ErrSameAccount
+		return ErrSameAccount
 	}
-	return insertPayment(ctx, s.pool, in)
+	return nil
 }
 
 // Get returns the payment with id, or ErrNotFound.
