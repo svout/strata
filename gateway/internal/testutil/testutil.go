@@ -308,6 +308,7 @@ func startRedis() (*redisServer, error) {
 	if err != nil {
 		return nil, err
 	}
+	opts.ContextTimeoutEnabled = true // as in cmd/gateway, so deadlines hold
 	free := make(chan int, redisDatabases)
 	for i := range redisDatabases {
 		free <- i
