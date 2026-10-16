@@ -26,7 +26,7 @@ import (
 
 // testAPI mounts the handler on the real httpx router, as cmd/gateway does.
 type testAPI struct {
-	t      *testing.T
+	t      testing.TB
 	pool   *pgxpool.Pool
 	router *chi.Mux
 	log    *bytes.Buffer
@@ -34,7 +34,7 @@ type testAPI struct {
 	payee  uuid.UUID
 }
 
-func newTestAPI(t *testing.T) *testAPI {
+func newTestAPI(t testing.TB) *testAPI {
 	t.Helper()
 	a, _ := newTestAPIWith(t, nil)
 	return a
@@ -42,7 +42,7 @@ func newTestAPI(t *testing.T) *testAPI {
 
 // newTestAPIWith is newTestAPI with the Redis in-flight lock on rdb, as
 // cmd/gateway wires it; a nil rdb means no lock.
-func newTestAPIWith(t *testing.T, rdb *redis.Client) (*testAPI, *idem.RedisLocker) {
+func newTestAPIWith(t testing.TB, rdb *redis.Client) (*testAPI, *idem.RedisLocker) {
 	t.Helper()
 	pool := testutil.Postgres(t)
 	var buf bytes.Buffer
@@ -271,14 +271,14 @@ func TestHTTP_AC3_ConcurrentSameKeyExactlyOnce(t *testing.T) {
 	t.Parallel()
 	const n = 100
 	for name, tc := range map[string]struct {
-		rdb  func(*testing.T) *redis.Client
+		rdb  func(testing.TB) *redis.Client
 		down bool
 	}{
-		"postgres only": {rdb: func(*testing.T) *redis.Client { return nil }},
+		"postgres only": {rdb: func(testing.TB) *redis.Client { return nil }},
 		// Under a loaded -race run some Redis calls exceed 50 ms and fail
 		// open, so this case doesn't assert Degraded = 0;
 		// TestHTTP_LockWaitAndTimeout proves the lock makes requests wait.
-		"redis lock": {rdb: func(t *testing.T) *redis.Client { return testutil.Redis(t) }},
+		"redis lock": {rdb: testutil.Redis},
 		"redis down": {rdb: downRedis, down: true},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -293,7 +293,7 @@ func TestHTTP_AC3_ConcurrentSameKeyExactlyOnce(t *testing.T) {
 }
 
 // downRedis is a client whose server is unreachable.
-func downRedis(t *testing.T) *redis.Client {
+func downRedis(t testing.TB) *redis.Client {
 	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", ContextTimeoutEnabled: true})
 	t.Cleanup(func() { _ = rdb.Close() })
 	return rdb

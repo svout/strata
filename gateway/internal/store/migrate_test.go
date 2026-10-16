@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +23,10 @@ import (
 
 var schemaTables = []string{"accounts", "payments", "ledger_entries", "idempotency_keys"}
 
+// schemaRelations is every table and index the migrations create; to_regclass
+// (tableExists) finds indexes as well as tables.
+var schemaRelations = slices.Concat(schemaTables, []string{"idempotency_keys_created_at_idx"})
+
 // PostgreSQL SQLSTATE codes the schema's constraints raise.
 const (
 	notNullViolation    = "23502"
@@ -30,7 +35,7 @@ const (
 	checkViolation      = "23514"
 )
 
-func TestUpAppliesSchemaV1(t *testing.T) {
+func TestUpAppliesSchema(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t) // already migrated with store.Up
 	ctx := testContext(t)
@@ -39,12 +44,12 @@ func TestUpAppliesSchemaV1(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT max(version_id) FROM goose_db_version").Scan(&version); err != nil {
 		t.Fatalf("read goose version: %v", err)
 	}
-	if version != 1 {
-		t.Errorf("schema version = %d, want 1", version)
+	if version != 2 {
+		t.Errorf("schema version = %d, want 2", version)
 	}
-	for _, table := range schemaTables {
-		if !tableExists(ctx, t, pool, table) {
-			t.Errorf("table %s missing after Up", table)
+	for _, rel := range schemaRelations {
+		if !tableExists(ctx, t, pool, rel) {
+			t.Errorf("%s missing after Up", rel)
 		}
 	}
 
@@ -63,18 +68,18 @@ func TestDownRemovesSchemaAndUpRestoresIt(t *testing.T) {
 	if err := store.Down(ctx, db); err != nil {
 		t.Fatalf("Down: %v", err)
 	}
-	for _, table := range schemaTables {
-		if tableExists(ctx, t, pool, table) {
-			t.Errorf("table %s still exists after Down", table)
+	for _, rel := range schemaRelations {
+		if tableExists(ctx, t, pool, rel) {
+			t.Errorf("%s still exists after Down", rel)
 		}
 	}
 
 	if err := store.Up(ctx, db); err != nil {
 		t.Fatalf("Up after Down: %v", err)
 	}
-	for _, table := range schemaTables {
-		if !tableExists(ctx, t, pool, table) {
-			t.Errorf("table %s missing after Up following Down", table)
+	for _, rel := range schemaRelations {
+		if !tableExists(ctx, t, pool, rel) {
+			t.Errorf("%s missing after Up following Down", rel)
 		}
 	}
 }

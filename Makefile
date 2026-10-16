@@ -26,7 +26,7 @@ COMPOSE := docker compose -f infra/compose/compose.yml
 # must never echo it: it can hold a real password.
 DATABASE_URL ?= postgres://agentgate:agentgate@127.0.0.1:5432/agentgate?sslmode=disable
 
-.PHONY: help install-lint lint test dev dev-down dev-logs migrate export-docs check-docs
+.PHONY: help install-lint lint test bench dev dev-down dev-logs migrate export-docs check-docs
 
 help: ## List the make targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-13s %s\n", $$1, $$2}'
@@ -61,6 +61,14 @@ test: ## Run every scaffolded service's tests
 	done
 	@if [ -f console/package.json ]; then echo "== console"; (cd console && pnpm install --frozen-lockfile && pnpm test); fi
 	@echo "== scripts"; python3 -m unittest discover -s scripts -p 'test_*.py'
+
+# Baseline for P6 (SPEC-002/8b-ii): no -race, not in CI (runners are too noisy).
+# Refuses a dirty gateway/ tree, so the printed SHA is the code that ran.
+bench: ## Benchmark POST /v1/payments (p50/p99, with/without Redis); needs Docker
+	@if [ -n "$$(git status --porcelain -- gateway)" ]; then echo "bench: gateway/ has uncommitted changes; commit first so the SHA matches" >&2; exit 1; fi
+	@echo "commit: $$(git rev-parse --short HEAD)"
+	@echo "go: $$(cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) go version)"
+	cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) go test -run '^$$' -bench BenchmarkCreatePayment -benchtime 2000x -count 5 -timeout 60m ./internal/payments
 
 dev: ## Start the local stack (gateway, PostgreSQL 16, Redis 7) and wait until /readyz is 200
 	@docker info >/dev/null 2>&1 || { echo "Docker is not running: start Docker Desktop" >&2; exit 1; }
