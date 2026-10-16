@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -44,9 +45,18 @@ func newTestAPI(t testing.TB) *testAPI {
 // cmd/gateway wires it; a nil rdb means no lock.
 func newTestAPIWith(t testing.TB, rdb *redis.Client) (*testAPI, *idem.RedisLocker) {
 	t.Helper()
-	pool := testutil.Postgres(t)
 	var buf bytes.Buffer
-	log := httpx.NewLogger(&buf, slog.LevelInfo)
+	a, locker := newTestAPILogTo(t, rdb, &buf)
+	a.log = &buf
+	return a, locker
+}
+
+// newTestAPILogTo is newTestAPIWith logging to w; a.log is nil. Benchmarks
+// pass io.Discard, so an ever-growing buffer isn't part of what they time.
+func newTestAPILogTo(t testing.TB, rdb *redis.Client, w io.Writer) (*testAPI, *idem.RedisLocker) {
+	t.Helper()
+	pool := testutil.Postgres(t)
+	log := httpx.NewLogger(w, slog.LevelInfo)
 	var (
 		opts   []Option
 		locker *idem.RedisLocker
@@ -57,7 +67,7 @@ func newTestAPIWith(t testing.TB, rdb *redis.Client) (*testAPI, *idem.RedisLocke
 	}
 	r := httpx.NewRouter(log)
 	r.Mount("/v1/payments", New(pool, opts...).Handler(log))
-	return &testAPI{t: t, pool: pool, router: r, log: &buf,
+	return &testAPI{t: t, pool: pool, router: r,
 		payer: newAccount(t.Context(), t, pool), payee: newAccount(t.Context(), t, pool)}, locker
 }
 

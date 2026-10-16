@@ -62,13 +62,26 @@ test: ## Run every scaffolded service's tests
 	@if [ -f console/package.json ]; then echo "== console"; (cd console && pnpm install --frozen-lockfile && pnpm test); fi
 	@echo "== scripts"; python3 -m unittest discover -s scripts -p 'test_*.py'
 
-# Baseline for P6 (SPEC-002/8b-ii): no -race, not in CI (runners are too noisy).
-# Refuses a dirty gateway/ tree, so the printed SHA is the code that ran.
-bench: ## Benchmark POST /v1/payments (p50/p99, with/without Redis); needs Docker
-	@if [ -n "$$(git status --porcelain -- gateway)" ]; then echo "bench: gateway/ has uncommitted changes; commit first so the SHA matches" >&2; exit 1; fi
-	@echo "commit: $$(git rev-parse --short HEAD)"
-	@echo "go: $$(cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) go version)"
-	cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) go test -run '^$$' -bench BenchmarkCreatePayment -benchtime 2000x -count 5 -timeout 60m ./internal/payments
+# Baseline for P6 and ADR-119's evidence (SPEC-002/8b-ii). Never under -race,
+# not in CI (runners are too noisy). Refuses uncommitted changes in gateway/ or
+# this Makefile (it holds the settings), so the printed SHA is what ran.
+# Uncontended runs at full settings (the numbers P6 cites); the contended
+# k-sweep at reduced ones (it measures shape). Output is also saved to
+# bench-<sha>.txt for benchstat.
+bench_go = (cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) go test -run '^$$' -timeout 60m $(1) ./internal/payments)
+bench: ## Benchmark POST /v1/payments (with/without Redis, contended sweep); needs Docker
+	@docker info >/dev/null 2>&1 || { echo "Docker is not running: start Docker Desktop" >&2; exit 1; }
+	@if [ -n "$$(git status --porcelain -- gateway Makefile)" ]; then echo "bench: gateway/ or Makefile has uncommitted changes; commit first so the SHA matches" >&2; exit 1; fi
+	@out=bench-$$(git rev-parse --short HEAD).txt; { \
+	  echo "commit: $$(git rev-parse HEAD)"; \
+	  echo "date: $$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+	  echo "host: $$(uname -srm)"; \
+	  if command -v sysctl >/dev/null; then echo "machine: $$(sysctl -n hw.model 2>/dev/null), $$(sysctl -n machdep.cpu.brand_string 2>/dev/null), $$(sysctl -n hw.ncpu 2>/dev/null) cores, $$(( $$(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 )) GiB"; fi; \
+	  echo "docker: $$(docker info --format '{{.NCPU}} CPUs, {{.MemTotal}} B, server {{.ServerVersion}}')"; \
+	  echo "go: $$(cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) go version)"; \
+	  $(call bench_go,-bench '^BenchmarkCreatePayment$$' -benchtime 2000x -count 5); \
+	  $(call bench_go,-bench '^BenchmarkCreatePaymentContended$$' -benchtime 200x -count 3); \
+	} 2>&1 | tee "$$out"; echo "saved $$out"
 
 dev: ## Start the local stack (gateway, PostgreSQL 16, Redis 7) and wait until /readyz is 200
 	@docker info >/dev/null 2>&1 || { echo "Docker is not running: start Docker Desktop" >&2; exit 1; }

@@ -47,6 +47,10 @@ func TestUpAppliesSchema(t *testing.T) {
 	if version != 2 {
 		t.Errorf("schema version = %d, want 2", version)
 	}
+	var indexdef string
+	if err := pool.QueryRow(ctx, "SELECT indexdef FROM pg_indexes WHERE indexname = 'idempotency_keys_created_at_idx'").Scan(&indexdef); err != nil || !strings.HasSuffix(indexdef, "(created_at)") {
+		t.Errorf("idempotency_keys_created_at_idx = %q (%v), want an index on (created_at)", indexdef, err)
+	}
 	for _, rel := range schemaRelations {
 		if !tableExists(ctx, t, pool, rel) {
 			t.Errorf("%s missing after Up", rel)
@@ -85,9 +89,9 @@ func TestDownRemovesSchemaAndUpRestoresIt(t *testing.T) {
 }
 
 // TestConcurrentUpIsSerialised starts several Up runs at once against an empty
-// schema. goose's advisory lock lets one apply version 1 while the others
-// wait and then find nothing pending, so all succeed, version 1 is recorded
-// exactly once, and the lock is released afterwards.
+// schema. goose's advisory lock lets one apply versions 1 and 2 while the
+// others wait and then find nothing pending, so all succeed, each version is
+// recorded exactly once, and the lock is released afterwards.
 func TestConcurrentUpIsSerialised(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
@@ -113,12 +117,14 @@ func TestConcurrentUpIsSerialised(t *testing.T) {
 		}
 	}
 
-	var applied int
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM goose_db_version WHERE version_id = 1").Scan(&applied); err != nil {
-		t.Fatalf("count version rows: %v", err)
-	}
-	if applied != 1 {
-		t.Errorf("goose_db_version rows for version 1 = %d, want 1", applied)
+	for _, v := range []int{1, 2} {
+		var applied int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM goose_db_version WHERE version_id = $1", v).Scan(&applied); err != nil {
+			t.Fatalf("count version rows: %v", err)
+		}
+		if applied != 1 {
+			t.Errorf("goose_db_version rows for version %d = %d, want 1", v, applied)
+		}
 	}
 	if n := advisoryLocks(ctx, t, pool); n != 0 {
 		t.Errorf("%d advisory locks left in this database after Up, want 0", n)

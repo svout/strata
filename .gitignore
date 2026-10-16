@@ -50,3 +50,6 @@ pnpm-debug.log*
 .DS_Store
 .idea/
 .vscode/
+
+# make bench output (SPEC-002/8b-ii)
+bench-*.txt
