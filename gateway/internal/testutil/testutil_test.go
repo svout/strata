@@ -47,7 +47,7 @@ func TestRedisDatabaseIsEmptyOnEntry(t *testing.T) {
 }
 
 // Two pools from Postgres(t) are on different databases, each migrated to
-// the latest schema version (2).
+// the latest schema version (3).
 func TestPostgresDatabasesAreSeparateAndMigrated(t *testing.T) {
 	t.Parallel()
 	ctx := testContext(t)
@@ -61,8 +61,8 @@ func TestPostgresDatabasesAreSeparateAndMigrated(t *testing.T) {
 		if err := pool.QueryRow(ctx, "SELECT max(version_id) FROM goose_db_version").Scan(&version); err != nil {
 			t.Fatalf("read goose version: %v", err)
 		}
-		if version != 2 {
-			t.Errorf("schema version = %d, want 2", version)
+		if version != 3 {
+			t.Errorf("schema version = %d, want 3", version)
 		}
 	}
 }

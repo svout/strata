@@ -104,7 +104,7 @@ func TestRun_NeverPrintsPassword(t *testing.T) {
 
 // TestRun_UpAppliesThenNoOps drives the whole success path (config, pool,
 // store.Up) against a real database: the first run applies every migration
-// (versions 1 and 2), the second has nothing to do, and both exit 0.
+// (versions 1–3), the second has nothing to do, and both exit 0.
 func TestRun_UpAppliesThenNoOps(t *testing.T) {
 	pool := testutil.Postgres(t) // already migrated; roll back to start empty
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -136,7 +136,7 @@ func TestRun_UpAppliesThenNoOps(t *testing.T) {
 		}
 	}
 
-	for _, v := range []int{1, 2} {
+	for _, v := range []int{1, 2, 3} {
 		var applied int
 		if err := pool.QueryRow(ctx, "SELECT count(*) FROM goose_db_version WHERE version_id = $1 AND is_applied", v).Scan(&applied); err != nil {
 			t.Fatalf("read goose versions: %v", err)

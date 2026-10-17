@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -238,6 +240,103 @@ func TestBalanceAcrossPostings(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("Balance in tx: %v", err)
+	}
+}
+
+// PostRef numbers its legs and records the reference; Posted sees it; a
+// second posting with the reference writes nothing (ADR-120).
+func TestPostRefPostsOnce(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	ctx := testContext(t)
+	f := newFixture(ctx, t, pool)
+	const ref = "pay_ref_once"
+
+	if posted, err := Posted(ctx, pool, ref); err != nil || posted {
+		t.Fatalf("Posted before = %v, %v; want false", posted, err)
+	}
+	postRef := func() error {
+		return store.Serializable(ctx, pool, func(tx pgx.Tx) error { return PostRef(ctx, tx, f.payment, ref, f.balanced(500)) })
+	}
+	if err := postRef(); err != nil {
+		t.Fatalf("PostRef: %v", err)
+	}
+	if posted, err := Posted(ctx, pool, ref); err != nil || !posted {
+		t.Fatalf("Posted after = %v, %v; want true", posted, err)
+	}
+	if posted, err := Posted(ctx, pool, "pay_ref_other"); err != nil || posted {
+		t.Fatalf("Posted(other ref) = %v, %v; want false", posted, err)
+	}
+	var legs []int
+	rows, err := pool.Query(ctx, "SELECT leg FROM ledger_entries WHERE rail_ref = $1 ORDER BY leg", ref)
+	if err == nil {
+		legs, err = pgx.CollectRows(rows, pgx.RowTo[int])
+	}
+	if err != nil || len(legs) != 2 || legs[0] != 1 || legs[1] != 2 {
+		t.Fatalf("legs = %v (%v), want [1 2]", legs, err)
+	}
+
+	if err := postRef(); !errors.Is(err, ErrAlreadyPosted) {
+		t.Fatalf("second PostRef = %v, want ErrAlreadyPosted", err)
+	}
+	if n := countEntries(ctx, t, pool, f.payment); n != 2 {
+		t.Fatalf("entries = %d after a repeated PostRef, want 2", n)
+	}
+	// Post without a reference is unaffected (refunds), and leaves both
+	// columns NULL.
+	if err := store.Serializable(ctx, pool, func(tx pgx.Tx) error { return Post(ctx, tx, f.payment, f.balanced(500)) }); err != nil {
+		t.Fatalf("Post after PostRef: %v", err)
+	}
+	var unref int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM ledger_entries WHERE payment_id = $1 AND rail_ref IS NULL AND leg IS NULL", pgUUID(f.payment)).Scan(&unref); err != nil || unref != 2 {
+		t.Fatalf("unreferenced legs = %d (%v), want 2", unref, err)
+	}
+}
+
+// The database is the guarantee, not Posted: concurrent PostRef calls with
+// one reference and no Posted check still leave exactly one posting.
+func TestPostRefConstraintHoldsUnderRace(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	ctx := testContext(t)
+	f := newFixture(ctx, t, pool)
+	const n = 8
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range n {
+		wg.Go(func() {
+			<-start
+			errs[i] = store.Serializable(ctx, pool, func(tx pgx.Tx) error { return PostRef(ctx, tx, f.payment, "pay_ref_race", f.balanced(500)) })
+		})
+	}
+	close(start)
+	wg.Wait()
+	ok := 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			ok++
+		case errors.Is(err, ErrAlreadyPosted), errors.Is(err, store.ErrRetryLimit):
+		default:
+			t.Errorf("PostRef %d: %v", i, err)
+		}
+	}
+	if ok != 1 {
+		t.Errorf("%d PostRef calls succeeded, want 1", ok)
+	}
+	if got := countEntries(ctx, t, pool, f.payment); got != 2 {
+		t.Fatalf("entries = %d, want 2 (one posting)", got)
+	}
+}
+
+func TestPostRefRejectsBadReference(t *testing.T) {
+	t.Parallel()
+	for _, ref := range []string{"", strings.Repeat("r", 256)} {
+		// Validation runs before any I/O, so a nil tx is never touched.
+		if err := PostRef(t.Context(), nil, idP, ref, []Entry{{idA, Debit, 1}, {idB, Credit, 1}}); !errors.Is(err, ErrMissingRef) || !errors.Is(err, ErrInvalidPosting) {
+			t.Errorf("PostRef(%d-char ref) = %v, want ErrMissingRef", len(ref), err)
+		}
 	}
 }
 
