@@ -12,7 +12,9 @@ import (
 	"github.com/svout/strata/gateway/internal/rail"
 )
 
-// Harness describes one rail under test.
+// Harness describes one rail under test. New, Request and Effects are
+// required; each optional hook enables the tests for a behaviour the rail
+// can produce, and those tests skip when it is nil.
 type Harness struct {
 	// New returns a fresh adapter for one test.
 	New func(t *testing.T) rail.Adapter
@@ -20,14 +22,24 @@ type Harness struct {
 	// reference.
 	Request func(t *testing.T) rail.Request
 	// Effects returns how many times money moved for ref (0 or 1 for a
-	// correct rail): postings for the internal rail, settled records for the
-	// fake. It is how the suite checks "one effect", independently of what
-	// Settle returns.
+	// correct rail): postings for the internal rail, applications for the
+	// fake. It must count applications, not read a flag, so a double
+	// application shows as 2.
 	Effects func(t *testing.T, ref string) int
-	// Decline, if set, returns a request this adapter will decline. A rail
-	// that never declines (the internal rail) leaves it nil and the decline
-	// tests skip.
+
+	// Decline returns a request a will decline. Nil for a rail that never
+	// declines (the internal rail).
 	Decline func(t *testing.T, a rail.Adapter) rail.Request
+	// Pend returns a request a will leave Pending. Nil for a synchronous rail.
+	Pend func(t *testing.T, a rail.Adapter) rail.Request
+	// Resolve finishes a pending operation on a with outcome (Settled or
+	// Declined), as the rail's asynchronous notification would. Required
+	// when Pend is set.
+	Resolve func(t *testing.T, a rail.Adapter, ref string, outcome rail.Outcome)
+	// LoseResponse returns a request whose Settle a will apply but answer
+	// with an error, as a connection lost after the rail acted would. Nil if
+	// the harness can't arrange that.
+	LoseResponse func(t *testing.T, a rail.Adapter) rail.Request
 }
 
 // concurrent is how many Settle calls race on one reference.
@@ -61,6 +73,8 @@ func Run(t *testing.T, h Harness) {
 		}
 	})
 
+	// The central claim (ADR-120): however many calls race on one reference,
+	// money moves once, and the reference ends Settled.
 	t.Run("concurrent settles with one reference move money once", func(t *testing.T) {
 		a, req := h.New(t), h.Request(t)
 		results := make([]rail.Result, concurrent)
@@ -75,15 +89,29 @@ func Run(t *testing.T, h Harness) {
 		}
 		close(start)
 		wg.Wait()
+		settled := 0
 		for i := range concurrent {
-			// An error is allowed (unknown outcome); a claimed result must be
-			// the one outcome.
-			if errs[i] == nil && results[i].Outcome != rail.Settled {
+			// An error is allowed (an unknown outcome); a claimed result must
+			// be the one outcome, and at least one call must claim it.
+			switch {
+			case errs[i] != nil:
+			case results[i].Outcome == rail.Settled:
+				settled++
+			default:
 				t.Errorf("Settle %d = %+v, want Settled", i, results[i])
 			}
 		}
+		if settled == 0 {
+			t.Fatalf("no concurrent Settle returned Settled (errors: %v)", errs)
+		}
+		if res, err := a.Status(t.Context(), req.Ref); err != nil || res.Outcome != rail.Settled {
+			t.Fatalf("Status after the race = %+v, %v; want Settled", res, err)
+		}
+		if res, err := a.Settle(t.Context(), req); err != nil || res.Outcome != rail.Settled {
+			t.Fatalf("Settle after the race = %+v, %v; want Settled", res, err)
+		}
 		if n := h.Effects(t, req.Ref); n != 1 {
-			t.Fatalf("effects = %d after %d concurrent settles, want 1", n, concurrent)
+			t.Fatalf("effects = %d after %d concurrent settles and a repeat, want 1", n, concurrent)
 		}
 	})
 
@@ -124,15 +152,23 @@ func Run(t *testing.T, h Harness) {
 	t.Run("invalid request is ErrInvalidRequest", func(t *testing.T) {
 		a := h.New(t)
 		for name, change := range map[string]func(*rail.Request){
-			"zero amount":    func(r *rail.Request) { r.Amount = 0 },
-			"empty ref":      func(r *rail.Request) { r.Ref = "" },
-			"other currency": func(r *rail.Request) { r.Currency = "EUR" },
-			"same accounts":  func(r *rail.Request) { r.Payee = r.Payer },
+			"zero amount":   func(r *rail.Request) { r.Amount = 0 },
+			"empty ref":     func(r *rail.Request) { r.Ref = "" },
+			"no currency":   func(r *rail.Request) { r.Currency = "" },
+			"same accounts": func(r *rail.Request) { r.Payee = r.Payer },
 		} {
 			req := h.Request(t)
 			change(&req)
-			if _, err := a.Settle(t.Context(), req); !errors.Is(err, rail.ErrInvalidRequest) {
-				t.Errorf("%s: Settle = %v, want ErrInvalidRequest", name, err)
+			// Deterministic: the repeat fails the same way, and nothing moves.
+			for range 2 {
+				if _, err := a.Settle(t.Context(), req); !errors.Is(err, rail.ErrInvalidRequest) {
+					t.Errorf("%s: Settle = %v, want ErrInvalidRequest", name, err)
+				}
+			}
+			if req.Ref != "" {
+				if n := h.Effects(t, req.Ref); n != 0 {
+					t.Errorf("%s: effects = %d, want 0", name, n)
+				}
 			}
 		}
 	})
@@ -155,6 +191,67 @@ func Run(t *testing.T, h Harness) {
 		}
 		if n := h.Effects(t, req.Ref); n != 0 {
 			t.Fatalf("effects = %d, want 0", n)
+		}
+	})
+
+	// The asynchronous path (Stripe): pending moves nothing and repeats
+	// stay pending until the rail resolves it; then the outcome is final.
+	t.Run("pending stays pending until resolved", func(t *testing.T) {
+		if h.Pend == nil {
+			t.Skip("this rail is synchronous")
+		}
+		for _, final := range []rail.Outcome{rail.Settled, rail.Declined} {
+			a := h.New(t)
+			req := h.Pend(t, a)
+			for i := range 2 { // the repeat stays pending and moves nothing
+				if res, err := a.Settle(t.Context(), req); err != nil || res.Outcome != rail.Pending {
+					t.Fatalf("Settle %d = %+v, %v; want Pending", i, res, err)
+				}
+			}
+			if res, err := a.Status(t.Context(), req.Ref); err != nil || res.Outcome != rail.Pending {
+				t.Fatalf("Status before resolving = %+v, %v; want Pending", res, err)
+			}
+			if n := h.Effects(t, req.Ref); n != 0 {
+				t.Fatalf("effects while pending = %d, want 0", n)
+			}
+			h.Resolve(t, a, req.Ref, final)
+			want := 0
+			if final == rail.Settled {
+				want = 1
+			}
+			for _, get := range []func() (rail.Result, error){
+				func() (rail.Result, error) { return a.Status(t.Context(), req.Ref) },
+				func() (rail.Result, error) { return a.Settle(t.Context(), req) },
+			} {
+				if res, err := get(); err != nil || res.Outcome != final || (final == rail.Declined && res.Reason == "") {
+					t.Fatalf("after resolving %s: %+v, %v", final, res, err)
+				}
+			}
+			if n := h.Effects(t, req.Ref); n != want {
+				t.Fatalf("effects after resolving %s = %d, want %d", final, n, want)
+			}
+		}
+	})
+
+	// Unknown is not failure (ADR-120): the rail acted but the answer was
+	// lost. Settle errors, Status says Settled, and a retry moves nothing.
+	t.Run("lost response is resolved by status", func(t *testing.T) {
+		if h.LoseResponse == nil {
+			t.Skip("the harness can't lose a response for this rail")
+		}
+		a := h.New(t)
+		req := h.LoseResponse(t, a)
+		if _, err := a.Settle(t.Context(), req); err == nil || errors.Is(err, rail.ErrInvalidRequest) {
+			t.Fatalf("Settle = %v, want an unknown-outcome error", err)
+		}
+		if res, err := a.Status(t.Context(), req.Ref); err != nil || res.Outcome != rail.Settled {
+			t.Fatalf("Status = %+v, %v; want Settled", res, err)
+		}
+		if res, err := a.Settle(t.Context(), req); err != nil || res.Outcome != rail.Settled {
+			t.Fatalf("retry = %+v, %v; want Settled", res, err)
+		}
+		if n := h.Effects(t, req.Ref); n != 1 {
+			t.Fatalf("effects = %d, want 1", n)
 		}
 	})
 }

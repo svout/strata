@@ -12,6 +12,10 @@
 //     later. Only an explicit Declined result means nothing moved, and only it
 //     may lead to payments.MarkFailed. Treating a timeout as a failure is how
 //     a settled payment gets retried into a second one.
+//   - The one exception is ErrInvalidRequest: the request is wrong in itself,
+//     nothing was attempted, and it fails the same way every time. Retrying
+//     it forever is a bug, not caution; the caller decides how to end it
+//     (subtask 10).
 //   - The reference is derived from the payment (Ref), never random per
 //     attempt, so a retry hits the same rail operation and recovery needs no
 //     lookup table.
@@ -61,8 +65,9 @@ type Adapter interface {
 	// Name is the rail's name as stored in payments.rail.
 	Name() string
 	// Settle performs the operation req.Ref, or returns its earlier outcome
-	// if that reference was already settled. A non-nil error means the
-	// outcome is unknown, not that it failed (see the package comment).
+	// if that reference was already settled. A non-nil error other than
+	// ErrInvalidRequest means the outcome is unknown, not that it failed
+	// (see the package comment).
 	Settle(ctx context.Context, req Request) (Result, error)
 	// Status returns the current outcome of the operation ref, or
 	// ErrUnknownRef if the rail has no record of it (it never took effect,
@@ -74,7 +79,9 @@ var (
 	// ErrUnknownRef means the rail has no operation with that reference.
 	ErrUnknownRef = errors.New("rail: unknown reference")
 	// ErrInvalidRequest means the request is wrong in itself; nothing was
-	// attempted. Messages are fixed and never quote the input.
+	// attempted, and repeating it gives the same error. It is the only Settle
+	// error that is not an unknown outcome. Messages are fixed and never
+	// quote the input.
 	ErrInvalidRequest = errors.New("rail: invalid request")
 )
 
@@ -84,16 +91,14 @@ func Ref(paymentID uuid.UUID) string {
 	return "pay_" + paymentID.String()
 }
 
-// Currency is the only currency in P1 (as in payments and the schema).
-const Currency = "GBP"
-
-// validate checks a request without I/O.
+// validate checks a request without I/O. Which currencies are allowed is
+// the payments package's rule (P1: GBP only); a rail only needs one.
 func validate(req Request) error {
 	switch {
 	case req.PaymentID == uuid.Nil || req.Payer == uuid.Nil || req.Payee == uuid.Nil,
 		req.Ref == "" || len(req.Ref) > 255,
 		req.Amount <= 0,
-		req.Currency != Currency,
+		len(req.Currency) != 3,
 		req.Payer == req.Payee:
 		return ErrInvalidRequest
 	}

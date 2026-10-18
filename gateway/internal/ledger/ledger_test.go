@@ -317,7 +317,11 @@ func TestPostRefConstraintHoldsUnderRace(t *testing.T) {
 		switch {
 		case err == nil:
 			ok++
-		case errors.Is(err, ErrAlreadyPosted), errors.Is(err, store.ErrRetryLimit):
+		case errors.Is(err, ErrAlreadyPosted):
+			// A loser sees the constraint: 23505 at once, or one 40001 that
+			// store.Serializable retries into 23505. Without a Posted read
+			// there are no predicate locks to keep conflicting on, so
+			// ErrRetryLimit here would be a regression.
 		default:
 			t.Errorf("PostRef %d: %v", i, err)
 		}

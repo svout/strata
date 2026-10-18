@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,7 +19,9 @@ import (
 )
 
 // AC6: the internal-ledger rail passes the contract. One database serves the
-// whole suite; each request has its own accounts and payment.
+// whole suite; each request has its own accounts and payment. It never
+// declines, is never pending, and a lost response can't be arranged
+// in-process, so those tests skip.
 func TestInternal_Contract(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
@@ -59,24 +62,97 @@ func TestInternal_Balances(t *testing.T) {
 	}
 }
 
-// AC6: the fake PSP passes the contract, including declines.
+// Review should 4 (investigation): ledger.Posted runs inside the
+// SERIALIZABLE transaction, so settles of *different* payments may conflict
+// on its predicate locks and be retried. Settle rounds of 16 different
+// payments at once on a fresh (small) ledger, require every settle to
+// succeed, and report how many transactions PostgreSQL rolled back (each
+// rollback is one retry).
+func TestInternal_ConcurrentDifferentPayments(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	const rounds, n = 10, 16
+	reqs := make([][]rail.Request, rounds)
+	for i := range reqs {
+		for range n {
+			reqs[i] = append(reqs[i], newPaymentRequest(t, pool))
+		}
+	}
+	var db string
+	if err := pool.QueryRow(t.Context(), "SELECT current_database()").Scan(&db); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1500 * time.Millisecond) // let the setup's statistics land
+	before := xactCounts(t, pool, db)
+
+	r := rail.NewInternal(pool)
+	var failed []error
+	for _, round := range reqs {
+		errs := make([]error, n)
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i, req := range round {
+			wg.Go(func() {
+				<-start
+				_, errs[i] = r.Settle(t.Context(), req)
+			})
+		}
+		close(start)
+		wg.Wait()
+		for _, err := range errs {
+			if err != nil {
+				failed = append(failed, err)
+			}
+		}
+	}
+
+	// Closing the pool flushes its backends' statistics; read them on a
+	// fresh pool, by database name.
+	cfg := pool.Config()
+	pool.Close()
+	stats, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stats.Close()
+	after := xactCounts(t, stats, db)
+	settles := rounds * n
+	rollbacks := after[1] - before[1]
+	t.Logf("%d settles of different payments, %d at a time: %d failed, %d rolled-back transactions (%.2f per settle), %d committed",
+		settles, n, len(failed), rollbacks, float64(rollbacks)/float64(settles), after[0]-before[0])
+	if len(failed) > 0 {
+		t.Fatalf("%d of %d settles failed, first: %v", len(failed), settles, failed[0])
+	}
+}
+
+// AC6: the fake PSP passes the contract, including declines, pending and a
+// lost response.
 func TestFake_Contract(t *testing.T) {
 	t.Parallel()
 	var current *rail.Fake // subtests run one at a time
+	fake := func(a rail.Adapter) *rail.Fake { return a.(*rail.Fake) }
 	railtest.Run(t, railtest.Harness{
 		New: func(*testing.T) rail.Adapter {
 			current = rail.NewFake()
 			return current
 		},
 		Request: func(*testing.T) rail.Request { return fakeRequest() },
-		Effects: func(_ *testing.T, ref string) int {
-			if current.Moved(ref) {
-				return 1
-			}
-			return 0
-		},
+		Effects: func(_ *testing.T, ref string) int { return current.Moves(ref) },
 		Decline: func(_ *testing.T, a rail.Adapter) rail.Request {
-			a.(*rail.Fake).Push(rail.Step{Outcome: rail.Declined, Reason: "insufficient_funds"})
+			fake(a).Push(rail.Step{Outcome: rail.Declined, Reason: "insufficient_funds"})
+			return fakeRequest()
+		},
+		Pend: func(_ *testing.T, a rail.Adapter) rail.Request {
+			fake(a).Push(rail.Step{Outcome: rail.Pending})
+			return fakeRequest()
+		},
+		Resolve: func(t *testing.T, a rail.Adapter, ref string, outcome rail.Outcome) {
+			if err := fake(a).Resolve(ref, outcome, ""); err != nil {
+				t.Fatal(err)
+			}
+		},
+		LoseResponse: func(_ *testing.T, a rail.Adapter) rail.Request {
+			fake(a).Push(rail.Step{LoseResponse: true})
 			return fakeRequest()
 		},
 	})
@@ -103,25 +179,8 @@ func TestFake_DelayAndTimeout(t *testing.T) {
 	if _, err := f.Status(t.Context(), slow.Ref); !errors.Is(err, rail.ErrUnknownRef) {
 		t.Fatalf("Status after timeout = %v, want ErrUnknownRef (nothing applied)", err)
 	}
-	if res, err := f.Settle(t.Context(), slow); err != nil || res.Outcome != rail.Settled || !f.Moved(slow.Ref) {
-		t.Fatalf("retry = %+v, %v; want Settled", res, err)
-	}
-}
-
-// Unknown is not failure (ADR-120): the response is lost after the money
-// moved, Settle errors, and Status says Settled; a retry moves nothing more.
-func TestFake_LostResponseIsResolvedByStatus(t *testing.T) {
-	t.Parallel()
-	f := rail.NewFake(rail.Step{LoseResponse: true})
-	req := fakeRequest()
-	if _, err := f.Settle(t.Context(), req); !errors.Is(err, rail.ErrResponseLost) {
-		t.Fatalf("Settle = %v, want ErrResponseLost", err)
-	}
-	if res, err := f.Status(t.Context(), req.Ref); err != nil || res.Outcome != rail.Settled {
-		t.Fatalf("Status = %+v, %v; want Settled", res, err)
-	}
-	if res, err := f.Settle(t.Context(), req); err != nil || res.Outcome != rail.Settled {
-		t.Fatalf("retry = %+v, %v; want the recorded Settled", res, err)
+	if res, err := f.Settle(t.Context(), slow); err != nil || res.Outcome != rail.Settled || f.Moves(slow.Ref) != 1 {
+		t.Fatalf("retry = %+v, %v; want Settled once", res, err)
 	}
 }
 
@@ -139,33 +198,24 @@ func TestFake_ErrorBeforeApplying(t *testing.T) {
 	}
 }
 
-// Pending stays pending (and repeats return it) until Resolve, as an
-// asynchronous PSP's webhook would; only a pending operation resolves.
-func TestFake_PendingThenResolved(t *testing.T) {
+// Resolve only finishes a pending operation, with a final outcome, and a
+// decline always carries a reason.
+func TestFake_Resolve(t *testing.T) {
 	t.Parallel()
-	f := rail.NewFake(rail.Step{Outcome: rail.Pending}, rail.Step{Outcome: rail.Pending})
-	settles, declines := fakeRequest(), fakeRequest()
-	for _, req := range []rail.Request{settles, declines} {
-		if res, err := f.Settle(t.Context(), req); err != nil || res.Outcome != rail.Pending {
-			t.Fatalf("Settle = %+v, %v; want Pending", res, err)
+	f := rail.NewFake(rail.Step{Outcome: rail.Pending}, rail.Step{Outcome: rail.Declined})
+	pending, declined := fakeRequest(), fakeRequest()
+	for _, req := range []rail.Request{pending, declined} {
+		if _, err := f.Settle(t.Context(), req); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if res, _ := f.Settle(t.Context(), settles); res.Outcome != rail.Pending || f.Moved(settles.Ref) {
-		t.Fatalf("repeat while pending = %+v, want Pending and no money moved", res)
+	if res, _ := f.Status(t.Context(), declined.Ref); res.Reason != rail.DefaultDeclineReason {
+		t.Fatalf("decline without a scripted reason = %+v, want reason %q", res, rail.DefaultDeclineReason)
 	}
-	if err := f.Resolve(settles.Ref, rail.Settled, ""); err != nil {
-		t.Fatal(err)
+	if err := f.Resolve(pending.Ref, rail.Pending, ""); !errors.Is(err, rail.ErrInvalidRequest) {
+		t.Fatalf("Resolve to Pending = %v, want ErrInvalidRequest", err)
 	}
-	if err := f.Resolve(declines.Ref, rail.Declined, "do_not_honour"); err != nil {
-		t.Fatal(err)
-	}
-	if res, err := f.Status(t.Context(), settles.Ref); err != nil || res.Outcome != rail.Settled || !f.Moved(settles.Ref) {
-		t.Fatalf("Status = %+v, %v; want Settled", res, err)
-	}
-	if res, err := f.Status(t.Context(), declines.Ref); err != nil || res != (rail.Result{Outcome: rail.Declined, Reason: "do_not_honour"}) {
-		t.Fatalf("Status = %+v, %v; want Declined do_not_honour", res, err)
-	}
-	if err := f.Resolve(settles.Ref, rail.Declined, "late"); !errors.Is(err, rail.ErrNotPending) {
+	if err := f.Resolve(declined.Ref, rail.Settled, ""); !errors.Is(err, rail.ErrNotPending) {
 		t.Fatalf("Resolve of a final outcome = %v, want ErrNotPending", err)
 	}
 	if err := f.Resolve("pay_unknown", rail.Settled, ""); !errors.Is(err, rail.ErrUnknownRef) {
@@ -173,30 +223,76 @@ func TestFake_PendingThenResolved(t *testing.T) {
 	}
 }
 
-// Same script, same calls, same results.
-func TestFake_Deterministic(t *testing.T) {
+// The script plays out exactly: one step per reference that reaches the
+// fake, in order, and a repeat returns the recorded outcome without a step.
+func TestFake_ScriptPlaysInOrder(t *testing.T) {
 	t.Parallel()
-	script := []rail.Step{
-		{Outcome: rail.Declined, Reason: "insufficient_funds"},
-		{LoseResponse: true},
-		{Outcome: rail.Pending},
-		{Err: errors.New("reset")},
-	}
+	reset := errors.New("reset")
+	f := rail.NewFake(
+		rail.Step{Outcome: rail.Declined, Reason: "insufficient_funds"},
+		rail.Step{LoseResponse: true},
+		rail.Step{Outcome: rail.Pending},
+		rail.Step{Err: reset},
+	)
 	reqs := make([]rail.Request, 6)
 	for i := range reqs {
 		reqs[i] = fakeRequest()
 	}
-	run := func() []string {
-		f := rail.NewFake(script...)
-		var out []string
-		for _, req := range append(reqs, reqs[0], reqs[1]) {
-			res, err := f.Settle(t.Context(), req)
-			out = append(out, string(res.Outcome)+"/"+res.Reason+"/"+errText(err))
+	declined := rail.Result{Outcome: rail.Declined, Reason: "insufficient_funds"}
+	settled := rail.Result{Outcome: rail.Settled}
+	for i, want := range []struct {
+		req rail.Request
+		res rail.Result
+		err error
+	}{
+		{reqs[0], declined, nil},
+		{reqs[1], rail.Result{}, rail.ErrResponseLost},
+		{reqs[2], rail.Result{Outcome: rail.Pending}, nil},
+		{reqs[3], rail.Result{}, reset},
+		{reqs[4], settled, nil}, // the script has run out
+		{reqs[5], settled, nil},
+		{reqs[0], declined, nil}, // repeats: recorded, no step taken
+		{reqs[1], settled, nil},
+		{reqs[3], settled, nil}, // nothing was recorded, so a new step: default
+	} {
+		res, err := f.Settle(t.Context(), want.req)
+		if res != want.res || !errors.Is(err, want.err) || (want.err == nil && err != nil) {
+			t.Errorf("call %d = %+v, %v; want %+v, %v", i, res, err, want.res, want.err)
 		}
-		return out
 	}
-	if a, b := run(), run(); strings.Join(a, " ") != strings.Join(b, " ") {
-		t.Fatalf("two runs differ:\n%v\n%v", a, b)
+}
+
+// Concurrent calls for one reference share one step, so the script doesn't
+// shift: every caller sees the scripted outcome and the next reference gets
+// the next step (review should 1, for the subtask 11 chaos runs).
+func TestFake_ConcurrentCallsShareOneStep(t *testing.T) {
+	t.Parallel()
+	f := rail.NewFake(
+		rail.Step{Delay: 20 * time.Millisecond, Outcome: rail.Declined, Reason: "first"},
+		rail.Step{Outcome: rail.Declined, Reason: "second"},
+	)
+	req := fakeRequest()
+	const n = 16
+	results := make([]rail.Result, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range n {
+		wg.Go(func() {
+			<-start
+			results[i], errs[i] = f.Settle(t.Context(), req)
+		})
+	}
+	close(start)
+	wg.Wait()
+	first := rail.Result{Outcome: rail.Declined, Reason: "first"}
+	for i := range n {
+		if errs[i] != nil || results[i] != first {
+			t.Fatalf("call %d = %+v, %v; want %+v", i, results[i], errs[i], first)
+		}
+	}
+	if res, err := f.Settle(t.Context(), fakeRequest()); err != nil || res.Reason != "second" {
+		t.Fatalf("next reference = %+v, %v; want the second step", res, err)
 	}
 }
 
@@ -208,36 +304,42 @@ func TestRef_Deterministic(t *testing.T) {
 	}
 }
 
-func errText(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
-}
-
 // fakeRequest is a valid request with a new payment; the fake never looks
 // the accounts up.
 func fakeRequest() rail.Request {
 	id := uuid.New()
-	return rail.Request{PaymentID: id, Ref: rail.Ref(id), Amount: 1250, Currency: rail.Currency, Payer: uuid.New(), Payee: uuid.New()}
+	return rail.Request{PaymentID: id, Ref: rail.Ref(id), Amount: 1250, Currency: "GBP", Payer: uuid.New(), Payee: uuid.New()}
 }
 
 // newPaymentRequest creates two accounts and a payment between them, and
 // returns the request that settles it.
 func newPaymentRequest(t *testing.T, pool *pgxpool.Pool) rail.Request {
 	t.Helper()
-	ctx := t.Context()
-	newID := func(sql string, args ...any) uuid.UUID {
-		var id pgtype.UUID
-		if err := pool.QueryRow(ctx, sql, args...).Scan(&id); err != nil {
-			t.Fatalf("insert: %v", err)
+	payer, payee := testutil.NewAccount(t, pool, "user"), testutil.NewAccount(t, pool, "merchant")
+	payment := testutil.NewPayment(t, pool, payer, payee, 1250)
+	return rail.Request{PaymentID: payment, Ref: rail.Ref(payment), Amount: 1250, Currency: "GBP", Payer: payer, Payee: payee}
+}
+
+// xactCounts reads database db's committed and rolled-back transaction
+// counts, polling until two reads 200 ms apart agree (statistics arrive
+// asynchronously), for at most 5 s.
+func xactCounts(t *testing.T, pool *pgxpool.Pool, db string) [2]int64 {
+	t.Helper()
+	read := func() [2]int64 {
+		var c [2]int64
+		if err := pool.QueryRow(context.WithoutCancel(t.Context()), "SELECT xact_commit, xact_rollback FROM pg_stat_database WHERE datname = $1", db).Scan(&c[0], &c[1]); err != nil {
+			t.Fatal(err)
 		}
-		return uuid.UUID(id.Bytes)
+		return c
 	}
-	const account = "INSERT INTO accounts (kind, currency) VALUES ('user', 'GBP') RETURNING id"
-	payer, payee := newID(account), newID(account)
-	pg := func(id uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: id, Valid: true} }
-	payment := newID(`INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail)
-		VALUES ($1, $2, 1250, 'GBP', 'internal') RETURNING id`, pg(payer), pg(payee))
-	return rail.Request{PaymentID: payment, Ref: rail.Ref(payment), Amount: 1250, Currency: rail.Currency, Payer: payer, Payee: payee}
+	prev := read()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		time.Sleep(200 * time.Millisecond)
+		cur := read()
+		if cur[1] == prev[1] && cur[0]-prev[0] <= 1 {
+			return cur
+		}
+		prev = cur
+	}
+	return prev
 }
