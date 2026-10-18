@@ -17,9 +17,12 @@ concurrency:
 # so the workflow passes on the empty skeleton and tightens as code lands.
 # The jobs only install toolchains; `make lint` / `make test` are the entry
 # points, the same commands developers run locally (Reuse Registry).
+# The runner image is pinned like the toolchains (ADR-116): ubuntu-latest
+# moves to Ubuntu 26.04 on 2026-10-19, and an image change should be a
+# deliberate bump, not a surprise on an unrelated PR.
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +66,7 @@ jobs:
         run: make lint
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
