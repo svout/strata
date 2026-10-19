@@ -62,12 +62,13 @@ func TestInternal_Balances(t *testing.T) {
 	}
 }
 
-// Review should 4 (investigation): ledger.Posted runs inside the
-// SERIALIZABLE transaction, so settles of *different* payments may conflict
-// on its predicate locks and be retried. Settle rounds of 16 different
-// payments at once on a fresh (small) ledger, require every settle to
-// succeed, and report how many transactions PostgreSQL rolled back (each
-// rollback is one retry).
+// Review should 4: settles of *different* payments must not conflict. With
+// ledger.Posted read inside the SERIALIZABLE transaction its predicate locks
+// made them conflict (0.78-0.89 rolled-back transactions per settle); read
+// before the transaction it was 0.00. Settle rounds of 16 different payments
+// at once on a fresh (small) ledger, require every settle to succeed, and
+// fail if more than 1 in 10 settles was rolled back (each rollback is one
+// retry) — far above the 0 measured, far below the ~0.8 regression.
 func TestInternal_ConcurrentDifferentPayments(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
@@ -122,6 +123,9 @@ func TestInternal_ConcurrentDifferentPayments(t *testing.T) {
 		settles, n, len(failed), rollbacks, float64(rollbacks)/float64(settles), after[0]-before[0])
 	if len(failed) > 0 {
 		t.Fatalf("%d of %d settles failed, first: %v", len(failed), settles, failed[0])
+	}
+	if rollbacks*10 > int64(settles) {
+		t.Fatalf("%d rolled-back transactions for %d settles of different payments, want at most %d", rollbacks, settles, settles/10)
 	}
 }
 

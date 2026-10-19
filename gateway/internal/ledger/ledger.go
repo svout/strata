@@ -89,9 +89,9 @@ func Post(ctx context.Context, tx pgx.Tx, paymentID uuid.UUID, entries []Entry) 
 // happens at most once per railRef, enforced by the database (UNIQUE
 // (rail_ref, leg), migration 00003): if a posting with railRef exists,
 // PostRef writes nothing and returns ErrAlreadyPosted, however the writers
-// race. Check Posted first in the same transaction as the fast path; under
-// SERIALIZABLE that also turns a race into a retried serialization failure
-// rather than ErrAlreadyPosted (ADR-120).
+// race. Check Posted first, outside the transaction, as the fast path: read
+// inside a SERIALIZABLE transaction it takes predicate locks that make
+// postings of different references conflict and retry (ADR-120).
 func PostRef(ctx context.Context, tx pgx.Tx, paymentID uuid.UUID, railRef string, entries []Entry) error {
 	if railRef == "" || len([]rune(railRef)) > 255 {
 		return ErrMissingRef
