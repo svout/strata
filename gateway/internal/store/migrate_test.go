@@ -25,7 +25,7 @@ var schemaTables = []string{"accounts", "payments", "ledger_entries", "idempoten
 
 // schemaRelations is every table and index the migrations create; to_regclass
 // (tableExists) finds indexes as well as tables.
-var schemaRelations = slices.Concat(schemaTables, []string{"idempotency_keys_created_at_idx"})
+var schemaRelations = slices.Concat(schemaTables, []string{"idempotency_keys_created_at_idx", "ledger_entries_rail_ref_leg_key"})
 
 // PostgreSQL SQLSTATE codes the schema's constraints raise.
 const (
@@ -44,8 +44,8 @@ func TestUpAppliesSchema(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT max(version_id) FROM goose_db_version").Scan(&version); err != nil {
 		t.Fatalf("read goose version: %v", err)
 	}
-	if version != 2 {
-		t.Errorf("schema version = %d, want 2", version)
+	if version != 3 {
+		t.Errorf("schema version = %d, want 3", version)
 	}
 	var indexdef string
 	if err := pool.QueryRow(ctx, "SELECT indexdef FROM pg_indexes WHERE indexname = 'idempotency_keys_created_at_idx'").Scan(&indexdef); err != nil || !strings.HasSuffix(indexdef, "(created_at)") {
@@ -89,7 +89,7 @@ func TestDownRemovesSchemaAndUpRestoresIt(t *testing.T) {
 }
 
 // TestConcurrentUpIsSerialised starts several Up runs at once against an empty
-// schema. goose's advisory lock lets one apply versions 1 and 2 while the
+// schema. goose's advisory lock lets one apply versions 1–3 while the
 // others wait and then find nothing pending, so all succeed, each version is
 // recorded exactly once, and the lock is released afterwards.
 func TestConcurrentUpIsSerialised(t *testing.T) {
@@ -117,7 +117,7 @@ func TestConcurrentUpIsSerialised(t *testing.T) {
 		}
 	}
 
-	for _, v := range []int{1, 2} {
+	for _, v := range []int{1, 2, 3} {
 		var applied int
 		if err := pool.QueryRow(ctx, "SELECT count(*) FROM goose_db_version WHERE version_id = $1", v).Scan(&applied); err != nil {
 			t.Fatalf("count version rows: %v", err)

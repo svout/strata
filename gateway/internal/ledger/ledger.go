@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -50,7 +51,18 @@ var (
 	ErrUnbalanced       = fmt.Errorf("%w: debits do not equal credits", ErrInvalidPosting)
 	ErrOverflow         = fmt.Errorf("%w: total exceeds int64", ErrInvalidPosting)
 	ErrMissingID        = fmt.Errorf("%w: payment or account id is the nil UUID", ErrInvalidPosting)
+	ErrMissingRef       = fmt.Errorf("%w: rail reference must be 1-255 characters", ErrInvalidPosting)
 )
+
+// ErrAlreadyPosted means a posting with this rail reference exists: PostRef
+// wrote nothing. For a caller settling a rail operation it means the work is
+// already done (ADR-120).
+var ErrAlreadyPosted = errors.New("ledger: a posting with this rail reference already exists")
+
+// railRefLegKey is migration 00003's UNIQUE (rail_ref, leg) constraint.
+const railRefLegKey = "ledger_entries_rail_ref_leg_key"
+
+const sqlstateUniqueViolation = "23505"
 
 // ErrNotSerializable means Post was handed a transaction below SERIALIZABLE.
 // That is a programming error in the caller, not a bad request: use
@@ -67,8 +79,36 @@ var ErrNotSerializable = errors.New("ledger: transaction is not SERIALIZABLE")
 // happens to anything else it did.
 //
 // Post does not stop the same payment being posted twice: each call adds its
-// legs. Idempotency is SPEC-002 subtask 7.
+// legs. A posting that must happen once (settling a rail operation) uses
+// PostRef.
 func Post(ctx context.Context, tx pgx.Tx, paymentID uuid.UUID, entries []Entry) error {
+	return post(ctx, tx, paymentID, nil, entries)
+}
+
+// PostRef is Post for the posting that settles the rail operation railRef. It
+// happens at most once per railRef, enforced by the database (UNIQUE
+// (rail_ref, leg), migration 00003): if a posting with railRef exists,
+// PostRef writes nothing and returns ErrAlreadyPosted, however the writers
+// race. Check Posted first, outside the transaction, as the fast path: read
+// inside a SERIALIZABLE transaction it takes predicate locks that make
+// postings of different references conflict and retry (ADR-120).
+func PostRef(ctx context.Context, tx pgx.Tx, paymentID uuid.UUID, railRef string, entries []Entry) error {
+	if railRef == "" || len([]rune(railRef)) > 255 {
+		return ErrMissingRef
+	}
+	return post(ctx, tx, paymentID, &railRef, entries)
+}
+
+// Posted reports whether a posting with railRef exists.
+func Posted(ctx context.Context, q Querier, railRef string) (bool, error) {
+	var posted bool
+	if err := q.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM ledger_entries WHERE rail_ref = $1)", railRef).Scan(&posted); err != nil {
+		return false, fmt.Errorf("ledger: posted: %w", err)
+	}
+	return posted, nil
+}
+
+func post(ctx context.Context, tx pgx.Tx, paymentID uuid.UUID, railRef *string, entries []Entry) error {
 	if err := validate(paymentID, entries); err != nil {
 		return err
 	}
@@ -86,6 +126,7 @@ func Post(ctx context.Context, tx pgx.Tx, paymentID uuid.UUID, entries []Entry) 
 
 	// One INSERT for all legs: unnest turns the parallel arrays back into
 	// rows, so the posting costs one round trip however many legs it has.
+	// With a rail reference, legs are numbered from 1 in entry order.
 	accounts := make([]pgtype.UUID, len(entries))
 	directions := make([]string, len(entries))
 	amounts := make([]int64, len(entries))
@@ -93,10 +134,13 @@ func Post(ctx context.Context, tx pgx.Tx, paymentID uuid.UUID, entries []Entry) 
 		accounts[i], directions[i], amounts[i] = pgUUID(e.AccountID), string(e.Direction), e.Amount
 	}
 	_, err := tx.Exec(ctx, `
-		INSERT INTO ledger_entries (payment_id, account_id, direction, amount)
-		SELECT $1, a, d, m
-		FROM unnest($2::uuid[], $3::text[], $4::bigint[]) AS t (a, d, m)`,
-		pgUUID(paymentID), accounts, directions, amounts)
+		INSERT INTO ledger_entries (payment_id, account_id, direction, amount, rail_ref, leg)
+		SELECT $1, a, d, m, $5::text, CASE WHEN $5::text IS NULL THEN NULL ELSE n::smallint END
+		FROM unnest($2::uuid[], $3::text[], $4::bigint[]) WITH ORDINALITY AS t (a, d, m, n)`,
+		pgUUID(paymentID), accounts, directions, amounts, railRef)
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == sqlstateUniqueViolation && pgErr.ConstraintName == railRefLegKey {
+		return ErrAlreadyPosted
+	}
 	if err != nil {
 		return fmt.Errorf("ledger: insert entries: %w", err)
 	}
@@ -140,7 +184,7 @@ func validate(paymentID uuid.UUID, entries []Entry) error {
 	return nil
 }
 
-// Querier is what Balance needs; *pgxpool.Pool, *pgx.Conn and pgx.Tx all
+// Querier is what Balance and Posted need; *pgxpool.Pool, *pgx.Conn and pgx.Tx all
 // satisfy it.
 type Querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
