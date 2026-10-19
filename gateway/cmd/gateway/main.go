@@ -16,6 +16,7 @@ import (
 
 	"github.com/svout/strata/gateway/internal/config"
 	"github.com/svout/strata/gateway/internal/httpx"
+	"github.com/svout/strata/gateway/internal/idem"
 	"github.com/svout/strata/gateway/internal/payments"
 	"github.com/svout/strata/gateway/internal/store"
 )
@@ -47,7 +48,9 @@ func run() error {
 	}
 	defer pool.Close()
 	redis.SetLogger(redisLogger{log})
-	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
+	// ContextTimeoutEnabled makes the client honour context deadlines on
+	// network I/O, so the idempotency lock's 50 ms per call holds.
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, ContextTimeoutEnabled: true})
 	defer func() { _ = rdb.Close() }()
 
 	checks := []httpx.ReadyCheck{
@@ -56,7 +59,8 @@ func run() error {
 	}
 
 	router := httpx.NewRouter(log, checks...)
-	router.Mount("/v1/payments", payments.New(pool).Handler(log))
+	locker := idem.NewRedisLocker(rdb, log)
+	router.Mount("/v1/payments", payments.New(pool, payments.WithLocker(locker)).Handler(log))
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

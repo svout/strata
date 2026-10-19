@@ -86,12 +86,26 @@ var (
 
 // Service creates, reads and transitions payments.
 type Service struct {
-	pool *pgxpool.Pool
+	pool   *pgxpool.Pool
+	locker idem.Locker // nil: no in-flight lock, PostgreSQL alone
+}
+
+// Option configures a Service.
+type Option func(*Service)
+
+// WithLocker makes concurrent CreateIdempotent calls with the same key wait
+// for each other (SPEC-002 8b). Correctness doesn't depend on it (ADR-118).
+func WithLocker(l idem.Locker) Option {
+	return func(s *Service) { s.locker = l }
 }
 
 // New returns a Service on pool.
-func New(pool *pgxpool.Pool) *Service {
-	return &Service{pool: pool}
+func New(pool *pgxpool.Pool, opts ...Option) *Service {
+	s := &Service{pool: pool}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 // create validates in and inserts a payment in state created on the internal
@@ -120,10 +134,19 @@ type CreateResult struct {
 // gets that stored response back (Replayed) and creates nothing. A different
 // hash is idem.ErrMismatch. Invalid input is rejected before the key is
 // touched, and any failure rolls the claim back, so only a 201 is ever
-// stored.
+// stored. With a Locker, a concurrent duplicate waits for the first request's
+// transaction instead of racing it; the lock is held around the transaction,
+// never taken inside it, and a wait that outlasts ctx returns ctx's error.
 func (s *Service) CreateIdempotent(ctx context.Context, key idem.Key, hash [32]byte, in CreateInput) (CreateResult, error) {
 	if err := validate(in); err != nil {
 		return CreateResult{}, err
+	}
+	if s.locker != nil {
+		release, err := s.locker.Lock(ctx, key)
+		if err != nil {
+			return CreateResult{}, err
+		}
+		defer release()
 	}
 	var out CreateResult
 	err := store.Serializable(ctx, s.pool, func(tx pgx.Tx) error {

@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/svout/strata/gateway/internal/httpx"
 	"github.com/svout/strata/gateway/internal/idem"
@@ -35,13 +36,29 @@ type testAPI struct {
 
 func newTestAPI(t *testing.T) *testAPI {
 	t.Helper()
+	a, _ := newTestAPIWith(t, nil)
+	return a
+}
+
+// newTestAPIWith is newTestAPI with the Redis in-flight lock on rdb, as
+// cmd/gateway wires it; a nil rdb means no lock.
+func newTestAPIWith(t *testing.T, rdb *redis.Client) (*testAPI, *idem.RedisLocker) {
+	t.Helper()
 	pool := testutil.Postgres(t)
 	var buf bytes.Buffer
 	log := httpx.NewLogger(&buf, slog.LevelInfo)
+	var (
+		opts   []Option
+		locker *idem.RedisLocker
+	)
+	if rdb != nil {
+		locker = idem.NewRedisLocker(rdb, log)
+		opts = append(opts, WithLocker(locker))
+	}
 	r := httpx.NewRouter(log)
-	r.Mount("/v1/payments", New(pool).Handler(log))
+	r.Mount("/v1/payments", New(pool, opts...).Handler(log))
 	return &testAPI{t: t, pool: pool, router: r, log: &buf,
-		payer: newAccount(t.Context(), t, pool), payee: newAccount(t.Context(), t, pool)}
+		payer: newAccount(t.Context(), t, pool), payee: newAccount(t.Context(), t, pool)}, locker
 }
 
 func (a *testAPI) do(method, path, key, body string, header ...string) *httptest.ResponseRecorder {
@@ -248,11 +265,42 @@ func TestHTTP_ClientCancelled(t *testing.T) {
 }
 
 // AC3: 100 concurrent requests with the same Idempotency-Key and body create
-// exactly one payment and one key, and all 100 get the same response.
+// exactly one payment and one key, and all 100 get the same response: on
+// PostgreSQL alone, with the Redis lock, and with Redis down (fail open).
 func TestHTTP_AC3_ConcurrentSameKeyExactlyOnce(t *testing.T) {
 	t.Parallel()
-	a := newTestAPI(t)
 	const n = 100
+	for name, tc := range map[string]struct {
+		rdb  func(*testing.T) *redis.Client
+		down bool
+	}{
+		"postgres only": {rdb: func(*testing.T) *redis.Client { return nil }},
+		// Under a loaded -race run some Redis calls exceed 50 ms and fail
+		// open, so this case doesn't assert Degraded = 0;
+		// TestHTTP_LockWaitAndTimeout proves the lock makes requests wait.
+		"redis lock": {rdb: func(t *testing.T) *redis.Client { return testutil.Redis(t) }},
+		"redis down": {rdb: downRedis, down: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			a, locker := newTestAPIWith(t, tc.rdb(t))
+			concurrentSameKey(t, a, n)
+			if tc.down && locker.Degraded() != n {
+				t.Fatalf("Degraded = %d, want %d", locker.Degraded(), n)
+			}
+		})
+	}
+}
+
+// downRedis is a client whose server is unreachable.
+func downRedis(t *testing.T) *redis.Client {
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", ContextTimeoutEnabled: true})
+	t.Cleanup(func() { _ = rdb.Close() })
+	return rdb
+}
+
+func concurrentSameKey(t *testing.T, a *testAPI, n int) {
+	t.Helper()
 	body := a.body("")
 
 	type result struct {
@@ -291,6 +339,50 @@ func TestHTTP_AC3_ConcurrentSameKeyExactlyOnce(t *testing.T) {
 	}
 	if c, r := strings.Count(a.log.String(), `"msg":"payment created"`), strings.Count(a.log.String(), `"msg":"payment replayed"`); c != 1 || r != n-1 {
 		t.Fatalf("log: %d created, %d replayed; want 1 and %d", c, r, n-1)
+	}
+}
+
+// A request whose key is locked waits for the holder and then runs; one whose
+// wait outlasts its deadline gets 503 request_timeout and creates nothing.
+func TestHTTP_LockWaitAndTimeout(t *testing.T) {
+	t.Parallel()
+	a, locker := newTestAPIWith(t, testutil.Redis(t))
+	key := idem.Key{Scope: idem.AnonymousCaller, Value: "k-locked"}
+	release, err := locker.Lock(t.Context(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	short, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
+	defer cancel()
+	req := httptest.NewRequestWithContext(short, http.MethodPost, "/v1/payments", strings.NewReader(a.body("")))
+	req.Header.Set(idem.Header, key.Value)
+	timedOut := httptest.NewRecorder()
+	a.router.ServeHTTP(timedOut, req)
+	assertProblem(t, timedOut, http.StatusServiceUnavailable, "request_timeout")
+	if timedOut.Header().Get("Retry-After") != "1" {
+		t.Fatalf("Retry-After = %q, want 1", timedOut.Header().Get("Retry-After"))
+	}
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- a.do(http.MethodPost, "/v1/payments", key.Value, a.body("")) }()
+	select {
+	case rec := <-done:
+		t.Fatalf("request finished (%d) while its key was locked", rec.Code)
+	case <-time.After(150 * time.Millisecond):
+	}
+	var payments int
+	if err := a.pool.QueryRow(t.Context(), "SELECT count(*) FROM payments").Scan(&payments); err != nil || payments != 0 {
+		t.Fatalf("payments while locked = %d (%v), want 0", payments, err)
+	}
+	release()
+	select {
+	case rec := <-done:
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("after release = %d: %s, want 201", rec.Code, rec.Body)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("request did not finish after the lock was released")
 	}
 }
 

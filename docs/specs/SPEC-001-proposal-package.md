@@ -13,7 +13,7 @@ adr:
   - ADR-113
 created: 2026-09-26
 ---
-<!-- DO NOT EDIT: exported from vault "Specs/SPEC-001 Proposal Package.md" by make export-docs | source-sha256: bfa699d99f609941620b564d8e8c5ea3c2b24cb87e75b5d4cd7038c7e20ab3b2 | content-sha256: 58b5b8310821a0ba0fd28abf6711d55614f8388c32c701a1b8f198f1544fc507 -->
+<!-- DO NOT EDIT: exported from vault "Specs/SPEC-001 Proposal Package.md" by make export-docs | source-sha256: 6230c2daf587aaf4f0a5a85dff790a4f773bd1a2db6410d299a83e6d4dbe414f | content-sha256: bcd26ac4d18d59929d3e127cea84992d7deaba36c1bc96f1ab7107a331d459e3 -->
 
 # SPEC-001 Proposal Package
 
@@ -27,7 +27,7 @@ The topic is agreed (2026-09-26, Supervisor Log), but nothing written exists tha
 Revision 2 keeps the revision-1 groundwork (threat model, metrics, literature, repo) and replans the rest by who may do it.
 
 ## Goal and non-goals
-**Goal:** a proposal package the supervisor signs off: proposal document, finished Threat Model, Research Questions and Evaluation covering every success criterion, ethics form submitted, 12–15 sources in Literature Notes, and an empty repo with Repo Kit installed and CI green.
+**Goal:** a proposal package the supervisor signs off: proposal document, finished Threat Model, Research Questions and Evaluation covering every success criterion, ethics form submitted, 12–15 sources in Literature Notes, and an empty repo with Strata/Repo Kit/Repo Kit installed and CI green.
 **Goal (revision 2):** Ivan submits his own 1,000–1,500-word proposal plus E1 on Moodle by S1 week 4, after the supervisor has seen it. Under ADR-113, Claude may draft, plan and review. Ivan edits and owns everything submitted and can explain every part. Every AI contribution is declared in AI Use Log.
 **Non-goals:** any gateway, control-plane or console code; choosing ML models or features beyond naming them; final chapter prose (the revision-1 Ch. 1–2 drafts feed the progress report's Introduction and Background review); fixing calendar dates (plan stays in week numbers until deadlines are known).
 
@@ -43,7 +43,7 @@ Planning spec: each criterion is checked by inspection of the named note, not by
 - [x] Every success criterion in Project Brief › Success criteria maps to a row in Research Questions and Evaluation › Metrics with a metric and instrument. This includes ledger invariants and chapter mapping, which have no row today.
 - [x] Literature Notes holds ≥ 12 sources: the four protocol specs, ≥ 4 peer-reviewed papers, each with the per-source template filled, and a one-paragraph gap statement citing them.
 - [ ] Ethics form submitted (or written confirmation it isn't needed), recorded in Supervisor Log; consistent with ADR-105.
-- [x] Repo created, `Repo Kit/install.sh` run, CI passes on an empty build (lint + empty test job); repo URL recorded in Home.
+- [x] Repo created, `Repo Kit/install.sh` run, CI passes on an empty build (lint + empty test job); repo URL recorded in Strata/Home.
 - [ ] Supervisor sign-off on scope and RQs recorded in Supervisor Log with the date.
 - [x] First drafts of Chapter 1 (Introduction) and Chapter 2 (Background) exist in `Dissertation/`. **Restored (ADR-113):** they feed the progress report's Introduction and Background review (S1 week 12), which is out of scope for this spec.
 
@@ -58,24 +58,24 @@ Planning spec: each criterion is checked by inspection of the named note, not by
 
 ## Design notes
 **Outputs:** `Dissertation/Proposal.md` (new; export to the department's format at the end), edits to `Project/Threat Model.md`, `Dissertation/Research Questions and Evaluation.md`, `Dissertation/Literature Notes.md`, `Dissertation/Supervisor Log.md`, new `Dissertation/Ch1 Introduction.md`, `Dissertation/Ch2 Background.md`.
-**Repo:** empty monorepo skeleton only (`gateway/`, `control-plane/`, `console/` placeholders per Architecture); CI = one workflow running lint and an empty test target.
+**Repo:** empty monorepo skeleton only (`gateway/`, `control-plane/`, `console/` placeholders per Strata/Project/Architecture); CI = one workflow running lint and an empty test target.
 **Division of labour (ADR-113, rev. 2):** each subtask names an owner.
 - **Claude** may draft, plan, implement permitted work and review.
 - **Ivan** edits and owns everything submitted, makes the submissions, and must be able to explain all of it.
 - **Declaration rule:** every subtask, whoever owns it, adds or updates an AI Use Log row when Claude contributed (ADR-113 rule 1). Sources are read by Ivan before they are cited (rule 3).
 
-**Performance budget:** n/a for this spec. Latency targets are *stated* in the proposal from Architecture › Latency budget, not measured.
+**Performance budget:** n/a for this spec. Latency targets are *stated* in the proposal from Strata/Project/Architecture › Latency budget, not measured.
 
 ## Reuse plan
-Check Reuse Registry first. No Registry rows belong to P0 (all rows are code components for P1–P7); this spec reuses existing notes instead.
+Check Strata/Workflow/Reuse Registry first. No Registry rows belong to P0 (all rows are code components for P1–P7); this spec reuses existing notes instead.
 | Need | Reuse / extend / new | Registry item or new home |
 |---|---|---|
 | Threat scenarios | extend | Threat Model (eight scenarios already drafted) |
 | RQs, metrics, experiment design | extend | Research Questions and Evaluation |
 | Problem, pitch, success criteria | reuse | Project Brief, Market and Positioning |
-| Architecture and stack for the method section | reuse | Architecture, Technology Choices, Decisions (ADRs) |
+| Architecture and stack for the method section | reuse | Strata/Project/Architecture, Technology Choices, Decisions (ADRs) |
 | Source list and per-source template | extend | Literature Notes |
-| Repo CLAUDE.md and `.claude/` | reuse | Repo Kit via `install.sh` |
+| Repo CLAUDE.md and `.claude/` | reuse | Strata/Repo Kit/Repo Kit via `install.sh` |
 | Proposal document | extend (rev. 2) | `Dissertation/Proposal.md`: Claude's draft, cut and restructured to the handbook, then edited and owned by Ivan |
 | Gantt chart, data-management plan, version-management plan | new | `Project/Gantt Chart.md`, `Project/Data Management Plan.md`, `Project/Version Management Plan.md` |
 | Module rules, rubric, deadlines | reuse | COMP6013 Requirements |
@@ -133,7 +133,7 @@ Each ≤ 1 day, one session. "Green" here means every note it touches is consist
   - Fill in E1 (using Ethics Answers as notes), get Sam's approval, and submit the proposal plus E1 on Moodle by S1 week 4.
   - Claude records the date and confirmation in Supervisor Log and ticks the P0 deliverables.
 - [ ] 17. **[Claude] Plan re-anchor** (vault plan; blocked on Moodle dates).
-  - Map the phase table in Home to semester weeks, with the progress report as a hard milestone (S1 week 12 vs 13: confirm).
+  - Map the phase table in Strata/Home to semester weeks, with the progress report as a hard milestone (S1 week 12 vs 13: confirm).
   - Add the poster and presentation to P8 Dissertation Write-up.
   - Touches `Home.md`, `Phases/P8 Dissertation Write-up.md` and the week-date table in `Dissertation/Project Log.md`.
 - [x] 18. **[Claude] (b) Gantt chart.**
