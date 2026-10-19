@@ -69,7 +69,7 @@ test: ## Run every scaffolded service's tests
 # k-sweep at reduced ones (it measures shape). Output is also saved to
 # bench-<sha>.txt for benchstat.
 bench_go = (cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) go test -run '^$$' -timeout 60m $(1) ./internal/payments)
-bench: ## Benchmark POST /v1/payments (with/without Redis, settled on fake/internal rail, contended sweep); needs Docker
+bench: ## Benchmark POST /v1/payments (with/without Redis, settled on fake/internal rail, contended and concurrent-settled sweeps); needs Docker
 	@docker info >/dev/null 2>&1 || { echo "Docker is not running: start Docker Desktop" >&2; exit 1; }
 	@if [ -n "$$(git status --porcelain -- gateway Makefile)" ]; then echo "bench: gateway/ or Makefile has uncommitted changes; commit first so the SHA matches" >&2; exit 1; fi
 	@out=bench-$$(git rev-parse --short HEAD).txt; { \
@@ -82,6 +82,7 @@ bench: ## Benchmark POST /v1/payments (with/without Redis, settled on fake/inter
 	  $(call bench_go,-bench '^BenchmarkCreatePayment$$' -benchtime 2000x -count 5); \
 	  $(call bench_go,-bench '^BenchmarkCreatePaymentSettled$$' -benchtime 2000x -count 5); \
 	  $(call bench_go,-bench '^BenchmarkCreatePaymentContended$$' -benchtime 200x -count 3); \
+	  $(call bench_go,-bench '^BenchmarkCreatePaymentConcurrentSettled$$' -benchtime 200x -count 3); \
 	} 2>&1 | tee "$$out"; echo "saved $$out"
 
 dev: ## Start the local stack (gateway, PostgreSQL 16, Redis 7) and wait until /readyz is 200

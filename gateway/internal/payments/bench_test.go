@@ -132,6 +132,47 @@ func BenchmarkCreatePaymentContended(b *testing.B) {
 	}
 }
 
+// BenchmarkCreatePaymentConcurrentSettled sends k concurrent requests per
+// iteration, each with its own key. Unlike BenchmarkCreatePaymentContended
+// (k duplicates of one key, one settlement) this is k settlements at once,
+// and every bench payment shares one payer and one payee, so their postings
+// all land on the same accounts. That is the question SPEC-002/10a-ii raises
+// by adding a single clearing account per rail: do concurrent settlements
+// serialize on a shared account? With an append-only ledger they shouldn't,
+// and rollbacks/req is where it would show. ns/op is per batch of k
+// requests.
+//
+// The rail variants attribute any conflict: none is the create path alone
+// (payments stay created), fake adds the settlement transitions, internal
+// adds the ledger posting.
+//
+// PostgreSQL mode only: the Redis lock is per key, so with distinct keys it
+// adds a fixed cost and no contention. The test pool has 8 connections, so
+// at k = 16 half the requests also queue for a connection.
+func BenchmarkCreatePaymentConcurrentSettled(b *testing.B) {
+	rails := append([]struct {
+		name    string
+		newRail railFor
+	}{{"none", nil}}, settleRails...)
+	for _, k := range []int{8, 16} {
+		for _, rl := range rails {
+			b.Run("k="+strconv.Itoa(k)+"/"+rl.name+"/postgres", func(b *testing.B) {
+				r := newBenchRun(b, nil, rl.newRail)
+				r.spread(b, "bench-warmup", k) // dials up to k connections outside the timer
+				var batchLat, reqLat []time.Duration
+				for b.Loop() {
+					start := time.Now()
+					reqLat = append(reqLat, r.spread(b, "bench-"+strconv.Itoa(len(batchLat)), k)...)
+					batchLat = append(batchLat, time.Since(start))
+				}
+				r.finish(b, (len(batchLat)+1)*k) // k payments per batch, warm-up included
+				reportLatency(b, "batch-", batchLat)
+				reportLatency(b, "req-", reqLat)
+			})
+		}
+	}
+}
+
 // benchRun is one benchmark run's API and outcome counts.
 type benchRun struct {
 	a       *testAPI
@@ -203,6 +244,24 @@ func (r *benchRun) batch(b *testing.B, key string, k int) []time.Duration {
 	}
 	if first < 0 {
 		b.Fatalf("batch %s: no request got 201 (codes %v)", key, codes)
+	}
+	return lat
+}
+
+// spread sends k concurrent creates with distinct keys (prefix-0 …
+// prefix-(k-1)) and returns their latencies. Every request must get 201:
+// there is nothing to deduplicate, so anything else is a failure.
+func (r *benchRun) spread(b *testing.B, prefix string, k int) []time.Duration {
+	codes, lat := make([]int, k), make([]time.Duration, k)
+	var wg sync.WaitGroup
+	for j := range k {
+		wg.Go(func() { codes[j], _, lat[j] = r.post(prefix + "-" + strconv.Itoa(j)) })
+	}
+	wg.Wait()
+	for j, c := range codes {
+		if c != http.StatusCreated {
+			b.Fatalf("spread %s: request %d got %d, want 201 (codes %v)", prefix, j, c, codes)
+		}
 	}
 	return lat
 }
