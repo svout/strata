@@ -18,7 +18,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,6 +28,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/svout/strata/gateway/internal/idem"
+	"github.com/svout/strata/gateway/internal/rail"
 	"github.com/svout/strata/gateway/internal/store"
 )
 
@@ -39,27 +42,41 @@ const (
 	Failed   State = "failed"
 )
 
-// RailInternal is the only rail in P1 (SPEC-002 subtask 7); the service sets
-// it, callers can't choose it.
-const RailInternal = "internal"
+// RailInternal is the rail recorded when a Service has no rail (WithRail).
+// The rail package owns the name; callers can't choose a rail.
+const RailInternal = rail.InternalName
+
+// FailureReason says why a payment failed, as stored in
+// payments.failure_reason. It is set exactly when the state is Failed.
+type FailureReason string
+
+const (
+	// FailureDeclined: the rail declined the payment. The payer's problem.
+	FailureDeclined FailureReason = "declined"
+	// FailureInvalidRequest: the rail rejected the request as wrong in
+	// itself (rail.ErrInvalidRequest). Our bug: it is logged at Error.
+	FailureInvalidRequest FailureReason = "invalid_request"
+)
 
 // Currency is the only currency in P1; the schema's CHECK enforces it too.
 const Currency = "GBP"
 
 // Payment is one row of the payments table. Amount is in minor units (pence).
-// MandateID and RailRef are nil until set.
+// MandateID and RailRef are nil until set; FailureReason is set only when
+// State is Failed.
 type Payment struct {
-	ID             uuid.UUID  `json:"id"`
-	State          State      `json:"state"`
-	Amount         int64      `json:"amount"`
-	Currency       string     `json:"currency"`
-	PayerAccountID uuid.UUID  `json:"payer_account_id"`
-	PayeeAccountID uuid.UUID  `json:"payee_account_id"`
-	MandateID      *uuid.UUID `json:"mandate_id"`
-	Rail           string     `json:"rail"`
-	RailRef        *string    `json:"rail_ref"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	ID             uuid.UUID      `json:"id"`
+	State          State          `json:"state"`
+	Amount         int64          `json:"amount"`
+	Currency       string         `json:"currency"`
+	PayerAccountID uuid.UUID      `json:"payer_account_id"`
+	PayeeAccountID uuid.UUID      `json:"payee_account_id"`
+	MandateID      *uuid.UUID     `json:"mandate_id"`
+	Rail           string         `json:"rail"`
+	RailRef        *string        `json:"rail_ref"`
+	FailureReason  *FailureReason `json:"failure_reason"`
+	CreatedAt      time.Time      `json:"created_at"`
+	UpdatedAt      time.Time      `json:"updated_at"`
 }
 
 // CreateInput is what a caller supplies for a new payment.
@@ -74,20 +91,31 @@ type CreateInput struct {
 // Errors returned for requests that are wrong in themselves; anything else is
 // a database failure. Messages are fixed: none quotes the input.
 var (
-	ErrNotFound            = errors.New("payments: payment not found")
-	ErrInvalidTransition   = errors.New("payments: transition not allowed from the current state")
-	ErrInvalidAmount       = errors.New("payments: amount must be greater than zero")
-	ErrUnsupportedCurrency = errors.New("payments: currency must be GBP")
-	ErrMissingAccount      = errors.New("payments: payer or payee account id is missing")
-	ErrSameAccount         = errors.New("payments: payer and payee are the same account")
-	ErrAccountNotFound     = errors.New("payments: payer or payee account does not exist")
-	ErrMissingRailRef      = errors.New("payments: rail reference is empty")
+	ErrNotFound             = errors.New("payments: payment not found")
+	ErrInvalidTransition    = errors.New("payments: transition not allowed from the current state")
+	ErrInvalidAmount        = errors.New("payments: amount must be greater than zero")
+	ErrUnsupportedCurrency  = errors.New("payments: currency must be GBP")
+	ErrMissingAccount       = errors.New("payments: payer or payee account id is missing")
+	ErrSameAccount          = errors.New("payments: payer and payee are the same account")
+	ErrAccountNotFound      = errors.New("payments: payer or payee account does not exist")
+	ErrMissingRailRef       = errors.New("payments: rail reference is empty")
+	ErrNoRail               = errors.New("payments: no rail configured")
+	ErrInvalidFailureReason = errors.New("payments: failure reason must be declined or invalid_request")
 )
 
 // Service creates, reads and transitions payments.
 type Service struct {
 	pool   *pgxpool.Pool
-	locker idem.Locker // nil: no in-flight lock, PostgreSQL alone
+	locker idem.Locker  // nil: no in-flight lock, PostgreSQL alone
+	rail   rail.Adapter // nil: payments are created and never settled
+	log    *slog.Logger
+
+	// settleTimeout bounds one rail call. recoverGrace is how long a payment
+	// must have been settling before Recover touches it, and recoverPage how
+	// many it reads at a time; tests change both.
+	settleTimeout time.Duration
+	recoverGrace  time.Duration
+	recoverPage   int
 }
 
 // Option configures a Service.
@@ -99,9 +127,23 @@ func WithLocker(l idem.Locker) Option {
 	return func(s *Service) { s.locker = l }
 }
 
+// WithRail makes the Service settle every payment it creates on a (the
+// outbox, ADR-118's consequence): the payment is recorded as settling with
+// its rail reference in the transaction that creates it, and the rail is
+// called after that commits. Without a rail, payments stay created.
+func WithRail(a rail.Adapter) Option {
+	return func(s *Service) { s.rail = a }
+}
+
+// WithLogger sets where settlement outcomes are logged (default: nowhere).
+// It should be the redacting logger from httpx.NewLogger.
+func WithLogger(l *slog.Logger) Option {
+	return func(s *Service) { s.log = l }
+}
+
 // New returns a Service on pool.
 func New(pool *pgxpool.Pool, opts ...Option) *Service {
-	s := &Service{pool: pool}
+	s := &Service{pool: pool, log: slog.New(slog.DiscardHandler), settleTimeout: defaultSettleTimeout, recoverGrace: defaultRecoverGrace, recoverPage: defaultRecoverPage}
 	for _, o := range opts {
 		o(s)
 	}
@@ -116,7 +158,15 @@ func (s *Service) create(ctx context.Context, in CreateInput) (Payment, error) {
 	if err := validate(in); err != nil {
 		return Payment{}, err
 	}
-	return insertPayment(ctx, s.pool, in)
+	return insertPayment(ctx, s.pool, in, s.railName())
+}
+
+// railName is the name stored in payments.rail.
+func (s *Service) railName() string {
+	if s.rail == nil {
+		return RailInternal
+	}
+	return s.rail.Name()
 }
 
 // CreateResult is the answer to an idempotent create: the payment's id and the
@@ -135,22 +185,38 @@ type CreateResult struct {
 // hash is idem.ErrMismatch. Invalid input is rejected before the key is
 // touched, and any failure rolls the claim back, so only a 201 is ever
 // stored. With a Locker, a concurrent duplicate waits for the first request's
-// transaction instead of racing it; the lock is held around the transaction,
-// never taken inside it, and a wait that outlasts ctx returns ctx's error.
+// transaction instead of racing it; the lock is held around the transaction
+// only (never taken inside it, released before any rail call), and a wait
+// that outlasts ctx returns ctx's error.
+//
+// With a rail (WithRail), the same transaction moves the payment to settling
+// with its rail reference before the response is stored, so the 201 (and
+// every replay of it, byte for byte) says "settling": a snapshot at
+// creation, not the final state, which GET returns. After the commit, only
+// the request that created the payment calls the rail; a replay never does,
+// so a client can't drive money movement by retrying. A payment the call
+// doesn't finish stays settling for Recover.
 func (s *Service) CreateIdempotent(ctx context.Context, key idem.Key, hash [32]byte, in CreateInput) (CreateResult, error) {
 	if err := validate(in); err != nil {
 		return CreateResult{}, err
 	}
+	release := func() {}
 	if s.locker != nil {
-		release, err := s.locker.Lock(ctx, key)
+		unlock, err := s.locker.Lock(ctx, key)
 		if err != nil {
 			return CreateResult{}, err
 		}
+		// Released explicitly after the commit below; the defer only covers
+		// a panic. OnceFunc makes the second call a no-op.
+		release = sync.OnceFunc(unlock)
 		defer release()
 	}
-	var out CreateResult
+	var (
+		out     CreateResult
+		created Payment
+	)
 	err := store.Serializable(ctx, s.pool, func(tx pgx.Tx) error {
-		out = CreateResult{} // the function may run more than once
+		out, created = CreateResult{}, Payment{} // the function may run more than once
 		stored, found, err := idem.Claim(ctx, tx, key, hash)
 		if err != nil {
 			return err
@@ -168,10 +234,17 @@ func (s *Service) CreateIdempotent(ctx context.Context, key idem.Key, hash [32]b
 			out = CreateResult{PaymentID: p.ID, Status: stored.Status, Body: stored.Body, Replayed: true}
 			return nil
 		}
-		p, err := insertPayment(ctx, tx, in)
+		p, err := insertPayment(ctx, tx, in, s.railName())
 		if err != nil {
 			return err
 		}
+		if s.rail != nil {
+			ref := rail.Ref(p.ID)
+			if p, err = transition(ctx, tx, p.ID, Settling, &ref, nil); err != nil {
+				return err
+			}
+		}
+		created = p
 		body, err := json.Marshal(p)
 		if err != nil {
 			return fmt.Errorf("payments: encode response: %w", err)
@@ -179,8 +252,19 @@ func (s *Service) CreateIdempotent(ctx context.Context, key idem.Key, hash [32]b
 		out = CreateResult{PaymentID: p.ID, Status: http.StatusCreated, Body: body}
 		return idem.Complete(ctx, tx, key, hash, idem.Response{Status: out.Status, Body: body})
 	})
+	// The lock is released before the rail call, never held across it. It
+	// sheds load in front of the transaction, with a TTL and a millisecond
+	// budget (ADR-119); held across a rail call of up to 2 x settleTimeout it
+	// would make duplicates wait on the rail and could expire mid-settle.
+	// Releasing early can't cause a second rail call: the key is completed
+	// in the committed transaction, so a duplicate arriving now replays the
+	// stored 201, and a replay never settles.
+	release()
 	if err != nil {
 		return CreateResult{}, err
+	}
+	if s.rail != nil && !out.Replayed {
+		s.settle(ctx, created)
 	}
 	return out, nil
 }
@@ -212,17 +296,22 @@ func (s *Service) MarkSettling(ctx context.Context, id uuid.UUID, railRef string
 	if railRef == "" {
 		return Payment{}, ErrMissingRailRef
 	}
-	return transition(ctx, s.pool, id, Settling, &railRef)
+	return transition(ctx, s.pool, id, Settling, &railRef, nil)
 }
 
 // MarkSettled moves a settling payment to settled.
 func (s *Service) MarkSettled(ctx context.Context, id uuid.UUID) (Payment, error) {
-	return transition(ctx, s.pool, id, Settled, nil)
+	return transition(ctx, s.pool, id, Settled, nil, nil)
 }
 
-// MarkFailed moves a created or settling payment to failed.
-func (s *Service) MarkFailed(ctx context.Context, id uuid.UUID) (Payment, error) {
-	return transition(ctx, s.pool, id, Failed, nil)
+// MarkFailed moves a created or settling payment to failed, recording why.
+// An unknown reason is ErrInvalidFailureReason, checked before the database,
+// so it never surfaces as a raw CHECK violation naming the table.
+func (s *Service) MarkFailed(ctx context.Context, id uuid.UUID, reason FailureReason) (Payment, error) {
+	if reason != FailureDeclined && reason != FailureInvalidRequest {
+		return Payment{}, ErrInvalidFailureReason
+	}
+	return transition(ctx, s.pool, id, Failed, nil, &reason)
 }
 
 // from lists the states each target may be reached from. Every edge moves

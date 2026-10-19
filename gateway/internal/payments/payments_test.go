@@ -348,7 +348,7 @@ func apply(ctx context.Context, svc *Service, id uuid.UUID, to State) (Payment, 
 	case Settled:
 		return svc.MarkSettled(ctx, id)
 	default:
-		return svc.MarkFailed(ctx, id)
+		return svc.MarkFailed(ctx, id, FailureDeclined)
 	}
 }
 

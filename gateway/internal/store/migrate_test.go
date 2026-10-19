@@ -25,7 +25,7 @@ var schemaTables = []string{"accounts", "payments", "ledger_entries", "idempoten
 
 // schemaRelations is every table and index the migrations create; to_regclass
 // (tableExists) finds indexes as well as tables.
-var schemaRelations = slices.Concat(schemaTables, []string{"idempotency_keys_created_at_idx", "ledger_entries_rail_ref_leg_key"})
+var schemaRelations = slices.Concat(schemaTables, []string{"idempotency_keys_created_at_idx", "ledger_entries_rail_ref_leg_key", "payments_settling_idx"})
 
 // PostgreSQL SQLSTATE codes the schema's constraints raise.
 const (
@@ -44,8 +44,8 @@ func TestUpAppliesSchema(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT max(version_id) FROM goose_db_version").Scan(&version); err != nil {
 		t.Fatalf("read goose version: %v", err)
 	}
-	if version != 3 {
-		t.Errorf("schema version = %d, want 3", version)
+	if version != 4 {
+		t.Errorf("schema version = %d, want 4", version)
 	}
 	var indexdef string
 	if err := pool.QueryRow(ctx, "SELECT indexdef FROM pg_indexes WHERE indexname = 'idempotency_keys_created_at_idx'").Scan(&indexdef); err != nil || !strings.HasSuffix(indexdef, "(created_at)") {
@@ -89,7 +89,7 @@ func TestDownRemovesSchemaAndUpRestoresIt(t *testing.T) {
 }
 
 // TestConcurrentUpIsSerialised starts several Up runs at once against an empty
-// schema. goose's advisory lock lets one apply versions 1–3 while the
+// schema. goose's advisory lock lets one apply every version while the
 // others wait and then find nothing pending, so all succeed, each version is
 // recorded exactly once, and the lock is released afterwards.
 func TestConcurrentUpIsSerialised(t *testing.T) {
@@ -222,6 +222,14 @@ func TestSchemaConstraints(t *testing.T) {
 		t.Errorf("default payment state = %q, want created", state)
 	}
 
+	// Both failure reasons are accepted on a failed payment (00004).
+	var failedPayment string
+	for _, reason := range []string{"declined", "invalid_request"} {
+		failedPayment = insertID(ctx, t, pool,
+			`INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail, state, failure_reason)
+			 VALUES ($1, $2, 1250, 'GBP', 'internal', 'failed', $3) RETURNING id::text`, payer, payee, reason)
+	}
+
 	const missing = "00000000-0000-0000-0000-000000000000" // no row has this id
 
 	tests := []struct {
@@ -244,6 +252,11 @@ func TestSchemaConstraints(t *testing.T) {
 		{"payment dangling payer", `INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail) VALUES ($1, $2, 100, 'GBP', 'internal')`, []any{missing, payee}, foreignKeyViolation},
 		{"payment to itself", `INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail) VALUES ($1, $1, 100, 'GBP', 'internal')`, []any{payer}, checkViolation},
 		{"payment dangling payee", `INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail) VALUES ($1, $2, 100, 'GBP', 'internal')`, []any{payer, missing}, foreignKeyViolation},
+		// 00004: failure_reason is one of two values, set exactly when failed.
+		{"payment failed without reason", `INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail, state) VALUES ($1, $2, 100, 'GBP', 'internal', 'failed')`, []any{payer, payee}, checkViolation},
+		{"payment settled with reason", `INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail, state, failure_reason) VALUES ($1, $2, 100, 'GBP', 'internal', 'settled', 'declined')`, []any{payer, payee}, checkViolation},
+		{"payment bad failure reason", `INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail, state, failure_reason) VALUES ($1, $2, 100, 'GBP', 'internal', 'failed', 'timeout')`, []any{payer, payee}, checkViolation},
+		{"payment unfailed keeps reason", `UPDATE payments SET state = 'settled' WHERE id = $1`, []any{failedPayment}, checkViolation},
 
 		// ledger_entries
 		{"entry bad direction", `INSERT INTO ledger_entries (payment_id, account_id, direction, amount) VALUES ($1, $2, 'up', 100)`, []any{payment, payer}, checkViolation},
