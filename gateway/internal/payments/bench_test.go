@@ -33,8 +33,7 @@ import (
 // Metrics: latencies are nearest-rank percentiles in ms. Counters are per
 // request: non201/req and 503/req; commits/req and rollbacks/req are
 // PostgreSQL transactions in the run's database from pg_stat_database
-// (rollbacks are the serialization retries the Redis lock is meant to shed;
-// both include the warm-up and a few bookkeeping transactions: the counter
+// (rollbacks are serialization retries; both include the warm-up and a few bookkeeping transactions: the counter
 // reads and the payment count);
 // degraded/req is the share of Redis-mode requests that ran without the lock.
 
@@ -134,21 +133,30 @@ func BenchmarkCreatePaymentContended(b *testing.B) {
 
 // BenchmarkCreatePaymentConcurrentSettled sends k concurrent requests per
 // iteration, each with its own key. Unlike BenchmarkCreatePaymentContended
-// (k duplicates of one key, one settlement) this is k settlements at once,
-// and every bench payment shares one payer and one payee, so their postings
-// all land on the same accounts. That is the question SPEC-002/10a-ii raises
-// by adding a single clearing account per rail: do concurrent settlements
-// serialize on a shared account? With an append-only ledger they shouldn't,
-// and rollbacks/req is where it would show. ns/op is per batch of k
-// requests.
+// (k duplicates of one key, one settlement) this is k settlements at once.
+// ns/op is per batch of k requests.
 //
-// The rail variants attribute any conflict: none is the create path alone
-// (payments stay created), fake adds the settlement transitions, internal
-// adds the ledger posting.
+// It is the "before" for SPEC-002/10a-ii-a. Every bench payment already
+// shares one payer and one payee, so a shared hot account is present here
+// too; what 10a-ii-a changes is a second ledger.PostRef inside the
+// SERIALIZABLE settling -> settled transaction, and the internal rail
+// posting to clearing:internal. The before/after difference measures that
+// change, not a new shared account.
+//
+// Hypothesis under test: the ledger is append-only (no balance column), so
+// shared accounts add no row contention. That does not rule out
+// serialization failures: every transaction here is SERIALIZABLE, and SSI
+// predicate locks on index ranges can make unrelated payments conflict.
+// rollbacks/req is where either would show. A request runs several
+// transactions (create, transitions, the rail's posting) and a rollback may
+// come from any of them, so only the differences between the rail variants
+// attribute it: none is the create path alone (payments stay created), fake
+// adds the settlement transitions, internal adds the ledger posting.
 //
 // PostgreSQL mode only: the Redis lock is per key, so with distinct keys it
 // adds a fixed cost and no contention. The test pool has 8 connections, so
-// at k = 16 half the requests also queue for a connection.
+// database concurrency is capped at 8: k = 16 adds pool wait, not more
+// contention.
 func BenchmarkCreatePaymentConcurrentSettled(b *testing.B) {
 	rails := append([]struct {
 		name    string

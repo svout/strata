@@ -62,12 +62,13 @@ test: ## Run every scaffolded service's tests
 	@if [ -f console/package.json ]; then echo "== console"; (cd console && pnpm install --frozen-lockfile && pnpm test); fi
 	@echo "== scripts"; python3 -m unittest discover -s scripts -p 'test_*.py'
 
-# Baseline for P6 and ADR-119's evidence (SPEC-002/8b-ii). Never under -race,
-# not in CI (runners are too noisy). Refuses uncommitted changes in gateway/ or
-# this Makefile (it holds the settings), so the printed SHA is what ran.
-# Uncontended runs at full settings (the numbers P6 cites); the contended
-# k-sweep at reduced ones (it measures shape). Output is also saved to
-# bench-<sha>.txt for benchstat.
+# Baseline for P6, ADR-119's evidence (SPEC-002/8b-ii) and the before/after
+# for SPEC-002/10a-ii. Never under -race, not in CI (runners are too noisy).
+# Refuses uncommitted changes in gateway/ or this Makefile (it holds the
+# settings), so the printed SHA is what ran. Uncontended runs at full
+# settings (the numbers P6 cites); the two k-sweeps (contended: duplicates of
+# one key; concurrent-settled: distinct keys) at reduced ones (they measure
+# shape). Output is also saved to bench-<sha>.txt for benchstat.
 bench_go = (cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) go test -run '^$$' -timeout 60m $(1) ./internal/payments)
 bench: ## Benchmark POST /v1/payments (with/without Redis, settled on fake/internal rail, contended and concurrent-settled sweeps); needs Docker
 	@docker info >/dev/null 2>&1 || { echo "Docker is not running: start Docker Desktop" >&2; exit 1; }
