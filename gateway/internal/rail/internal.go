@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -15,9 +16,11 @@ import (
 // subtask 10 makes payments use this constant so the rail owns it.
 const InternalName = "internal"
 
-// Internal settles a payment by posting it to the ledger: the payer's account
-// is debited and the payee's credited, in one SERIALIZABLE transaction of its
-// own. It never declines and is never pending.
+// Internal settles a payment by posting it to the ledger: the internal rail's
+// clearing account is debited and the payee's credited, in one SERIALIZABLE
+// transaction of its own. It never declines and is never pending. The payer's
+// side (payer debit, clearing credit) is posted by payments when it records
+// the payment as settled (ADR-123), so clearing nets to zero per payment.
 //
 // The posting carries the rail reference, so it happens at most once per
 // reference: ledger.Posted, read before the transaction, is the fast path,
@@ -26,12 +29,15 @@ const InternalName = "internal"
 // before the rail is called, and a transaction must not stay open across a
 // rail call.
 type Internal struct {
-	pool *pgxpool.Pool
+	pool     *pgxpool.Pool
+	clearing ledger.ClearingAccountID
 }
 
-// NewInternal returns the internal rail on pool.
-func NewInternal(pool *pgxpool.Pool) *Internal {
-	return &Internal{pool: pool}
+// NewInternal returns the internal rail on pool, settling out of clearing,
+// the clearing account of InternalName (ledger.ClearingAccount). The caller
+// resolves it once at startup (ADR-125).
+func NewInternal(pool *pgxpool.Pool, clearing ledger.ClearingAccountID) *Internal {
+	return &Internal{pool: pool, clearing: clearing}
 }
 
 // Name implements Adapter.
@@ -61,7 +67,7 @@ func (r *Internal) Settle(ctx context.Context, req Request) (Result, error) {
 	}
 	err = store.Serializable(ctx, r.pool, func(tx pgx.Tx) error {
 		return ledger.PostRef(ctx, tx, req.PaymentID, req.Ref, []ledger.Entry{
-			{AccountID: req.Payer, Direction: ledger.Debit, Amount: req.Amount},
+			{AccountID: uuid.UUID(r.clearing), Direction: ledger.Debit, Amount: req.Amount},
 			{AccountID: req.Payee, Direction: ledger.Credit, Amount: req.Amount},
 		})
 	})

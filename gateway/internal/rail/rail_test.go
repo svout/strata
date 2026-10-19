@@ -27,7 +27,7 @@ func TestInternal_Contract(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
 	railtest.Run(t, railtest.Harness{
-		New:     func(*testing.T) rail.Adapter { return rail.NewInternal(pool) },
+		New:     func(t *testing.T) rail.Adapter { return newInternal(t, pool) },
 		Request: func(t *testing.T) rail.Request { return newPaymentRequest(t, pool) },
 		Effects: func(t *testing.T, ref string) int {
 			// Count postings by payment, not by reference, so a double post
@@ -43,28 +43,34 @@ func TestInternal_Contract(t *testing.T) {
 			return legs / 2 // every internal posting has two legs
 		},
 		Unreachable: func(t *testing.T, _ rail.Adapter) (rail.Adapter, rail.Request) {
+			// The id is looked up while the database is reachable, as
+			// cmd/gateway does at startup; then the database goes away.
+			clearing := clearingAccount(t, pool)
 			closed, err := pgxpool.NewWithConfig(t.Context(), pool.Config())
 			if err != nil {
 				t.Fatal(err)
 			}
 			closed.Close()
-			return rail.NewInternal(closed), newPaymentRequest(t, pool)
+			return rail.NewInternal(closed, clearing), newPaymentRequest(t, pool)
 		},
 	})
 }
 
-// The internal rail moves the amount from payer to payee.
+// The internal rail moves the amount from its clearing account to the payee
+// (ADR-123). The payer's side is payments' posting, so the rail alone leaves
+// the payer untouched.
 func TestInternal_Balances(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
 	req := newPaymentRequest(t, pool)
-	r := rail.NewInternal(pool)
+	clearing := clearingAccount(t, pool)
+	r := rail.NewInternal(pool, clearing)
 	for range 2 { // the repeat moves nothing
 		if _, err := r.Settle(t.Context(), req); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for acct, want := range map[uuid.UUID]int64{req.Payer: -req.Amount, req.Payee: req.Amount} {
+	for acct, want := range map[uuid.UUID]int64{uuid.UUID(clearing): -req.Amount, req.Payee: req.Amount, req.Payer: 0} {
 		if got, err := ledger.Balance(t.Context(), pool, acct); err != nil || got != want {
 			t.Errorf("balance = %d (%v), want %d", got, err, want)
 		}
@@ -95,7 +101,7 @@ func TestInternal_ConcurrentDifferentPayments(t *testing.T) {
 	time.Sleep(1500 * time.Millisecond) // let the setup's statistics land
 	before := xactCounts(t, pool, db)
 
-	r := rail.NewInternal(pool)
+	r := newInternal(t, pool)
 	var failed []error
 	for _, round := range reqs {
 		errs := make([]error, n)
@@ -332,6 +338,22 @@ func newPaymentRequest(t *testing.T, pool *pgxpool.Pool) rail.Request {
 	payer, payee := testutil.NewAccount(t, pool, "user"), testutil.NewAccount(t, pool, "merchant")
 	payment := testutil.NewPayment(t, pool, payer, payee, 1250)
 	return rail.Request{PaymentID: payment, Ref: rail.Ref(payment), Amount: 1250, Currency: "GBP", Payer: payer, Payee: payee}
+}
+
+// newInternal is the internal rail on pool, with its clearing account looked
+// up as cmd/gateway does.
+func newInternal(t *testing.T, pool *pgxpool.Pool) *rail.Internal {
+	t.Helper()
+	return rail.NewInternal(pool, clearingAccount(t, pool))
+}
+
+func clearingAccount(t *testing.T, pool *pgxpool.Pool) ledger.ClearingAccountID {
+	t.Helper()
+	id, err := ledger.ClearingAccount(t.Context(), pool, rail.InternalName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
 }
 
 // xactCounts reads database db's committed and rolled-back transaction
