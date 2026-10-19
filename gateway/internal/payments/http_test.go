@@ -21,6 +21,7 @@ import (
 
 	"github.com/svout/strata/gateway/internal/httpx"
 	"github.com/svout/strata/gateway/internal/idem"
+	"github.com/svout/strata/gateway/internal/rail"
 	"github.com/svout/strata/gateway/internal/store"
 	"github.com/svout/strata/gateway/internal/testutil"
 )
@@ -42,28 +43,38 @@ func newTestAPI(t testing.TB) *testAPI {
 }
 
 // newTestAPIWith is newTestAPI with the Redis in-flight lock on rdb, as
-// cmd/gateway wires it; a nil rdb means no lock.
+// cmd/gateway wires it; a nil rdb means no lock. Payments settle on the
+// internal rail.
 func newTestAPIWith(t testing.TB, rdb *redis.Client) (*testAPI, *idem.RedisLocker) {
 	t.Helper()
 	var buf bytes.Buffer
-	a, locker := newTestAPILogTo(t, rdb, &buf)
+	a, locker := newTestAPILogTo(t, rdb, &buf, internalRail)
 	a.log = &buf
 	return a, locker
 }
 
-// newTestAPILogTo is newTestAPIWith logging to w; a.log is nil. Benchmarks
-// pass io.Discard, so an ever-growing buffer isn't part of what they time.
-func newTestAPILogTo(t testing.TB, rdb *redis.Client, w io.Writer) (*testAPI, *idem.RedisLocker) {
+// railFor builds the rail a test API settles on; nil means no rail.
+type railFor func(*pgxpool.Pool) rail.Adapter
+
+func internalRail(pool *pgxpool.Pool) rail.Adapter { return rail.NewInternal(pool) }
+
+// newTestAPILogTo is newTestAPIWith logging to w, settling on newRail (nil:
+// no rail, payments stay created); a.log is nil. Benchmarks pass io.Discard,
+// so an ever-growing buffer isn't part of what they time.
+func newTestAPILogTo(t testing.TB, rdb *redis.Client, w io.Writer, newRail railFor) (*testAPI, *idem.RedisLocker) {
 	t.Helper()
 	pool := testutil.Postgres(t)
 	log := httpx.NewLogger(w, slog.LevelInfo)
 	var (
-		opts   []Option
+		opts   = []Option{WithLogger(log)}
 		locker *idem.RedisLocker
 	)
 	if rdb != nil {
 		locker = idem.NewRedisLocker(rdb, log)
 		opts = append(opts, WithLocker(locker))
+	}
+	if newRail != nil {
+		opts = append(opts, WithRail(newRail(pool)))
 	}
 	r := httpx.NewRouter(log)
 	r.Mount("/v1/payments", New(pool, opts...).Handler(log))
@@ -107,9 +118,11 @@ func TestHTTP_CreateThenGet(t *testing.T) {
 	if loc := rec.Header().Get("Location"); loc != "/v1/payments/"+id {
 		t.Fatalf("Location = %q, want /v1/payments/%s", loc, id)
 	}
-	want := map[string]any{"state": "created", "amount": 1250.0, "currency": "GBP", "rail": "internal",
+	// The 201 is the snapshot at creation: settling, with its rail reference
+	// (the outbox row). The rail runs after it is stored.
+	want := map[string]any{"state": "settling", "amount": 1250.0, "currency": "GBP", "rail": "internal",
 		"payer_account_id": a.payer.String(), "payee_account_id": a.payee.String(),
-		"mandate_id": mandate.String(), "rail_ref": nil}
+		"mandate_id": mandate.String(), "rail_ref": "pay_" + id, "failure_reason": nil}
 	for k, v := range want {
 		if created[k] != v {
 			t.Errorf("%s = %v, want %v", k, created[k], v)
@@ -120,8 +133,8 @@ func TestHTTP_CreateThenGet(t *testing.T) {
 			t.Errorf("%s missing", k)
 		}
 	}
-	if len(created) != 11 {
-		t.Errorf("response has %d members, want 11: %v", len(created), created)
+	if len(created) != 12 {
+		t.Errorf("response has %d members, want 12: %v", len(created), created)
 	}
 
 	get := a.do(http.MethodGet, "/v1/payments/"+id, "", "")
@@ -129,9 +142,16 @@ func TestHTTP_CreateThenGet(t *testing.T) {
 	if get.Code != http.StatusOK || json.Unmarshal(get.Body.Bytes(), &got) != nil {
 		t.Fatalf("GET = %d: %s", get.Code, get.Body)
 	}
+	// GET is the current state: settled by the time POST returned.
 	for k, v := range created {
+		switch k {
+		case "state":
+			v = "settled"
+		case "updated_at":
+			continue
+		}
 		if got[k] != v {
-			t.Errorf("GET %s = %v, POST gave %v", k, got[k], v)
+			t.Errorf("GET %s = %v, want %v", k, got[k], v)
 		}
 	}
 
@@ -218,7 +238,9 @@ func TestHTTP_LogsIDAsTextAndNoSecrets(t *testing.T) {
 	bad := a.do("POST", "/v1/payments", "k", a.body(`,"card_number":"`+secret+`"`), "Authorization", "Bearer "+secret)
 
 	out := a.log.String()
-	for _, want := range []string{`"msg":"payment created"`, `"payment_id":"` + p.ID.String() + `"`, `"amount":1250`} {
+	for _, want := range []string{`"msg":"payment created"`, `"payment_id":"` + p.ID.String() + `"`, `"amount":1250`,
+		// The settlement log (subtask 10a-i) carries the id as text too.
+		`"msg":"payment settled","payment_id":"` + p.ID.String() + `"`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("log missing %s:\n%s", want, out)
 		}
@@ -346,6 +368,19 @@ func concurrentSameKey(t *testing.T, a *testAPI, n int) {
 	}
 	if payments != 1 || keys != 1 {
 		t.Fatalf("payments = %d, keys = %d; want exactly 1 each", payments, keys)
+	}
+	// AC3's ledger clause: the payment settled once, so one two-leg posting.
+	// Replays never call the rail.
+	var entries int
+	var state string
+	if err := a.pool.QueryRow(ctx, "SELECT count(*) FROM ledger_entries").Scan(&entries); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.pool.QueryRow(ctx, "SELECT state FROM payments").Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if entries != 2 || state != string(Settled) {
+		t.Fatalf("ledger entries = %d, state = %s; want 2 and settled", entries, state)
 	}
 	if c, r := strings.Count(a.log.String(), `"msg":"payment created"`), strings.Count(a.log.String(), `"msg":"payment replayed"`); c != 1 || r != n-1 {
 		t.Fatalf("log: %d created, %d replayed; want 1 and %d", c, r, n-1)

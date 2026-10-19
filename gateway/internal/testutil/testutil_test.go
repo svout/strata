@@ -61,8 +61,8 @@ func TestPostgresDatabasesAreSeparateAndMigrated(t *testing.T) {
 		if err := pool.QueryRow(ctx, "SELECT max(version_id) FROM goose_db_version").Scan(&version); err != nil {
 			t.Fatalf("read goose version: %v", err)
 		}
-		if version != 3 {
-			t.Errorf("schema version = %d, want 3", version)
+		if version != 4 {
+			t.Errorf("schema version = %d, want 4", version)
 		}
 	}
 }

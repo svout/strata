@@ -21,7 +21,8 @@ import (
 // AC6: the internal-ledger rail passes the contract. One database serves the
 // whole suite; each request has its own accounts and payment. It never
 // declines, is never pending, and a lost response can't be arranged
-// in-process, so those tests skip.
+// in-process, so those tests skip. Unreachable is the rail on a closed pool:
+// the database (its "PSP") can't be reached at all.
 func TestInternal_Contract(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
@@ -40,6 +41,14 @@ func TestInternal_Contract(t *testing.T) {
 				t.Fatal(err)
 			}
 			return legs / 2 // every internal posting has two legs
+		},
+		Unreachable: func(t *testing.T, _ rail.Adapter) (rail.Adapter, rail.Request) {
+			closed, err := pgxpool.NewWithConfig(t.Context(), pool.Config())
+			if err != nil {
+				t.Fatal(err)
+			}
+			closed.Close()
+			return rail.NewInternal(closed), newPaymentRequest(t, pool)
 		},
 	})
 }
@@ -130,7 +139,8 @@ func TestInternal_ConcurrentDifferentPayments(t *testing.T) {
 }
 
 // AC6: the fake PSP passes the contract, including declines, pending and a
-// lost response.
+// lost response. It has no transport to cut, so the unreachable test skips;
+// a Step's Err is its failure before acting (TestFake_ErrorBeforeApplying).
 func TestFake_Contract(t *testing.T) {
 	t.Parallel()
 	var current *rail.Fake // subtests run one at a time

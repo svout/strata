@@ -15,6 +15,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/svout/strata/gateway/internal/idem"
+	"github.com/svout/strata/gateway/internal/rail"
 	"github.com/svout/strata/gateway/internal/testutil"
 )
 
@@ -48,11 +49,14 @@ var modes = []struct {
 }
 
 // BenchmarkCreatePayment is one request per iteration, each with a new key:
-// the uncontended latency P6 cites. ns/op is per request.
+// the uncontended latency P6 cites. ns/op is per request. It runs with no
+// rail (payments stay created), exactly the code path of the 8b-ii baseline,
+// so that comparison stays valid; BenchmarkCreatePaymentSettled adds the
+// rail.
 func BenchmarkCreatePayment(b *testing.B) {
 	for _, mode := range modes {
 		b.Run(mode.name, func(b *testing.B) {
-			r := newBenchRun(b, mode.rdb(b))
+			r := newBenchRun(b, mode.rdb(b), nil)
 			r.post("bench-warmup") // dials the first connection outside the timer
 			var lat []time.Duration
 			for b.Loop() {
@@ -63,6 +67,41 @@ func BenchmarkCreatePayment(b *testing.B) {
 			r.finish(b, r.created) // one payment per 201: every key is new
 			reportLatency(b, "", lat)
 		})
+	}
+}
+
+// settleRails are the rails BenchmarkCreatePaymentSettled compares with the
+// no-rail baseline. The fake answers in memory with no I/O, so fake minus
+// the baseline is what the settlement machinery costs (the outbox
+// transition, the call, the settled write); internal minus fake is what the
+// internal rail's own posting transaction costs.
+var settleRails = []struct {
+	name    string
+	newRail railFor
+}{
+	{"fake", func(*pgxpool.Pool) rail.Adapter { return rail.NewFake() }},
+	{"internal", internalRail},
+}
+
+// BenchmarkCreatePaymentSettled is BenchmarkCreatePayment with each payment
+// settled on a rail before the response returns (SPEC-002 subtask 10a). ns/op
+// is per request.
+func BenchmarkCreatePaymentSettled(b *testing.B) {
+	for _, rl := range settleRails {
+		for _, mode := range modes {
+			b.Run(rl.name+"/"+mode.name, func(b *testing.B) {
+				r := newBenchRun(b, mode.rdb(b), rl.newRail)
+				r.post("bench-warmup")
+				var lat []time.Duration
+				for b.Loop() {
+					start := time.Now()
+					r.post("bench-" + strconv.Itoa(len(lat)))
+					lat = append(lat, time.Since(start))
+				}
+				r.finish(b, r.created)
+				reportLatency(b, "", lat)
+			})
+		}
 	}
 }
 
@@ -77,8 +116,8 @@ func BenchmarkCreatePaymentContended(b *testing.B) {
 	for _, k := range []int{2, 8, 16} {
 		for _, mode := range modes {
 			b.Run("k="+strconv.Itoa(k)+"/"+mode.name, func(b *testing.B) {
-				r := newBenchRun(b, mode.rdb(b))
-				r.batch(b, "bench-warmup", k) // dials up to k connections outside the timer
+				r := newBenchRun(b, mode.rdb(b), nil) // no rail: the 8b-ii comparison
+				r.batch(b, "bench-warmup", k)         // dials up to k connections outside the timer
 				var batchLat, reqLat []time.Duration
 				for b.Loop() {
 					start := time.Now()
@@ -105,11 +144,12 @@ type benchRun struct {
 	n503    int
 	dbName  string
 	before  [2]int64 // commits, rollbacks
+	settles bool     // a rail is wired: every payment must end settled
 }
 
-func newBenchRun(b *testing.B, rdb *redis.Client) *benchRun {
-	a, locker := newTestAPILogTo(b, rdb, io.Discard)
-	r := &benchRun{a: a, locker: locker, body: a.body("")}
+func newBenchRun(b *testing.B, rdb *redis.Client, newRail railFor) *benchRun {
+	a, locker := newTestAPILogTo(b, rdb, io.Discard, newRail)
+	r := &benchRun{a: a, locker: locker, body: a.body(""), settles: newRail != nil}
 	// pg_stat_database is updated when a backend goes idle (at most once a
 	// second) or exits. Let the setup's transactions land, then snapshot.
 	time.Sleep(1500 * time.Millisecond)
@@ -175,6 +215,12 @@ func (r *benchRun) finish(b *testing.B, wantPayments int) {
 	var payments int
 	if err := r.a.pool.QueryRow(ctx, "SELECT count(*) FROM payments").Scan(&payments); err != nil || payments != wantPayments {
 		b.Fatalf("payments = %d (%v), want %d", payments, err, wantPayments)
+	}
+	if r.settles {
+		var unsettled int
+		if err := r.a.pool.QueryRow(ctx, "SELECT count(*) FROM payments WHERE state <> 'settled'").Scan(&unsettled); err != nil || unsettled != 0 {
+			b.Fatalf("unsettled payments = %d (%v), want 0: the run didn't measure settlement", unsettled, err)
+		}
 	}
 	// Closing the pool ends its backends, which flushes their statistics;
 	// read them by name on a fresh pool (pg_stat_database is cluster-wide).

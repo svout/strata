@@ -40,6 +40,11 @@ type Harness struct {
 	// with an error, as a connection lost after the rail acted would. Nil if
 	// the harness can't arrange that.
 	LoseResponse func(t *testing.T, a rail.Adapter) rail.Request
+	// Unreachable returns an adapter for the same rail as a whose calls fail
+	// before reaching the rail (a refused connection, a closed pool), and a
+	// valid request for it. Retried on a, the request must settle. Nil if
+	// the harness can't arrange that.
+	Unreachable func(t *testing.T, a rail.Adapter) (rail.Adapter, rail.Request)
 }
 
 // concurrent is how many Settle calls race on one reference.
@@ -137,8 +142,8 @@ func Run(t *testing.T, h Harness) {
 		a, req := h.New(t), h.Request(t)
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
-		if res, err := a.Settle(ctx, req); err == nil {
-			t.Fatalf("Settle on a cancelled context = %+v, want an error", res)
+		if res, err := a.Settle(ctx, req); err == nil || errors.Is(err, rail.ErrInvalidRequest) {
+			t.Fatalf("Settle on a cancelled context = %+v, %v; want an unknown-outcome error, not ErrInvalidRequest", res, err)
 		}
 		if n := h.Effects(t, req.Ref); n != 0 {
 			t.Fatalf("effects = %d, want 0", n)
@@ -230,6 +235,36 @@ func Run(t *testing.T, h Harness) {
 			if n := h.Effects(t, req.Ref); n != want {
 				t.Fatalf("effects after resolving %s = %d, want %d", final, n, want)
 			}
+		}
+	})
+
+	// ErrInvalidRequest is final: payments fails the payment and never
+	// retries it (subtask 10a-i). So an adapter may return it only for a
+	// definitive rejection, never when the call didn't reach the rail or the
+	// answer was ambiguous; that would turn a network blip into a permanently
+	// failed payment, the class of bug ADR-120 exists to prevent. The
+	// cancelled-context and lost-response cases above and below check the
+	// same rule.
+	t.Run("unreachable rail is an unknown outcome, not ErrInvalidRequest", func(t *testing.T) {
+		if h.Unreachable == nil {
+			t.Skip("the harness can't make this rail unreachable")
+		}
+		a := h.New(t)
+		down, req := h.Unreachable(t, a)
+		if res, err := down.Settle(t.Context(), req); err == nil || errors.Is(err, rail.ErrInvalidRequest) {
+			t.Fatalf("Settle on an unreachable rail = %+v, %v; want an unknown-outcome error, not ErrInvalidRequest", res, err)
+		}
+		if _, err := down.Status(t.Context(), req.Ref); err == nil || errors.Is(err, rail.ErrUnknownRef) {
+			t.Fatalf("Status on an unreachable rail = %v; want an error that isn't ErrUnknownRef (the rail wasn't asked)", err)
+		}
+		if n := h.Effects(t, req.Ref); n != 0 {
+			t.Fatalf("effects = %d, want 0", n)
+		}
+		if res, err := a.Settle(t.Context(), req); err != nil || res.Outcome != rail.Settled {
+			t.Fatalf("retry on the reachable rail = %+v, %v; want Settled", res, err)
+		}
+		if n := h.Effects(t, req.Ref); n != 1 {
+			t.Fatalf("effects after the retry = %d, want 1", n)
 		}
 	})
 
