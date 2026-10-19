@@ -310,6 +310,33 @@ func TestSettle_FirstWriterWins(t *testing.T) {
 	}
 }
 
+// Transition first, then the payer posting (Ivan, 2026-10-19): a second
+// settle of a payment already settled loses on the state machine
+// (ErrInvalidTransition, the same outcome, so done), never on the ledger's
+// unique constraint. Posting first would end this as ErrAlreadyPosted: a Warn
+// and outcomeUnknown for a payment that is settled correctly.
+func TestFinish_SecondSettleLosesOnTransitionNotLedger(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	svc, logs := newSettleService(t, pool, rail.NewFake())
+	res := createFor(t, svc, "k", newAccount(t.Context(), t, pool), newAccount(t.Context(), t, pool))
+	assertState(t, svc, res.PaymentID, Settled, nil)
+	p, err := svc.Get(t.Context(), res.PaymentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := svc.finish(t.Context(), p, Settled, ""); got != outcomeSettled {
+		t.Fatalf("second finish = %v, want outcomeSettled", got)
+	}
+	if strings.Contains(logs.String(), `"level":"WARN"`) {
+		t.Fatalf("second finish logged a Warn:\n%s", logs)
+	}
+	if n := payerEntries(t, pool, res.PaymentID); n != 2 {
+		t.Fatalf("payer posting legs = %d, want 2", n)
+	}
+}
+
 // A result outside the three outcomes is not a decision: the payment stays
 // settling and the line is logged at Error.
 func TestSettle_UnknownOutcomeLeavesSettling(t *testing.T) {
