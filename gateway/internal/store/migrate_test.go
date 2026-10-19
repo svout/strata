@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +23,10 @@ import (
 
 var schemaTables = []string{"accounts", "payments", "ledger_entries", "idempotency_keys"}
 
+// schemaRelations is every table and index the migrations create; to_regclass
+// (tableExists) finds indexes as well as tables.
+var schemaRelations = slices.Concat(schemaTables, []string{"idempotency_keys_created_at_idx"})
+
 // PostgreSQL SQLSTATE codes the schema's constraints raise.
 const (
 	notNullViolation    = "23502"
@@ -30,7 +35,7 @@ const (
 	checkViolation      = "23514"
 )
 
-func TestUpAppliesSchemaV1(t *testing.T) {
+func TestUpAppliesSchema(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t) // already migrated with store.Up
 	ctx := testContext(t)
@@ -39,12 +44,16 @@ func TestUpAppliesSchemaV1(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT max(version_id) FROM goose_db_version").Scan(&version); err != nil {
 		t.Fatalf("read goose version: %v", err)
 	}
-	if version != 1 {
-		t.Errorf("schema version = %d, want 1", version)
+	if version != 2 {
+		t.Errorf("schema version = %d, want 2", version)
 	}
-	for _, table := range schemaTables {
-		if !tableExists(ctx, t, pool, table) {
-			t.Errorf("table %s missing after Up", table)
+	var indexdef string
+	if err := pool.QueryRow(ctx, "SELECT indexdef FROM pg_indexes WHERE indexname = 'idempotency_keys_created_at_idx'").Scan(&indexdef); err != nil || !strings.HasSuffix(indexdef, "(created_at)") {
+		t.Errorf("idempotency_keys_created_at_idx = %q (%v), want an index on (created_at)", indexdef, err)
+	}
+	for _, rel := range schemaRelations {
+		if !tableExists(ctx, t, pool, rel) {
+			t.Errorf("%s missing after Up", rel)
 		}
 	}
 
@@ -63,26 +72,26 @@ func TestDownRemovesSchemaAndUpRestoresIt(t *testing.T) {
 	if err := store.Down(ctx, db); err != nil {
 		t.Fatalf("Down: %v", err)
 	}
-	for _, table := range schemaTables {
-		if tableExists(ctx, t, pool, table) {
-			t.Errorf("table %s still exists after Down", table)
+	for _, rel := range schemaRelations {
+		if tableExists(ctx, t, pool, rel) {
+			t.Errorf("%s still exists after Down", rel)
 		}
 	}
 
 	if err := store.Up(ctx, db); err != nil {
 		t.Fatalf("Up after Down: %v", err)
 	}
-	for _, table := range schemaTables {
-		if !tableExists(ctx, t, pool, table) {
-			t.Errorf("table %s missing after Up following Down", table)
+	for _, rel := range schemaRelations {
+		if !tableExists(ctx, t, pool, rel) {
+			t.Errorf("%s missing after Up following Down", rel)
 		}
 	}
 }
 
 // TestConcurrentUpIsSerialised starts several Up runs at once against an empty
-// schema. goose's advisory lock lets one apply version 1 while the others
-// wait and then find nothing pending, so all succeed, version 1 is recorded
-// exactly once, and the lock is released afterwards.
+// schema. goose's advisory lock lets one apply versions 1 and 2 while the
+// others wait and then find nothing pending, so all succeed, each version is
+// recorded exactly once, and the lock is released afterwards.
 func TestConcurrentUpIsSerialised(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
@@ -108,12 +117,14 @@ func TestConcurrentUpIsSerialised(t *testing.T) {
 		}
 	}
 
-	var applied int
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM goose_db_version WHERE version_id = 1").Scan(&applied); err != nil {
-		t.Fatalf("count version rows: %v", err)
-	}
-	if applied != 1 {
-		t.Errorf("goose_db_version rows for version 1 = %d, want 1", applied)
+	for _, v := range []int{1, 2} {
+		var applied int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM goose_db_version WHERE version_id = $1", v).Scan(&applied); err != nil {
+			t.Fatalf("count version rows: %v", err)
+		}
+		if applied != 1 {
+			t.Errorf("goose_db_version rows for version %d = %d, want 1", v, applied)
+		}
 	}
 	if n := advisoryLocks(ctx, t, pool); n != 0 {
 		t.Errorf("%d advisory locks left in this database after Up, want 0", n)

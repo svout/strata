@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -26,7 +27,7 @@ import (
 
 // testAPI mounts the handler on the real httpx router, as cmd/gateway does.
 type testAPI struct {
-	t      *testing.T
+	t      testing.TB
 	pool   *pgxpool.Pool
 	router *chi.Mux
 	log    *bytes.Buffer
@@ -34,7 +35,7 @@ type testAPI struct {
 	payee  uuid.UUID
 }
 
-func newTestAPI(t *testing.T) *testAPI {
+func newTestAPI(t testing.TB) *testAPI {
 	t.Helper()
 	a, _ := newTestAPIWith(t, nil)
 	return a
@@ -42,11 +43,20 @@ func newTestAPI(t *testing.T) *testAPI {
 
 // newTestAPIWith is newTestAPI with the Redis in-flight lock on rdb, as
 // cmd/gateway wires it; a nil rdb means no lock.
-func newTestAPIWith(t *testing.T, rdb *redis.Client) (*testAPI, *idem.RedisLocker) {
+func newTestAPIWith(t testing.TB, rdb *redis.Client) (*testAPI, *idem.RedisLocker) {
+	t.Helper()
+	var buf bytes.Buffer
+	a, locker := newTestAPILogTo(t, rdb, &buf)
+	a.log = &buf
+	return a, locker
+}
+
+// newTestAPILogTo is newTestAPIWith logging to w; a.log is nil. Benchmarks
+// pass io.Discard, so an ever-growing buffer isn't part of what they time.
+func newTestAPILogTo(t testing.TB, rdb *redis.Client, w io.Writer) (*testAPI, *idem.RedisLocker) {
 	t.Helper()
 	pool := testutil.Postgres(t)
-	var buf bytes.Buffer
-	log := httpx.NewLogger(&buf, slog.LevelInfo)
+	log := httpx.NewLogger(w, slog.LevelInfo)
 	var (
 		opts   []Option
 		locker *idem.RedisLocker
@@ -57,7 +67,7 @@ func newTestAPIWith(t *testing.T, rdb *redis.Client) (*testAPI, *idem.RedisLocke
 	}
 	r := httpx.NewRouter(log)
 	r.Mount("/v1/payments", New(pool, opts...).Handler(log))
-	return &testAPI{t: t, pool: pool, router: r, log: &buf,
+	return &testAPI{t: t, pool: pool, router: r,
 		payer: newAccount(t.Context(), t, pool), payee: newAccount(t.Context(), t, pool)}, locker
 }
 
@@ -271,14 +281,14 @@ func TestHTTP_AC3_ConcurrentSameKeyExactlyOnce(t *testing.T) {
 	t.Parallel()
 	const n = 100
 	for name, tc := range map[string]struct {
-		rdb  func(*testing.T) *redis.Client
+		rdb  func(testing.TB) *redis.Client
 		down bool
 	}{
-		"postgres only": {rdb: func(*testing.T) *redis.Client { return nil }},
+		"postgres only": {rdb: func(testing.TB) *redis.Client { return nil }},
 		// Under a loaded -race run some Redis calls exceed 50 ms and fail
 		// open, so this case doesn't assert Degraded = 0;
 		// TestHTTP_LockWaitAndTimeout proves the lock makes requests wait.
-		"redis lock": {rdb: func(t *testing.T) *redis.Client { return testutil.Redis(t) }},
+		"redis lock": {rdb: testutil.Redis},
 		"redis down": {rdb: downRedis, down: true},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -293,7 +303,7 @@ func TestHTTP_AC3_ConcurrentSameKeyExactlyOnce(t *testing.T) {
 }
 
 // downRedis is a client whose server is unreachable.
-func downRedis(t *testing.T) *redis.Client {
+func downRedis(t testing.TB) *redis.Client {
 	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", ContextTimeoutEnabled: true})
 	t.Cleanup(func() { _ = rdb.Close() })
 	return rdb
