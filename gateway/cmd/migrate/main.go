@@ -19,9 +19,9 @@ import (
 
 	"github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/svout/agentgate/gateway/internal/config"
-	"github.com/svout/agentgate/gateway/internal/httpx"
-	"github.com/svout/agentgate/gateway/internal/store"
+	"github.com/svout/strata/gateway/internal/config"
+	"github.com/svout/strata/gateway/internal/httpx"
+	"github.com/svout/strata/gateway/internal/store"
 )
 
 const usage = `usage: migrate up

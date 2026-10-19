@@ -16,8 +16,8 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3/lock"
 
-	"github.com/svout/agentgate/gateway/internal/store"
-	"github.com/svout/agentgate/gateway/internal/testutil"
+	"github.com/svout/strata/gateway/internal/store"
+	"github.com/svout/strata/gateway/internal/testutil"
 )
 
 var schemaTables = []string{"accounts", "payments", "ledger_entries", "idempotency_keys"}

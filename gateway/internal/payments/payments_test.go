@@ -13,8 +13,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"pgregory.net/rapid"
 
-	"github.com/svout/agentgate/gateway/internal/idem"
-	"github.com/svout/agentgate/gateway/internal/testutil"
+	"github.com/svout/strata/gateway/internal/idem"
+	"github.com/svout/strata/gateway/internal/testutil"
 )
 
 // SPEC-002 subtask 7: create/get, forward-only transitions, and a rapid

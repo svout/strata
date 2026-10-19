@@ -13,8 +13,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/svout/agentgate/gateway/internal/store"
-	"github.com/svout/agentgate/gateway/internal/testutil"
+	"github.com/svout/strata/gateway/internal/store"
+	"github.com/svout/strata/gateway/internal/testutil"
 )
 
 // maxAttempts mirrors defaultRetry.attempts in tx.go (SPEC-002 subtask 5a),

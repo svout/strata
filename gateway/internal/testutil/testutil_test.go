@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/svout/agentgate/gateway/internal/testutil"
+	"github.com/svout/strata/gateway/internal/testutil"
 )
 
 // Two clients held at the same time must be on different logical databases

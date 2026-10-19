@@ -228,7 +228,7 @@ Each takes at most a day, fits one session and leaves `make test` green. Under A
 - [x] 4. **Redis in P1:** keep it (in-flight lock, as the phase note says), or use PostgreSQL only until P3 needs Redis for velocity? The spec keeps Redis, but correctness never depends on it. → **Answered 2026-10-03:** keep Redis (in-flight lock); PostgreSQL stays the source of truth.
 - [ ] 5. **Stripe test mode** needs a Stripe account and test keys. Ethics Answers Q4 says "sandbox via CLI, no account registration", but the Stripe CLI's `stripe login` normally needs an account. Which is it? Alternatives: `stripe-mock`, or stay on the fake PSP for P1.
 - [ ] 6. **Time:** ADR-114 (proposed) gives P1 about 3 weeks at 10–15 h/week. Subtasks 1–11 are the core, which is already tight. Subtasks 12 (Stripe) and 13 (OpenTelemetry) are stretch and may move to P2. Agree?
-- [ ] 7. **Module path:** `github.com/svout/agentgate/gateway`, one module per service rather than a root `go.work`?
+- [ ] 7. **Module path:** `github.com/svout/strata/gateway`, one module per service rather than a root `go.work`?
 - [ ] 8. **Branch protection** on `main` is still off. Turn it on before the first P1 PR, so CI must pass before merge?
 - [x] 9. **Logging follow-ups from the 1b review** (decide when convenient; fold into subtask 7 when domain types appear): → **Answered 2026-10-05 (Ivan, planner defaults; built in 7a):** `cardholder` hard; `pan_last4`/`card_last4` stay redacted (ADR-105); named scalars logged by underlying string/int/bool kind, never via `Stringer`; add `bearer`, `jwt`, `otp`, `accesskey` (hard), `session` (soft), plural/digit normalisation (`dsn`/`databaseurl` already in since 3a); error-text rule added to the repo CLAUDE.md via Repo Kit.
   - Make `cardholder` a hard word?

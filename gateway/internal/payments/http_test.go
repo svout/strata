@@ -17,10 +17,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/svout/agentgate/gateway/internal/httpx"
-	"github.com/svout/agentgate/gateway/internal/idem"
-	"github.com/svout/agentgate/gateway/internal/store"
-	"github.com/svout/agentgate/gateway/internal/testutil"
+	"github.com/svout/strata/gateway/internal/httpx"
+	"github.com/svout/strata/gateway/internal/idem"
+	"github.com/svout/strata/gateway/internal/store"
+	"github.com/svout/strata/gateway/internal/testutil"
 )
 
 // testAPI mounts the handler on the real httpx router, as cmd/gateway does.

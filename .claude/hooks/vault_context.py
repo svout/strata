@@ -15,6 +15,7 @@ SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".next", "d
              "coverage", ".cache"}
 RECORD_FILES = {"Session Log.md", "Home.md"}  # updating these is "recording", not "work"
 LOG_MARK = "%% entries below, newest first — hooks insert here %%"
+AI_MARK = "%% ai-log entries below, newest first — hooks insert here %%"
 
 
 def read_input():
@@ -140,6 +141,31 @@ def cmd_prompt(data):
           "When this step is done, run /wrap-up (spec ☑, Now, Reuse Registry, Session Log) before starting the next one.")
 
 
+def append_ai_log(vault, project, hits, reason):
+    """Declare this session in the AI Use Log (COMP6013 requires every use to be declared)."""
+    path = os.path.join(vault, "Dissertation", "AI Use Log.md")
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return
+    if AI_MARK not in text:
+        return
+    names = ", ".join(f"`{h[1]}`" for h in hits[:6]) + (f" (+{len(hits) - 6} more)" if len(hits) > 6 else "")
+    where = os.path.basename(project.rstrip("/"))
+    row = (f"| {datetime.now().strftime('%Y-%m-%d')} | Claude Code | Working session in `{where}`"
+           f" ({reason}): {names} | _set at /wrap-up_ | {where} |\n")
+    head, tail = text.split(AI_MARK, 1)
+    tail = tail.lstrip("\n")
+    # keep the table header at the top of the table, insert the row under it
+    lines = tail.split("\n")
+    if len(lines) > 2 and lines[0].startswith("|") and lines[1].startswith("|"):
+        tail = "\n".join([lines[0], lines[1], row.rstrip("\n")] + lines[2:])
+    else:
+        tail = row + tail
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(head + AI_MARK + "\n\n" + tail)
+
+
 def cmd_end(data):
     project, vault, marker = paths(data)
     hits = unrecorded(project, vault, marker)
@@ -149,6 +175,7 @@ def cmd_end(data):
         pass
     if not hits:
         return
+    append_ai_log(vault, project, hits, data.get("reason", "exit"))
     log = os.path.join(vault, "Workflow", "Session Log.md")
     try:
         text = open(log, encoding="utf-8").read()

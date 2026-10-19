@@ -20,7 +20,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/svout/agentgate/gateway/internal/testutil"
+	"github.com/svout/strata/gateway/internal/testutil"
 )
 
 func TestHealthz_ReturnsOK(t *testing.T) {

@@ -14,10 +14,10 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/svout/agentgate/gateway/internal/config"
-	"github.com/svout/agentgate/gateway/internal/httpx"
-	"github.com/svout/agentgate/gateway/internal/payments"
-	"github.com/svout/agentgate/gateway/internal/store"
+	"github.com/svout/strata/gateway/internal/config"
+	"github.com/svout/strata/gateway/internal/httpx"
+	"github.com/svout/strata/gateway/internal/payments"
+	"github.com/svout/strata/gateway/internal/store"
 )
 
 func main() {

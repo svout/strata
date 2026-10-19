@@ -12,8 +12,8 @@ import (
 
 	"github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/svout/agentgate/gateway/internal/store"
-	"github.com/svout/agentgate/gateway/internal/testutil"
+	"github.com/svout/strata/gateway/internal/store"
+	"github.com/svout/strata/gateway/internal/testutil"
 )
 
 // env returns a getenv over m.

@@ -25,8 +25,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/svout/agentgate/gateway/internal/idem"
-	"github.com/svout/agentgate/gateway/internal/store"
+	"github.com/svout/strata/gateway/internal/idem"
+	"github.com/svout/strata/gateway/internal/store"
 )
 
 // State is a payment's lifecycle state, as stored in payments.state.

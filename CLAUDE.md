@@ -24,6 +24,14 @@ Procedure: `VAULT/Workflow/Step Loop.md`. Principles: `VAULT/Workflow/Developmen
 `make dev` · `make test` · `make lint` · `make bench` (k6) · `make attack` (scenario suite) · `make demo` · `make export-docs` · `make migrate`
 Scoped while building: `go test ./internal/<pkg> -run <Test>` · `uv run pytest <path>::<test>` · `pnpm --filter console vitest related <file>`
 
+## AI use on this module (read this first)
+This is an assessed university project. The supervisor has agreed that AI tools may be used across the project **on condition that every use is declared** (ADR-113 in `VAULT/Project/Decisions (ADRs).md`).
+
+- **Declare every session.** The session-end hook adds a row to `VAULT/Dissertation/AI Use Log.md`; `/wrap-up` corrects it to what actually happened. That note is submitted as the "Acknowledgement of AI" appendix, so placeholder rows must never reach submission.
+- **Ivan must understand everything that ships.** Anything described in the report has to be demonstrable on request, and unexplained work counts against methodological rigour. So: explain non-obvious code as you write it, keep functions readable over clever, and leave a comment where a design choice was made and why.
+- **Verify sources.** Never invent a citation. Anything suggested for the bibliography must be a real, locatable source that Ivan reads before citing.
+- Assessed prose (proposal, progress report, final report, slides, poster) may be drafted here, but Ivan edits and owns it, and word limits are hard: proposal 1,000–1,500; progress report 2,500–3,500; final report 8,000–10,000.
+
 ## Rules that decide reviews
 - **Fail closed on authorisation, degrade on scoring.** An unverifiable signature or mandate is rejected. A scoring failure falls back to rules and marks the decision `degraded` — never a silent allow.
 - Protocol formats (AP2, ACP, Visa TAP) are known **only** inside `internal/mandate`. Everything downstream sees the canonical mandate type.
@@ -32,6 +40,7 @@ Scoped while building: `go test ./internal/<pkg> -run <Test>` · `uv run pytest 
 - Audit records are written in the same transaction as the decision, chained to the previous hash. Never log instead of chaining.
 - Features are defined once in `control-plane/ml/features.py` and mirrored in Go, with parity tests. A feature added on one side only is a bug.
 - No secrets, tokens, mandate bodies or personal data in logs — log IDs and digests.
+- Error text is logged verbatim (the redactor checks keys, not messages), so never wrap secrets, DSNs, tokens or URLs with query strings into an error; return a sentinel and keep the detail out.
 - No real payment credentials or personal data anywhere. Sandbox and synthetic only.
 
 ## Performance budgets (the dissertation's cost claim)

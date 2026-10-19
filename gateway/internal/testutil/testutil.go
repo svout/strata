@@ -30,7 +30,7 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
 
-	"github.com/svout/agentgate/gateway/internal/store"
+	"github.com/svout/strata/gateway/internal/store"
 )
 
 // Image tags must match infra/compose/compose.yml, so tests run against the

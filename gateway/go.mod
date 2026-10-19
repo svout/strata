@@ -1,4 +1,4 @@
-module github.com/svout/agentgate/gateway
+module github.com/svout/strata/gateway
 
 go 1.27.1
 

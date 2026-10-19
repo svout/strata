@@ -14,8 +14,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"pgregory.net/rapid"
 
-	"github.com/svout/agentgate/gateway/internal/store"
-	"github.com/svout/agentgate/gateway/internal/testutil"
+	"github.com/svout/strata/gateway/internal/store"
+	"github.com/svout/strata/gateway/internal/testutil"
 )
 
 // Property tests for SPEC-002 AC1 (money conservation) and AC2 (no partial

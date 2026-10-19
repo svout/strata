@@ -20,4 +20,4 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/svout/agentgate
+        - github.com/svout/strata

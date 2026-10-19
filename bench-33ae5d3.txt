@@ -1,0 +1,108 @@
+commit: 33ae5d3cff04fa227aa10a6457b25a5d3df07f1b
+date: 2026-10-16T20:26:26Z
+host: Darwin 27.0.0 arm64
+machine: Mac17,2, Apple M5, 10 cores, 24 GiB
+docker: 10 CPUs, 8217448448 B, server 29.1.3
+go: go version go1.27.1 darwin/arm64
+2026/10/16 21:26:28 github.com/testcontainers/testcontainers-go - Connected to docker: 
+  Server Version: 29.1.3
+  API Version: 1.52
+  Operating System: Docker Desktop
+  Total Memory: 7836 MB
+  Labels:
+    com.docker.desktop.address=unix:///Users/ivan/Library/Containers/com.docker.docker/Data/docker-cli.sock
+  Testcontainers for Go Version: v0.44.0
+  Resolved Docker Host: unix:///var/run/docker.sock
+  Resolved Docker Socket Path: /var/run/docker.sock
+  Test SessionID: 6916961f6a6092d1a4f5acea0d2698ba1a2eafa2935b2c056e97165269e51890
+  Test ProcessID: 7ae2c79e-7be6-45b5-af85-ae5a2adc4a94
+2026/10/16 21:26:28 🐳 Creating container for image postgres:16-alpine
+2026/10/16 21:26:28 🐳 Creating container for image testcontainers/ryuk:0.14.0
+2026/10/16 21:26:28 ✅ Container created: 5737a083ff28
+2026/10/16 21:26:28 🐳 Starting container: 5737a083ff28
+2026/10/16 21:26:28 ✅ Container started: 5737a083ff28
+2026/10/16 21:26:28 ⏳ Waiting for container id 5737a083ff28 image: testcontainers/ryuk:0.14.0. Waiting for: all of: [log message "Started", port 8080/tcp to be listening]
+2026/10/16 21:26:28 Shell not found in container
+2026/10/16 21:26:28 🔔 Container is ready: 5737a083ff28
+2026/10/16 21:26:28 ✅ Container created: bf56586e3d5e
+2026/10/16 21:26:28 🐳 Starting container: bf56586e3d5e
+2026/10/16 21:26:28 ✅ Container started: bf56586e3d5e
+2026/10/16 21:26:28 ⏳ Waiting for container id bf56586e3d5e image: postgres:16-alpine. Waiting for: all of: [log message "database system is ready to accept connections" (occurrence: 2), port 5432/tcp to be listening]
+2026/10/16 21:26:29 🔔 Container is ready: bf56586e3d5e
+goos: darwin
+goarch: arm64
+pkg: github.com/svout/strata/gateway/internal/payments
+cpu: Apple M5
+BenchmarkCreatePayment/postgres-10         	    2000	    632945 ns/op	         0 503/req	         1.004 commits/req	         1.897 max-ms	         0 non201/req	         0.6148 p50-ms	         0.8701 p99-ms	         0 rollbacks/req
+BenchmarkCreatePayment/postgres-10         	    2000	    682278 ns/op	         0 503/req	         1.004 commits/req	         1.970 max-ms	         0 non201/req	         0.6686 p50-ms	         1.166 p99-ms	         0 rollbacks/req
+BenchmarkCreatePayment/postgres-10         	    2000	    632085 ns/op	         0 503/req	         1.004 commits/req	         1.937 max-ms	         0 non201/req	         0.6114 p50-ms	         1.233 p99-ms	         0 rollbacks/req
+BenchmarkCreatePayment/postgres-10         	    2000	    656412 ns/op	         0 503/req	         1.004 commits/req	         2.431 max-ms	         0 non201/req	         0.6392 p50-ms	         1.221 p99-ms	         0 rollbacks/req
+BenchmarkCreatePayment/postgres-10         	    2000	    663289 ns/op	         0 503/req	         1.004 commits/req	         2.232 max-ms	         0 non201/req	         0.6555 p50-ms	         1.175 p99-ms	         0 rollbacks/req
+2026/10/16 21:26:46 🐳 Creating container for image redis:7-alpine
+2026/10/16 21:26:46 ✅ Container created: b54010e82c22
+2026/10/16 21:26:46 🐳 Starting container: b54010e82c22
+2026/10/16 21:26:46 ✅ Container started: b54010e82c22
+2026/10/16 21:26:46 ⏳ Waiting for container id b54010e82c22 image: redis:7-alpine. Waiting for: all of: [port 6379/tcp to be listening, log message "* Ready to accept connections"]
+2026/10/16 21:26:46 🔔 Container is ready: b54010e82c22
+BenchmarkCreatePayment/redis-10            	    2000	    881780 ns/op	         0 503/req	         1.004 commits/req	         0 degraded/req	         3.297 max-ms	         0 non201/req	         0.8620 p50-ms	         1.540 p99-ms	         0 rollbacks/req
+BenchmarkCreatePayment/redis-10            	    2000	    869056 ns/op	         0 503/req	         1.004 commits/req	         0 degraded/req	         2.368 max-ms	         0 non201/req	         0.8555 p50-ms	         1.338 p99-ms	         0 rollbacks/req
+BenchmarkCreatePayment/redis-10            	    2000	    854321 ns/op	         0 503/req	         1.004 commits/req	         0 degraded/req	         4.288 max-ms	         0 non201/req	         0.8374 p50-ms	         1.589 p99-ms	         0 rollbacks/req
+BenchmarkCreatePayment/redis-10            	    2000	    869980 ns/op	         0 503/req	         1.004 commits/req	         0 degraded/req	         2.892 max-ms	         0 non201/req	         0.8545 p50-ms	         1.404 p99-ms	         0 rollbacks/req
+BenchmarkCreatePayment/redis-10            	    2000	    879699 ns/op	         0 503/req	         1.004 commits/req	         0 degraded/req	         2.334 max-ms	         0 non201/req	         0.8659 p50-ms	         1.376 p99-ms	         0 rollbacks/req
+PASS
+ok  	github.com/svout/strata/gateway/internal/payments	36.552s
+2026/10/16 21:27:05 github.com/testcontainers/testcontainers-go - Connected to docker: 
+  Server Version: 29.1.3
+  API Version: 1.52
+  Operating System: Docker Desktop
+  Total Memory: 7836 MB
+  Labels:
+    com.docker.desktop.address=unix:///Users/ivan/Library/Containers/com.docker.docker/Data/docker-cli.sock
+  Testcontainers for Go Version: v0.44.0
+  Resolved Docker Host: unix:///var/run/docker.sock
+  Resolved Docker Socket Path: /var/run/docker.sock
+  Test SessionID: 5fe73a014f45d858b17f0cb6107e0be5a2c9df57d025ca302ae9fc4a613bba7e
+  Test ProcessID: 74ca16aa-1c44-4495-ac1c-f035d5d9a9d2
+2026/10/16 21:27:05 🐳 Creating container for image postgres:16-alpine
+2026/10/16 21:27:05 🐳 Creating container for image testcontainers/ryuk:0.14.0
+2026/10/16 21:27:05 ✅ Container created: ba19618b2eca
+2026/10/16 21:27:05 🐳 Starting container: ba19618b2eca
+2026/10/16 21:27:05 ✅ Container started: ba19618b2eca
+2026/10/16 21:27:05 ⏳ Waiting for container id ba19618b2eca image: testcontainers/ryuk:0.14.0. Waiting for: all of: [log message "Started", port 8080/tcp to be listening]
+2026/10/16 21:27:06 Shell not found in container
+2026/10/16 21:27:06 🔔 Container is ready: ba19618b2eca
+2026/10/16 21:27:06 ✅ Container created: 183a24ce7567
+2026/10/16 21:27:06 🐳 Starting container: 183a24ce7567
+2026/10/16 21:27:06 ✅ Container started: 183a24ce7567
+2026/10/16 21:27:06 ⏳ Waiting for container id 183a24ce7567 image: postgres:16-alpine. Waiting for: all of: [log message "database system is ready to accept connections" (occurrence: 2), port 5432/tcp to be listening]
+2026/10/16 21:27:06 🔔 Container is ready: 183a24ce7567
+goos: darwin
+goarch: arm64
+pkg: github.com/svout/strata/gateway/internal/payments
+cpu: Apple M5
+BenchmarkCreatePaymentContended/k=2/postgres-10         	     200	  31165934 ns/op	         0 503/req	        47.40 batch-max-ms	        31.43 batch-p50-ms	        46.07 batch-p99-ms	         1.022 commits/req	         0 non201/req	        47.38 req-max-ms	         5.543 req-p50-ms	        45.84 req-p99-ms	         0.4975 rollbacks/req
+BenchmarkCreatePaymentContended/k=2/postgres-10         	     200	  32225608 ns/op	         0 503/req	        47.67 batch-max-ms	        33.32 batch-p50-ms	        47.05 batch-p99-ms	         1.022 commits/req	         0 non201/req	        47.65 req-max-ms	         4.421 req-p50-ms	        46.64 req-p99-ms	         0.5000 rollbacks/req
+BenchmarkCreatePaymentContended/k=2/postgres-10         	     200	  31237343 ns/op	         0 503/req	        48.33 batch-max-ms	        31.53 batch-p50-ms	        46.31 batch-p99-ms	         1.022 commits/req	         0 non201/req	        48.29 req-max-ms	         4.702 req-p50-ms	        45.83 req-p99-ms	         0.5000 rollbacks/req
+2026/10/16 21:27:31 🐳 Creating container for image redis:7-alpine
+2026/10/16 21:27:31 ✅ Container created: b2d0c0d7a5d7
+2026/10/16 21:27:31 🐳 Starting container: b2d0c0d7a5d7
+2026/10/16 21:27:31 ✅ Container started: b2d0c0d7a5d7
+2026/10/16 21:27:31 ⏳ Waiting for container id b2d0c0d7a5d7 image: redis:7-alpine. Waiting for: all of: [port 6379/tcp to be listening, log message "* Ready to accept connections"]
+2026/10/16 21:27:31 🔔 Container is ready: b2d0c0d7a5d7
+BenchmarkCreatePaymentContended/k=2/redis-10            	     200	  21160596 ns/op	         0 503/req	        29.85 batch-max-ms	        20.97 batch-p50-ms	        29.02 batch-p99-ms	         1.020 commits/req	         0 degraded/req	         0 non201/req	        29.84 req-max-ms	         5.129 req-p50-ms	        28.88 req-p99-ms	         0 rollbacks/req
+BenchmarkCreatePaymentContended/k=2/redis-10            	     200	  21389588 ns/op	         0 503/req	        29.90 batch-max-ms	        21.51 batch-p50-ms	        29.20 batch-p99-ms	         1.020 commits/req	         0 degraded/req	         0 non201/req	        29.89 req-max-ms	         4.372 req-p50-ms	        28.85 req-p99-ms	         0 rollbacks/req
+BenchmarkCreatePaymentContended/k=2/redis-10            	     200	  21826980 ns/op	         0 503/req	        29.46 batch-max-ms	        22.20 batch-p50-ms	        29.23 batch-p99-ms	         1.020 commits/req	         0 degraded/req	         0 non201/req	        29.44 req-max-ms	         4.409 req-p50-ms	        29.14 req-p99-ms	         0 rollbacks/req
+BenchmarkCreatePaymentContended/k=8/postgres-10         	     200	  42933990 ns/op	         0 503/req	        49.00 batch-max-ms	        43.56 batch-p50-ms	        48.76 batch-p99-ms	         1.009 commits/req	         0 non201/req	        48.95 req-max-ms	        30.66 req-p50-ms	        47.44 req-p99-ms	         0.8731 rollbacks/req
+BenchmarkCreatePaymentContended/k=8/postgres-10         	     200	  42596055 ns/op	         0 503/req	        48.67 batch-max-ms	        43.37 batch-p50-ms	        48.50 batch-p99-ms	         1.009 commits/req	         0 non201/req	        48.62 req-max-ms	        29.06 req-p50-ms	        47.18 req-p99-ms	         0.8744 rollbacks/req
+BenchmarkCreatePaymentContended/k=8/postgres-10         	     200	  42552767 ns/op	         0 503/req	        49.96 batch-max-ms	        43.52 batch-p50-ms	        48.12 batch-p99-ms	         1.009 commits/req	         0 non201/req	        49.91 req-max-ms	        30.46 req-p50-ms	        46.79 req-p99-ms	         0.8706 rollbacks/req
+BenchmarkCreatePaymentContended/k=8/redis-10            	     200	  51562131 ns/op	         0 503/req	        87.30 batch-max-ms	        50.11 batch-p50-ms	        77.77 batch-p99-ms	         1.005 commits/req	         0 degraded/req	         0 non201/req	        87.26 req-max-ms	        24.11 req-p50-ms	        66.05 req-p99-ms	         0 rollbacks/req
+BenchmarkCreatePaymentContended/k=8/redis-10            	     200	  51923799 ns/op	         0 503/req	        86.43 batch-max-ms	        50.71 batch-p50-ms	        79.00 batch-p99-ms	         1.006 commits/req	         0 degraded/req	         0 non201/req	        86.34 req-max-ms	        24.47 req-p50-ms	        67.51 req-p99-ms	         0 rollbacks/req
+BenchmarkCreatePaymentContended/k=8/redis-10            	     200	  52515753 ns/op	         0 503/req	        96.79 batch-max-ms	        50.59 batch-p50-ms	        78.56 batch-p99-ms	         1.009 commits/req	         0 degraded/req	         0 non201/req	        96.61 req-max-ms	        24.37 req-p50-ms	        67.57 req-p99-ms	         0 rollbacks/req
+BenchmarkCreatePaymentContended/k=16/postgres-10        	     200	  43322541 ns/op	         0 503/req	        48.99 batch-max-ms	        43.67 batch-p50-ms	        48.52 batch-p99-ms	         1.007 commits/req	         0 non201/req	        48.77 req-max-ms	         7.832 req-p50-ms	        46.88 req-p99-ms	         0.4353 rollbacks/req
+BenchmarkCreatePaymentContended/k=16/postgres-10        	     200	  43181604 ns/op	         0 503/req	        50.24 batch-max-ms	        44.27 batch-p50-ms	        48.87 batch-p99-ms	         1.005 commits/req	         0 non201/req	        50.15 req-max-ms	         7.991 req-p50-ms	        46.36 req-p99-ms	         0.4353 rollbacks/req
+BenchmarkCreatePaymentContended/k=16/postgres-10        	     200	  42984206 ns/op	         0 503/req	        50.44 batch-max-ms	        43.60 batch-p50-ms	        48.39 batch-p99-ms	         1.005 commits/req	         0 non201/req	        50.34 req-max-ms	         8.007 req-p50-ms	        46.72 req-p99-ms	         0.4363 rollbacks/req
+BenchmarkCreatePaymentContended/k=16/redis-10           	     200	  72336639 ns/op	         0 503/req	       104.7 batch-max-ms	        70.80 batch-p50-ms	       102.3 batch-p99-ms	         1.004 commits/req	         0 degraded/req	         0 non201/req	       104.6 req-max-ms	        31.63 req-p50-ms	        86.67 req-p99-ms	         0 rollbacks/req
+BenchmarkCreatePaymentContended/k=16/redis-10           	     200	  72742434 ns/op	         0 503/req	       114.5 batch-max-ms	        71.47 batch-p50-ms	       108.7 batch-p99-ms	         1.003 commits/req	         0 degraded/req	         0 non201/req	       114.5 req-max-ms	        31.02 req-p50-ms	        84.84 req-p99-ms	         0 rollbacks/req
+BenchmarkCreatePaymentContended/k=16/redis-10           	     200	  71932580 ns/op	         0 503/req	       105.4 batch-max-ms	        70.93 batch-p50-ms	       100.3 batch-p99-ms	         1.003 commits/req	         0 degraded/req	         0 non201/req	       105.3 req-max-ms	        30.09 req-p50-ms	        86.14 req-p99-ms	         0 rollbacks/req
+PASS
+ok  	github.com/svout/strata/gateway/internal/payments	195.673s
