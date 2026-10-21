@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,7 +18,6 @@ import (
 	"github.com/svout/strata/gateway/internal/config"
 	"github.com/svout/strata/gateway/internal/httpx"
 	"github.com/svout/strata/gateway/internal/idem"
-	"github.com/svout/strata/gateway/internal/payments"
 	"github.com/svout/strata/gateway/internal/store"
 )
 
@@ -53,14 +53,17 @@ func run() error {
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, ContextTimeoutEnabled: true})
 	defer func() { _ = rdb.Close() }()
 
+	// The payments API is behind a gate until its rail is wired (wire.go).
+	payGate := &gate{}
 	checks := []httpx.ReadyCheck{
 		{Name: "postgres", Check: pool.Ping},
 		{Name: "redis", Check: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
+		payGate.readyCheck(),
 	}
 
 	router := httpx.NewRouter(log, checks...)
 	locker := idem.NewRedisLocker(rdb, log)
-	router.Mount("/v1/payments", payments.New(pool, payments.WithLocker(locker)).Handler(log))
+	router.Mount("/v1/payments", payGate)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -81,19 +84,36 @@ func run() error {
 		errCh <- srv.ListenAndServe()
 	}()
 
+	// Wiring and recovery run in the background until shutdown. Deferred
+	// calls run last-first: cancel the context, wait for the goroutine to
+	// stop, and only then close the pool it uses (deferred above).
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	wireCtx, cancelWire := context.WithCancel(ctx)
+	defer cancelWire()
+	wireErr := make(chan error, 1)
+	wg.Go(func() {
+		if err := wireSettlement(wireCtx, pool, cfg.AllowFakeRail, locker, log, payGate, defaultTimings); err != nil {
+			wireErr <- err
+		}
+	})
+
+	var exitErr error
 	select {
 	case err := <-errCh:
 		if !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}
 		return nil
+	case exitErr = <-wireErr:
+		// A configuration error: stop serving and exit with it.
 	case <-ctx.Done():
 	}
 
 	log.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return srv.Shutdown(shutdownCtx)
+	return errors.Join(exitErr, srv.Shutdown(shutdownCtx))
 }
 
 // redisLogger replaces go-redis's own logger, which prints plain-text lines to

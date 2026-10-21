@@ -6,10 +6,12 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 
 	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/database"
 	"github.com/pressly/goose/v3/lock"
 )
 
@@ -45,6 +47,49 @@ func Down(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("store: migrate down: %w", err)
 	}
 	return nil
+}
+
+// ErrSchemaVersion means the schema version could not be read. Its text is
+// fixed: the driver's error is left out because on a first connection it
+// names host, user and database (root CLAUDE.md, error text).
+var ErrSchemaVersion = errors.New("store: could not read the schema version")
+
+// SchemaVersion returns the highest migration version applied to db, or 0 if
+// nothing has been migrated (no goose version table yet). The gateway reads
+// it at startup to tell "not migrated yet" from "migrated and misconfigured"
+// (ADR-125 §3).
+//
+// It only reads. goose's Provider.GetDBVersion would be the obvious call, but
+// it creates the version table if it is missing and takes the migration lock,
+// so a gateway that called it would write to a database it must never
+// migrate (`make dev` doesn't migrate; `make migrate` does). goose's
+// database.Store runs the same queries without either side effect.
+func SchemaVersion(ctx context.Context, db *sql.DB) (int64, error) {
+	s, err := database.NewStore(database.DialectPostgres, goose.DefaultTablename)
+	if err != nil {
+		return 0, ErrSchemaVersion
+	}
+	// goose's PostgreSQL store implements the extended interface; the
+	// assertion only fails if a goose upgrade drops it, which a test catches.
+	st, ok := s.(database.StoreExtender)
+	if !ok {
+		return 0, ErrSchemaVersion
+	}
+	exists, err := st.TableExists(ctx, db)
+	if err != nil {
+		return 0, ErrSchemaVersion
+	}
+	if !exists {
+		return 0, nil
+	}
+	v, err := st.GetLatestVersion(ctx, db)
+	if errors.Is(err, database.ErrVersionNotFound) {
+		return 0, nil // the table exists but has no rows
+	}
+	if err != nil {
+		return 0, ErrSchemaVersion
+	}
+	return v, nil
 }
 
 // Lock retry policy for concurrent migration runs. goose's default polls every

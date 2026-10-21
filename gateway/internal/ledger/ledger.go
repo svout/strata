@@ -89,9 +89,15 @@ func Post(ctx context.Context, tx pgx.Tx, paymentID uuid.UUID, entries []Entry) 
 // happens at most once per railRef, enforced by the database (UNIQUE
 // (rail_ref, leg), migration 00003): if a posting with railRef exists,
 // PostRef writes nothing and returns ErrAlreadyPosted, however the writers
-// race. Check Posted first, outside the transaction, as the fast path: read
-// inside a SERIALIZABLE transaction it takes predicate locks that make
-// postings of different references conflict and retry (ADR-120).
+// race.
+//
+// Whether to check Posted first depends on the caller. A caller with no other
+// guard (the internal rail) reads it outside the transaction as the fast
+// path. A caller whose own state transition already admits a single writer
+// (payments' payer_ posting, after settling -> settled) skips the read, and
+// the constraint is only the backstop. Never read Posted inside the
+// SERIALIZABLE transaction: it takes predicate locks that make postings of
+// different references conflict and retry (ADR-120).
 func PostRef(ctx context.Context, tx pgx.Tx, paymentID uuid.UUID, railRef string, entries []Entry) error {
 	if railRef == "" || len([]rune(railRef)) > 255 {
 		return ErrMissingRef
@@ -195,7 +201,10 @@ type ClearingAccountID uuid.UUID
 // differently (SPEC-002/10a-ii-b):
 //
 //   - ErrNoClearingAccount: the database answered and the rail has no
-//     clearing account. A configuration error: refuse to start.
+//     clearing account. The schema version decides what it means (ADR-125
+//     §3 as amended): below 5, migration 00005 hasn't seeded the accounts
+//     yet, so it is transient; at 5 or above it is a configuration error and
+//     the gateway exits. cmd/gateway makes that call.
 //   - ErrClearingLookup: the lookup itself failed (database unreachable,
 //     accounts table not there yet, any other database error). Usually
 //     transient, e.g. a fresh stack before `make migrate`: retry.
