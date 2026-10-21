@@ -8,6 +8,8 @@ A mandate enforcement and risk gateway for AI agent payments. Final year project
 - Start every session with `/next-step`. It reads the **Now** block in `VAULT/Home.md`.
 - Load context in this order, stopping when you have enough: Now block → current spec → its phase note → the relevant rows of `VAULT/Workflow/Reuse Registry.md` → the files the plan names.
 - `docs/specs/` and `docs/adr/` are read-only exports from the vault, stamped with a hash. Edit the vault note and run `make export-docs`; never edit the export.
+- **On any conflict in `docs/specs/` or `docs/adr/` (merge, rebase, cherry-pick), take the newer export whole; never hand-merge it.** The vault is the source of truth, and a hand-merged export fails its own stamp (that is what blocked `make export-docs` before). If neither side is current, resolve to either, then re-run `make export-docs`.
+- **Don't export onto a branch that lacks the code the spec describes.** A new branch off `main` while a stack is unmerged would carry ticks and as-built notes for work `main` doesn't have; merge the stack first, then branch.
 
 ## Process (one session = one step = one ≤1-day subtask)
 `/next-step` → `/spec` (if no approved spec) → `/plan-step` → build → `/verify` → `/review-step` → `/wrap-up` → `/clear`.
