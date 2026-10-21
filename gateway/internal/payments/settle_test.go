@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"pgregory.net/rapid"
 
 	"github.com/svout/strata/gateway/internal/httpx"
 	"github.com/svout/strata/gateway/internal/idem"
@@ -335,6 +337,155 @@ func TestFinish_SecondSettleLosesOnTransitionNotLedger(t *testing.T) {
 	if n := payerEntries(t, pool, res.PaymentID); n != 2 {
 		t.Fatalf("payer posting legs = %d, want 2", n)
 	}
+}
+
+// AC1, atomicity of markSettled, first direction: the posting fails after
+// the transition succeeded. The transition must roll back with it: still
+// settling, no payer legs, one Warn. Catches a transition run on the pool
+// instead of the transaction (settled with no posting).
+//
+// Two ways to fail, because they fail differently. A clearing id that names
+// no account hits the foreign key on the server, which aborts the
+// transaction, so its commit would roll back even if markSettled dropped
+// PostRef's error. uuid.Nil is refused by ledger's validation before any SQL
+// runs, leaving the transaction healthy, so only returning PostRef's error
+// stops the commit; that case catches a swallowed error.
+func TestMarkSettled_PostingFailsAfterTransition(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		clearing uuid.UUID
+	}{
+		{"server-side: foreign key", uuid.New()},
+		{"client-side: validation", uuid.Nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pool := testutil.Postgres(t)
+			svc, logs := newSettleService(t, pool, rail.NewFake())
+			svc.clearing = ledger.ClearingAccountID(tc.clearing)
+			res := createFor(t, svc, "k", newAccount(t.Context(), t, pool), newAccount(t.Context(), t, pool))
+
+			assertState(t, svc, res.PaymentID, Settling, nil)
+			if n := payerEntries(t, pool, res.PaymentID); n != 0 {
+				t.Fatalf("payer posting legs = %d, want 0", n)
+			}
+			if n := strings.Count(logs.String(), `"level":"WARN","msg":"could not record the rail's answer`); n != 1 {
+				t.Fatalf("Warn lines = %d, want 1:\n%s", n, logs)
+			}
+		})
+	}
+}
+
+// AC1, atomicity of markSettled, second direction: the posting succeeded and
+// then the transition doesn't commit. A deferred constraint trigger (this
+// test's database only) refuses the commit of any payment reaching settled,
+// after both statements have run. Neither may persist: still settling, no
+// payer legs. Catches a posting run on the pool instead of the transaction
+// (payer legs for a payment that never settled). TestSettle_FirstWriterWins
+// can't: there the transition fails first, so the posting never runs.
+func TestMarkSettled_CommitFailsAfterPosting(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	if _, err := pool.Exec(t.Context(), `
+		CREATE FUNCTION test_refuse_settled() RETURNS trigger LANGUAGE plpgsql
+			AS $$ BEGIN RAISE EXCEPTION 'test: commit of settled refused'; END $$;
+		CREATE CONSTRAINT TRIGGER test_refuse_settled AFTER UPDATE ON payments
+			DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.state = 'settled')
+			EXECUTE FUNCTION test_refuse_settled();`); err != nil {
+		t.Fatal(err)
+	}
+	svc, logs := newSettleService(t, pool, rail.NewFake())
+	res := createFor(t, svc, "k", newAccount(t.Context(), t, pool), newAccount(t.Context(), t, pool))
+
+	assertState(t, svc, res.PaymentID, Settling, nil)
+	if n := payerEntries(t, pool, res.PaymentID); n != 0 {
+		t.Fatalf("payer posting legs = %d, want 0", n)
+	}
+	assertBalances(t, pool, map[uuid.UUID]int64{uuid.UUID(clearingFor(t, pool, rail.FakeName)): 0})
+	if n := strings.Count(logs.String(), `"level":"WARN","msg":"could not record the rail's answer`); n != 1 {
+		t.Fatalf("Warn lines = %d, want 1:\n%s", n, logs)
+	}
+}
+
+// The central invariant of 10a-ii-a2, as a property: whatever mix of rail
+// outcomes, recoveries, repeated answers, other writers and failed postings
+// happens, a payment is settled if and only if its payer posting exists
+// (exactly two legs), and the fake rail's clearing account holds exactly the
+// settled amount. The fixed tests above prove atomicity today; this keeps
+// proving it as later phases add code that touches settlement.
+func TestProperty_SettledIffPayerPosting(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	fake := rail.NewFake()
+	svc, _ := newSettleService(t, pool, fake)
+	// broken posts to a clearing account that doesn't exist: every
+	// settlement it records fails at the foreign key and must roll back.
+	broken, _ := newSettleService(t, pool, fake)
+	broken.clearing = ledger.ClearingAccountID(uuid.New())
+	clearing := uuid.UUID(clearingFor(t, pool, rail.FakeName))
+	payer, payee := newAccount(t.Context(), t, pool), newAccount(t.Context(), t, pool)
+	services := []*Service{svc, broken}
+	steps := []rail.Step{{}, {Outcome: rail.Declined}, {Outcome: rail.Pending}, {Err: errors.New("connection reset")}, {LoseResponse: true}}
+	var keys int
+
+	rapid.Check(t, func(rt *rapid.T) {
+		var ids []uuid.UUID // this run's payments
+		pick := func(rt *rapid.T) uuid.UUID {
+			if len(ids) == 0 {
+				rt.Skip("no payments yet")
+			}
+			return rapid.SampledFrom(ids).Draw(rt, "payment")
+		}
+		rt.Repeat(map[string]func(*rapid.T){
+			"create": func(rt *rapid.T) {
+				fake.Push(rapid.SampledFrom(steps).Draw(rt, "step"))
+				s := rapid.SampledFrom(services).Draw(rt, "service")
+				keys++
+				ids = append(ids, createFor(t, s, fmt.Sprintf("p%d", keys), payer, payee).PaymentID)
+			},
+			"resolve pending": func(rt *rapid.T) {
+				// Errors (not pending) are expected and ignored.
+				_ = fake.Resolve(rail.Ref(pick(rt)), rapid.SampledFrom([]rail.Outcome{rail.Settled, rail.Declined}).Draw(rt, "outcome"), "")
+			},
+			"recover": func(rt *rapid.T) {
+				if _, err := rapid.SampledFrom(services).Draw(rt, "service").Recover(t.Context()); err != nil {
+					rt.Fatalf("Recover: %v", err)
+				}
+			},
+			// A repeated or contradicting answer from a stale snapshot, as a
+			// second request or a concurrent Recover would deliver it.
+			"finish again": func(rt *rapid.T) {
+				p, err := svc.Get(t.Context(), pick(rt))
+				if err != nil {
+					rt.Fatal(err)
+				}
+				to := rapid.SampledFrom([]State{Settled, Failed}).Draw(rt, "to")
+				rapid.SampledFrom(services).Draw(rt, "service").finish(t.Context(), p, to, FailureDeclined)
+			},
+			"": func(rt *rapid.T) {
+				for _, id := range ids {
+					p, err := svc.Get(t.Context(), id)
+					if err != nil {
+						rt.Fatal(err)
+					}
+					legs := payerEntries(t, pool, id)
+					if (p.State == Settled) != (legs == 2) || (p.State != Settled && legs != 0) {
+						rt.Fatalf("payment %s is %s with %d payer legs; want settled iff 2", id, p.State, legs)
+					}
+				}
+			},
+		})
+		// Cumulative across runs: the clearing account holds 1250 per
+		// settled payment on the fake rail, ever.
+		var total int
+		if err := pool.QueryRow(t.Context(), "SELECT count(*) FROM payments WHERE state = 'settled'").Scan(&total); err != nil {
+			rt.Fatal(err)
+		}
+		if got, err := ledger.Balance(t.Context(), pool, clearing); err != nil || got != int64(total)*1250 {
+			rt.Fatalf("clearing:fake balance = %d (%v), want %d for %d settled payments", got, err, int64(total)*1250, total)
+		}
+	})
 }
 
 // A result outside the three outcomes is not a decision: the payment stays

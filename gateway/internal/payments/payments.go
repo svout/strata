@@ -308,10 +308,6 @@ func (s *Service) MarkSettling(ctx context.Context, id uuid.UUID, railRef string
 	return transition(ctx, s.pool, id, Settling, &railRef, nil)
 }
 
-// There is no MarkSettled: a payment becomes settled only in finish, in the
-// transaction that posts the payer's side (SPEC-002 10a-ii-a2). An exported
-// path to settled without that posting would break AC1 silently.
-
 // MarkFailed moves a created or settling payment to failed, recording why.
 // An unknown reason is ErrInvalidFailureReason, checked before the database,
 // so it never surfaces as a raw CHECK violation naming the table.
