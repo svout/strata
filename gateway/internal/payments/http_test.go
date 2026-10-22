@@ -488,6 +488,67 @@ func TestHTTP_FailureIsNotStored(t *testing.T) {
 	}
 }
 
+// 8b-i should 4: a request that fails after taking the lock releases it, or a
+// retry with the same key would wait out the 10 s TTL. invalid_amount fails before the lock is taken; it is a guard row
+// in case validation ever moves after the lock.
+func TestHTTP_LockReleasedOnFailure(t *testing.T) {
+	t.Parallel()
+	const key = "k-release"
+	cases := []struct {
+		name   string
+		status int
+		code   string
+		send   func(t *testing.T, a *testAPI) *httptest.ResponseRecorder
+	}{
+		{"409 key reused with another body", http.StatusConflict, "idempotency_key_mismatch",
+			func(t *testing.T, a *testAPI) *httptest.ResponseRecorder {
+				if rec := a.do(http.MethodPost, "/v1/payments", key, a.body("")); rec.Code != http.StatusCreated {
+					t.Fatalf("first = %d: %s, want 201", rec.Code, rec.Body)
+				}
+				return a.do(http.MethodPost, "/v1/payments", key, strings.Replace(a.body(""), "1250", "1251", 1))
+			}},
+		{"422 unknown account", http.StatusUnprocessableEntity, "account_not_found",
+			func(_ *testing.T, a *testAPI) *httptest.ResponseRecorder {
+				return a.do(http.MethodPost, "/v1/payments", key, strings.Replace(a.body(""), a.payee.String(), uuid.NewString(), 1))
+			}},
+		{"422 invalid amount", http.StatusUnprocessableEntity, "invalid_amount",
+			func(_ *testing.T, a *testAPI) *httptest.ResponseRecorder {
+				return a.do(http.MethodPost, "/v1/payments", key, strings.Replace(a.body(""), "1250", "0", 1))
+			}},
+		// The table lock stalls the transaction after the Redis lock is taken,
+		// so the deadline passes inside it.
+		{"503 deadline inside the transaction", http.StatusServiceUnavailable, "request_timeout",
+			func(t *testing.T, a *testAPI) *httptest.ResponseRecorder {
+				tx, err := a.pool.Begin(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(context.WithoutCancel(t.Context())) }()
+				if _, err := tx.Exec(t.Context(), "LOCK TABLE idempotency_keys IN ACCESS EXCLUSIVE MODE"); err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+				defer cancel()
+				req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/payments", strings.NewReader(a.body("")))
+				req.Header.Set(idem.Header, key)
+				rec := httptest.NewRecorder()
+				a.router.ServeHTTP(rec, req)
+				return rec
+			}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rdb := testutil.Redis(t) // a database of its own: any key left is this request's lock
+			a, _ := newTestAPIWith(t, rdb)
+			assertProblem(t, tc.send(t, a), tc.status, tc.code)
+			if keys := rdb.Keys(t.Context(), "*").Val(); len(keys) != 0 {
+				t.Fatalf("lock left in Redis after %d: %v", tc.status, keys)
+			}
+		})
+	}
+}
+
 // Decision 6: a replay is byte-identical and logged at Info with the payment
 // id and the key's digest, never the key.
 func TestHTTP_ReplayLogged(t *testing.T) {
