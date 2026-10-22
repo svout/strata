@@ -8,6 +8,8 @@ A mandate enforcement and risk gateway for AI agent payments. Final year project
 - Start every session with `/next-step`. It reads the **Now** block in `VAULT/Home.md`.
 - Load context in this order, stopping when you have enough: Now block → current spec → its phase note → the relevant rows of `VAULT/Workflow/Reuse Registry.md` → the files the plan names.
 - `docs/specs/` and `docs/adr/` are read-only exports from the vault, stamped with a hash. Edit the vault note and run `make export-docs`; never edit the export.
+- **On any conflict in `docs/specs/` or `docs/adr/` (merge, rebase, cherry-pick), take the newer export whole; never hand-merge it.** The vault is the source of truth, and a hand-merged export fails its own stamp (that is what blocked `make export-docs` before). If neither side is current, resolve to either, then re-run `make export-docs`.
+- **Don't export onto a branch that lacks the code the spec describes.** A new branch off `main` while a stack is unmerged would carry ticks and as-built notes for work `main` doesn't have; merge the stack first, then branch.
 
 ## Process (one session = one step = one ≤1-day subtask)
 `/next-step` → `/spec` (if no approved spec) → `/plan-step` → build → `/verify` → `/review-step` → `/wrap-up` → `/clear`.
@@ -42,6 +44,7 @@ This is an assessed university project. The supervisor has agreed that AI tools 
 - No secrets, tokens, mandate bodies or personal data in logs — log IDs and digests.
 - Error text is logged verbatim (the redactor checks keys, not messages), so never wrap secrets, DSNs, tokens or URLs with query strings into an error; return a sentinel and keep the detail out.
 - No real payment credentials or personal data anywhere. Sandbox and synthetic only.
+- **No startup path may call anything capable of applying a migration;** startup may only *read* the schema version (`store.SchemaVersion`). Migrations run only through `make migrate` (`cmd/migrate`). A startup path that can migrate is how a deploy silently migrates production: this includes library calls with migration side effects (goose's `Provider.GetDBVersion` creates the version table and takes the migration lock), so check a library call's side effects before using it at startup.
 
 ## Performance budgets (the dissertation's cost claim)
 Signature 2 ms · mandate 3 ms · policy 4 ms · scoring 8 ms · decision+audit 5 ms · **total added p99 < 25 ms** at 200 rps. A change that breaks a budget is not done; measure with `make bench` before claiming otherwise.

@@ -47,8 +47,10 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 		return 2
 	}
 
-	// config.Load also reads GATEWAY_ADDR and REDIS_ADDR, but only
-	// DATABASE_URL is required, so it fits here unchanged.
+	// config.Load also reads GATEWAY_ADDR, REDIS_ADDR and the rail settings,
+	// but only DATABASE_URL is required, so it fits here unchanged. An
+	// invalid rail setting fails the migration too, which is fine: the same
+	// environment would stop the gateway.
 	cfg, err := config.Load(getenv)
 	if err != nil {
 		printErr(stderr, "migrate: "+err.Error()+"\n")

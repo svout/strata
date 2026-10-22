@@ -239,16 +239,45 @@ func TestRecover_ConcurrentPassesSettleOnce(t *testing.T) {
 // Recovery only touches payments on its own rail, and needs a rail.
 func TestRecover_OwnRailOnly(t *testing.T) {
 	t.Parallel()
-	pool := testutil.Postgres(t)
-	fakeSvc, _ := newSettleService(t, pool, rail.NewFake(rail.Step{Outcome: rail.Pending}))
-	res := createFor(t, fakeSvc, "k", newAccount(t.Context(), t, pool), newAccount(t.Context(), t, pool))
+	// Both directions (SPEC-002 10a-ii-b): a process switched to the fake
+	// inherits payments left settling on the internal rail, and the reverse.
+	// Asking the wrong rail would get an unknown reference and re-settle the
+	// payment on a rail that never saw it, so Recover must not call its rail
+	// at all for them.
+	for name, tc := range map[string]struct {
+		owner, recoverer func(t *testing.T, pool *pgxpool.Pool) rail.Adapter
+	}{
+		"fake payment, internal recovery": {
+			owner:     func(*testing.T, *pgxpool.Pool) rail.Adapter { return rail.NewFake(rail.Step{Outcome: rail.Pending}) },
+			recoverer: func(t *testing.T, pool *pgxpool.Pool) rail.Adapter { return internalRail(t, pool) },
+		},
+		"internal payment, fake recovery": {
+			// An unknown outcome leaves the internal payment settling.
+			owner: func(t *testing.T, pool *pgxpool.Pool) rail.Adapter {
+				return &hookRail{Adapter: internalRail(t, pool), fail: context.DeadlineExceeded}
+			},
+			recoverer: func(*testing.T, *pgxpool.Pool) rail.Adapter { return rail.NewFake() },
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			pool := testutil.Postgres(t)
+			owner, _ := newSettleService(t, pool, tc.owner(t, pool))
+			res := createFor(t, owner, "k", newAccount(t.Context(), t, pool), newAccount(t.Context(), t, pool))
+			assertState(t, owner, res.PaymentID, Settling, nil)
 
-	internal, _ := newSettleService(t, pool, internalRail(t, pool))
-	if st, err := internal.Recover(t.Context()); err != nil || st != (RecoverStats{}) {
-		t.Fatalf("internal Recover = %+v, %v; want nothing to do", st, err)
+			other := &hookRail{Adapter: tc.recoverer(t, pool)}
+			svc, _ := newSettleService(t, pool, other)
+			if st, err := svc.Recover(t.Context()); err != nil || st != (RecoverStats{}) {
+				t.Fatalf("Recover on the other rail = %+v, %v; want nothing to do", st, err)
+			}
+			if n := other.settles.Load() + other.statuses.Load(); n != 0 {
+				t.Fatalf("Recover called the other rail %d times, want 0", n)
+			}
+			assertState(t, owner, res.PaymentID, Settling, nil)
+		})
 	}
-	assertState(t, fakeSvc, res.PaymentID, Settling, nil)
-	if _, err := New(pool).Recover(t.Context()); !errors.Is(err, ErrNoRail) {
+	if _, err := New(testutil.Postgres(t)).Recover(t.Context()); !errors.Is(err, ErrNoRail) {
 		t.Fatalf("Recover without a rail = %v, want ErrNoRail", err)
 	}
 }

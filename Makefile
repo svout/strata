@@ -94,7 +94,9 @@ dev: ## Start the local stack (gateway, PostgreSQL 16, Redis 7) and wait until /
 	  sleep 1; \
 	done; \
 	curl -sS http://127.0.0.1:8080/readyz >&2 || true; \
-	echo "gateway not ready after 30 s; see: make dev-logs" >&2; exit 1
+	echo "gateway not ready after 30 s; its last log lines (the reason, in its own words):" >&2; \
+	$(COMPOSE) logs --no-log-prefix --tail 3 gateway >&2 || true; \
+	echo "full logs: make dev-logs" >&2; exit 1
 
 dev-down: ## Stop the local stack (keeps the pgdata volume)
 	$(COMPOSE) down

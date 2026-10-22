@@ -97,6 +97,54 @@ func TestDownRemovesSchemaAndUpRestoresIt(t *testing.T) {
 	}
 }
 
+// SchemaVersion reads goose's version without migrating anything: the
+// highest version recorded (5 after Up, 4 once that row is gone), and 0
+// with no version table, which it must not create (the gateway calls it and
+// never migrates).
+func TestSchemaVersion(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	ctx := testContext(t)
+	db := sqlDB(t, pool)
+
+	read := func(want int64) {
+		t.Helper()
+		if got, err := store.SchemaVersion(ctx, db); err != nil || got != want {
+			t.Errorf("SchemaVersion = %d, %v; want %d", got, err, want)
+		}
+	}
+	read(5)
+	// A database migrated to 4 only, as the gateway's startup sees it before
+	// 00005: the version is the highest row.
+	mustExec(ctx, t, pool, "DELETE FROM goose_db_version WHERE version_id = 5")
+	read(4)
+	mustExec(ctx, t, pool, "DROP TABLE goose_db_version")
+	read(0)
+	if tableExists(ctx, t, pool, "goose_db_version") {
+		t.Error("SchemaVersion created goose_db_version; it must only read")
+	}
+}
+
+// An unreachable database gives ErrSchemaVersion with fixed text: nothing
+// from the DSN (AC8).
+func TestSchemaVersion_UnreachableHidesDSN(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("pgx", "postgres://leakuser:leakpass@127.0.0.1:1/leakdb?connect_timeout=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	_, err = store.SchemaVersion(testContext(t), db)
+	if !errors.Is(err, store.ErrSchemaVersion) {
+		t.Fatalf("SchemaVersion = %v, want ErrSchemaVersion", err)
+	}
+	for _, s := range []string{"leakuser", "leakpass", "leakdb", "127.0.0.1"} {
+		if strings.Contains(err.Error(), s) {
+			t.Errorf("error %q contains %q", err, s)
+		}
+	}
+}
+
 // Down past 00005 refuses to discard postings: once a ledger entry
 // references a seeded clearing account, deleting it fails on the foreign key
 // and the migration rolls back, leaving the schema at version 5.
