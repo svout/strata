@@ -346,7 +346,9 @@ func apply(ctx context.Context, svc *Service, id uuid.UUID, to State) (Payment, 
 	case Settling:
 		return svc.MarkSettling(ctx, id, "rail-"+id.String())
 	case Settled:
-		return svc.MarkSettled(ctx, id)
+		// There is no exported way to settle without the payer's posting;
+		// the state machine test reaches behind the API on purpose.
+		return transition(ctx, svc.pool, id, Settled, nil, nil)
 	default:
 		return svc.MarkFailed(ctx, id, FailureDeclined)
 	}

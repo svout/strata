@@ -6,7 +6,12 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
+	"github.com/svout/strata/gateway/internal/ledger"
 	"github.com/svout/strata/gateway/internal/rail"
+	"github.com/svout/strata/gateway/internal/store"
 )
 
 // Settlement (SPEC-002 subtask 10a): turning a settling payment into settled
@@ -176,6 +181,53 @@ func (s *Service) unknown(ctx context.Context, p Payment, err error) outcome {
 	return outcomeUnknown
 }
 
+// PayerRef is the rail reference of the payer's posting for payment id
+// (ADR-123): payer debit, clearing credit. It differs from the rail's own
+// reference (rail.Ref), so the ledger's at-most-once constraint holds each
+// posting separately. It is exported because it is a durable fact in
+// ledger_entries.rail_ref: anything that reconstructs a payment's postings
+// (dispute replay, the console, reconciliation) computes it, as with
+// rail.Ref.
+func PayerRef(id uuid.UUID) string { return "payer_" + id.String() }
+
+// markSettled moves payment id to settled and posts the payer's side, in one
+// SERIALIZABLE transaction, so a payment is never settled without it
+// (ADR-123). It is the only way to reach settled: there is no exported
+// MarkSettled, because a path to settled without this posting would break
+// AC1 silently (SPEC-002 10a-ii-a2). The order is deliberate (Ivan,
+// 2026-10-19):
+//
+//   - The transition goes first. A writer that lost the race gets
+//     ErrInvalidTransition from the state machine, as before, and finish
+//     treats it as first-writer-wins. Posting first would make the ledger's
+//     unique constraint the state machine's concurrency control.
+//
+//   - There is no ledger.Posted pre-read. Only the forward-only
+//     settling -> settled UPDATE can lead to this posting, so it already
+//     admits one writer; the unique constraint is the backstop (ADR-120).
+//     A read here would take predicate locks on ledger_entries inside the
+//     transaction, the conflict ADR-120 moved the rail's read out to avoid.
+//
+//   - The posting takes the payer and amount from the row the transition
+//     returns, never from the caller's copy: what is posted is what this
+//     transaction committed (Ivan, 2026-10-21). The caller's copy may be a
+//     snapshot from a Recover page or an earlier request.
+//
+// If PostRef fails after the transition, or the commit fails after both, the
+// whole transaction rolls back and the payment stays settling for Recover.
+func (s *Service) markSettled(ctx context.Context, id uuid.UUID) error {
+	return store.Serializable(ctx, s.pool, func(tx pgx.Tx) error {
+		p, err := transition(ctx, tx, id, Settled, nil, nil)
+		if err != nil {
+			return err
+		}
+		return ledger.PostRef(ctx, tx, p.ID, PayerRef(p.ID), []ledger.Entry{
+			{AccountID: p.PayerAccountID, Direction: ledger.Debit, Amount: p.Amount},
+			{AccountID: uuid.UUID(s.clearing), Direction: ledger.Credit, Amount: p.Amount},
+		})
+	})
+}
+
 // finish moves p to settled or failed. If another settle attempt got there
 // first, the transition is refused (ErrInvalidTransition) and the first
 // writer wins: the payment keeps what was recorded first. The same final
@@ -187,7 +239,7 @@ func (s *Service) finish(ctx context.Context, p Payment, to State, reason Failur
 	defer cancel()
 	var err error
 	if to == Settled {
-		_, err = s.MarkSettled(ctx, p.ID)
+		err = s.markSettled(ctx, p.ID)
 	} else {
 		_, err = s.MarkFailed(ctx, p.ID, reason)
 	}

@@ -28,6 +28,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/svout/strata/gateway/internal/idem"
+	"github.com/svout/strata/gateway/internal/ledger"
 	"github.com/svout/strata/gateway/internal/rail"
 	"github.com/svout/strata/gateway/internal/store"
 )
@@ -108,7 +109,11 @@ type Service struct {
 	pool   *pgxpool.Pool
 	locker idem.Locker  // nil: no in-flight lock, PostgreSQL alone
 	rail   rail.Adapter // nil: payments are created and never settled
-	log    *slog.Logger
+	// clearing is rail's clearing account, credited by the payer_ posting
+	// when a payment settles (ADR-123). Resolved by the caller at startup,
+	// never read inside the settle transaction (ADR-125).
+	clearing ledger.ClearingAccountID
+	log      *slog.Logger
 
 	// settleTimeout bounds one rail call. recoverGrace is how long a payment
 	// must have been settling before Recover touches it, and recoverPage how
@@ -131,8 +136,12 @@ func WithLocker(l idem.Locker) Option {
 // outbox, ADR-118's consequence): the payment is recorded as settling with
 // its rail reference in the transaction that creates it, and the rail is
 // called after that commits. Without a rail, payments stay created.
-func WithRail(a rail.Adapter) Option {
-	return func(s *Service) { s.rail = a }
+//
+// clearing is a's clearing account (ledger.ClearingAccount for a.Name()).
+// When a payment settles, the payer is debited and clearing credited in the
+// transaction that records settled (ADR-123).
+func WithRail(a rail.Adapter, clearing ledger.ClearingAccountID) Option {
+	return func(s *Service) { s.rail, s.clearing = a, clearing }
 }
 
 // WithLogger sets where settlement outcomes are logged (default: nowhere).
@@ -297,11 +306,6 @@ func (s *Service) MarkSettling(ctx context.Context, id uuid.UUID, railRef string
 		return Payment{}, ErrMissingRailRef
 	}
 	return transition(ctx, s.pool, id, Settling, &railRef, nil)
-}
-
-// MarkSettled moves a settling payment to settled.
-func (s *Service) MarkSettled(ctx context.Context, id uuid.UUID) (Payment, error) {
-	return transition(ctx, s.pool, id, Settled, nil, nil)
 }
 
 // MarkFailed moves a created or settling payment to failed, recording why.

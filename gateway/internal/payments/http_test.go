@@ -21,6 +21,7 @@ import (
 
 	"github.com/svout/strata/gateway/internal/httpx"
 	"github.com/svout/strata/gateway/internal/idem"
+	"github.com/svout/strata/gateway/internal/ledger"
 	"github.com/svout/strata/gateway/internal/rail"
 	"github.com/svout/strata/gateway/internal/store"
 	"github.com/svout/strata/gateway/internal/testutil"
@@ -54,9 +55,22 @@ func newTestAPIWith(t testing.TB, rdb *redis.Client) (*testAPI, *idem.RedisLocke
 }
 
 // railFor builds the rail a test API settles on; nil means no rail.
-type railFor func(*pgxpool.Pool) rail.Adapter
+type railFor func(testing.TB, *pgxpool.Pool) rail.Adapter
 
-func internalRail(pool *pgxpool.Pool) rail.Adapter { return rail.NewInternal(pool) }
+func internalRail(t testing.TB, pool *pgxpool.Pool) rail.Adapter {
+	return rail.NewInternal(pool, clearingFor(t, pool, rail.InternalName))
+}
+
+// clearingFor looks up the clearing account of the rail named name, as
+// cmd/gateway does at startup (ADR-125).
+func clearingFor(t testing.TB, pool *pgxpool.Pool, name string) ledger.ClearingAccountID {
+	t.Helper()
+	id, err := ledger.ClearingAccount(t.Context(), pool, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
 
 // newTestAPILogTo is newTestAPIWith logging to w, settling on newRail (nil:
 // no rail, payments stay created); a.log is nil. Benchmarks pass io.Discard,
@@ -74,7 +88,8 @@ func newTestAPILogTo(t testing.TB, rdb *redis.Client, w io.Writer, newRail railF
 		opts = append(opts, WithLocker(locker))
 	}
 	if newRail != nil {
-		opts = append(opts, WithRail(newRail(pool)))
+		r := newRail(t, pool)
+		opts = append(opts, WithRail(r, clearingFor(t, pool, r.Name())))
 	}
 	r := httpx.NewRouter(log)
 	r.Mount("/v1/payments", New(pool, opts...).Handler(log))
@@ -369,8 +384,9 @@ func concurrentSameKey(t *testing.T, a *testAPI, n int) {
 	if payments != 1 || keys != 1 {
 		t.Fatalf("payments = %d, keys = %d; want exactly 1 each", payments, keys)
 	}
-	// AC3's ledger clause: the payment settled once, so one two-leg posting.
-	// Replays never call the rail.
+	// AC3's ledger clause: the payment settled once, so two two-leg
+	// postings: the payer's (payer -> clearing) and the internal rail's
+	// (clearing -> payee), ADR-123. Replays never call the rail.
 	var entries int
 	var state string
 	if err := a.pool.QueryRow(ctx, "SELECT count(*) FROM ledger_entries").Scan(&entries); err != nil {
@@ -379,8 +395,8 @@ func concurrentSameKey(t *testing.T, a *testAPI, n int) {
 	if err := a.pool.QueryRow(ctx, "SELECT state FROM payments").Scan(&state); err != nil {
 		t.Fatal(err)
 	}
-	if entries != 2 || state != string(Settled) {
-		t.Fatalf("ledger entries = %d, state = %s; want 2 and settled", entries, state)
+	if entries != 4 || state != string(Settled) {
+		t.Fatalf("ledger entries = %d, state = %s; want 4 and settled", entries, state)
 	}
 	if c, r := strings.Count(a.log.String(), `"msg":"payment created"`), strings.Count(a.log.String(), `"msg":"payment replayed"`); c != 1 || r != n-1 {
 		t.Fatalf("log: %d created, %d replayed; want 1 and %d", c, r, n-1)

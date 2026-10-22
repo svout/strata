@@ -78,7 +78,7 @@ var settleRails = []struct {
 	name    string
 	newRail railFor
 }{
-	{"fake", func(*pgxpool.Pool) rail.Adapter { return rail.NewFake() }},
+	{"fake", func(testing.TB, *pgxpool.Pool) rail.Adapter { return rail.NewFake() }},
 	{"internal", internalRail},
 }
 
