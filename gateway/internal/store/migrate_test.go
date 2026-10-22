@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -25,7 +26,7 @@ var schemaTables = []string{"accounts", "payments", "ledger_entries", "idempoten
 
 // schemaRelations is every table and index the migrations create; to_regclass
 // (tableExists) finds indexes as well as tables.
-var schemaRelations = slices.Concat(schemaTables, []string{"idempotency_keys_created_at_idx", "ledger_entries_rail_ref_leg_key", "payments_settling_idx"})
+var schemaRelations = slices.Concat(schemaTables, []string{"idempotency_keys_created_at_idx", "ledger_entries_rail_ref_leg_key", "payments_settling_idx", "accounts_clearing_owner_key"})
 
 // PostgreSQL SQLSTATE codes the schema's constraints raise.
 const (
@@ -44,8 +45,8 @@ func TestUpAppliesSchema(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT max(version_id) FROM goose_db_version").Scan(&version); err != nil {
 		t.Fatalf("read goose version: %v", err)
 	}
-	if version != 4 {
-		t.Errorf("schema version = %d, want 4", version)
+	if version != 5 {
+		t.Errorf("schema version = %d, want 5", version)
 	}
 	var indexdef string
 	if err := pool.QueryRow(ctx, "SELECT indexdef FROM pg_indexes WHERE indexname = 'idempotency_keys_created_at_idx'").Scan(&indexdef); err != nil || !strings.HasSuffix(indexdef, "(created_at)") {
@@ -55,6 +56,10 @@ func TestUpAppliesSchema(t *testing.T) {
 		if !tableExists(ctx, t, pool, rel) {
 			t.Errorf("%s missing after Up", rel)
 		}
+	}
+	// 00005 seeds exactly one clearing account per rail.
+	if got := clearingOwners(ctx, t, pool); !slices.Equal(got, []string{"rail:fake", "rail:internal"}) {
+		t.Errorf("seeded clearing owners = %v, want [rail:fake rail:internal]", got)
 	}
 
 	// Up is idempotent: a second run has nothing to apply and must not fail.
@@ -86,6 +91,66 @@ func TestDownRemovesSchemaAndUpRestoresIt(t *testing.T) {
 			t.Errorf("%s missing after Up following Down", rel)
 		}
 	}
+	// 00005's Down removed its seeds, so Up reseeds them once, not twice.
+	if got := clearingOwners(ctx, t, pool); !slices.Equal(got, []string{"rail:fake", "rail:internal"}) {
+		t.Errorf("clearing owners after Down and Up = %v, want [rail:fake rail:internal]", got)
+	}
+}
+
+// Down past 00005 refuses to discard postings: once a ledger entry
+// references a seeded clearing account, deleting it fails on the foreign key
+// and the migration rolls back, leaving the schema at version 5.
+func TestDownKeepsClearingAccountsWithEntries(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	ctx := testContext(t)
+
+	// The payment is payer -> payee, as under ADR-123; only the ledger entry
+	// touches the clearing account. (A payment *to* the clearing account would
+	// make Down fail on payments' payee foreign key instead, and this test
+	// would pass without proving anything about postings.)
+	payer := insertID(ctx, t, pool, `INSERT INTO accounts (kind, currency) VALUES ('user', 'GBP') RETURNING id::text`)
+	payee := insertID(ctx, t, pool, `INSERT INTO accounts (kind, currency) VALUES ('merchant', 'GBP') RETURNING id::text`)
+	clearing := insertID(ctx, t, pool, `SELECT id::text FROM accounts WHERE owner = 'rail:internal'`)
+	payment := insertID(ctx, t, pool,
+		`INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail)
+		 VALUES ($1, $2, 100, 'GBP', 'internal') RETURNING id::text`, payer, payee)
+	mustExec(ctx, t, pool,
+		`INSERT INTO ledger_entries (payment_id, account_id, direction, amount) VALUES ($1, $2, 'debit', 100), ($1, $3, 'credit', 100)`,
+		payment, payer, clearing)
+
+	err := store.Down(ctx, sqlDB(t, pool))
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != foreignKeyViolation || pgErr.ConstraintName != "ledger_entries_account_id_fkey" {
+		t.Fatalf("Down with entries on a seeded clearing account = %v, want a foreign key violation on ledger_entries_account_id_fkey", err)
+	}
+	var version int64
+	if err := pool.QueryRow(ctx, "SELECT max(version_id) FROM goose_db_version").Scan(&version); err != nil || version != 5 {
+		t.Errorf("schema version after failed Down = %d (%v), want 5", version, err)
+	}
+	if got := clearingOwners(ctx, t, pool); len(got) != 2 {
+		t.Errorf("clearing owners after failed Down = %v, want both still there", got)
+	}
+	// Down drops the CHECK before it reaches the failing DELETE, so its
+	// survival shows the whole migration rolled back, not just the DELETE.
+	var checks int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM pg_constraint WHERE conname = 'payments_rail_check'").Scan(&checks); err != nil || checks != 1 {
+		t.Errorf("payments_rail_check after failed Down: %d (%v), want 1", checks, err)
+	}
+}
+
+// clearingOwners lists the owners of clearing accounts that have one, sorted.
+func clearingOwners(ctx context.Context, t *testing.T, pool *pgxpool.Pool) []string {
+	t.Helper()
+	rows, err := pool.Query(ctx, "SELECT owner FROM accounts WHERE kind = 'clearing' AND owner IS NOT NULL ORDER BY owner")
+	if err != nil {
+		t.Fatalf("list clearing owners: %v", err)
+	}
+	owners, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatalf("list clearing owners: %v", err)
+	}
+	return owners
 }
 
 // TestConcurrentUpIsSerialised starts several Up runs at once against an empty
@@ -194,7 +259,8 @@ func TestSchemaConstraints(t *testing.T) {
 	pool := testutil.Postgres(t)
 	ctx := testContext(t)
 
-	// Valid baseline rows. A clearing account has no owner (NULL).
+	// Valid baseline rows. A clearing account made by hand may have no owner
+	// (NULL); the ones 00005 seeds are owned by 'rail:<name>'.
 	payer := insertID(ctx, t, pool, `INSERT INTO accounts (owner, kind, currency) VALUES ('user-1', 'user', 'GBP') RETURNING id::text`)
 	payee := insertID(ctx, t, pool, `INSERT INTO accounts (owner, kind, currency) VALUES ('merchant-1', 'merchant', 'GBP') RETURNING id::text`)
 	insertID(ctx, t, pool, `INSERT INTO accounts (kind, currency) VALUES ('clearing', 'GBP') RETURNING id::text`)
@@ -213,6 +279,17 @@ func TestSchemaConstraints(t *testing.T) {
 	mustExec(ctx, t, pool,
 		`INSERT INTO idempotency_keys (key, request_hash, status, response_code, response_body) VALUES ('key-done', $1, 'completed', 201, $2)`,
 		hash(32), []byte(`{"id":"p1"}`))
+
+	// 00005 accepts as well as rejects: without these, a CHECK or index with
+	// a typo that blocks everything would pass the rejection cases below.
+	// Another kind may share a rail-shaped owner (the unique index is partial
+	// on kind = 'clearing'), and both rails are valid on a payment.
+	mustExec(ctx, t, pool, `INSERT INTO accounts (owner, kind, currency) VALUES ('rail:internal', 'merchant', 'GBP')`)
+	for _, railName := range []string{"internal", "fake"} {
+		mustExec(ctx, t, pool,
+			`INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail) VALUES ($1, $2, 100, 'GBP', $3)`,
+			payer, payee, railName)
+	}
 
 	var state string
 	if err := pool.QueryRow(ctx, `SELECT state FROM payments WHERE id = $1`, payment).Scan(&state); err != nil {
@@ -242,6 +319,8 @@ func TestSchemaConstraints(t *testing.T) {
 		{"account bad kind", `INSERT INTO accounts (kind, currency) VALUES ('bank', 'GBP')`, nil, checkViolation},
 		{"account non-GBP", `INSERT INTO accounts (kind, currency) VALUES ('user', 'USD')`, nil, checkViolation},
 		{"account no kind", `INSERT INTO accounts (currency) VALUES ('GBP')`, nil, notNullViolation},
+		// 00005: one clearing account per owner; other kinds may share one.
+		{"account second clearing for a rail", `INSERT INTO accounts (owner, kind, currency) VALUES ('rail:internal', 'clearing', 'GBP')`, nil, uniqueViolation},
 
 		// payments
 		{"payment zero amount", `INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail) VALUES ($1, $2, 0, 'GBP', 'internal')`, []any{payer, payee}, checkViolation},
@@ -249,6 +328,8 @@ func TestSchemaConstraints(t *testing.T) {
 		{"payment non-GBP", `INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail) VALUES ($1, $2, 100, 'EUR', 'internal')`, []any{payer, payee}, checkViolation},
 		{"payment bad state", `INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail, state) VALUES ($1, $2, 100, 'GBP', 'internal', 'pending')`, []any{payer, payee}, checkViolation},
 		{"payment no rail", `INSERT INTO payments (payer_account_id, payee_account_id, amount, currency) VALUES ($1, $2, 100, 'GBP')`, []any{payer, payee}, notNullViolation},
+		// 00005: only the rails that exist (rail.InternalName, rail.FakeName).
+		{"payment unknown rail", `INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail) VALUES ($1, $2, 100, 'GBP', 'stripe')`, []any{payer, payee}, checkViolation},
 		{"payment dangling payer", `INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail) VALUES ($1, $2, 100, 'GBP', 'internal')`, []any{missing, payee}, foreignKeyViolation},
 		{"payment to itself", `INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail) VALUES ($1, $1, 100, 'GBP', 'internal')`, []any{payer}, checkViolation},
 		{"payment dangling payee", `INSERT INTO payments (payer_account_id, payee_account_id, amount, currency, rail) VALUES ($1, $2, 100, 'GBP', 'internal')`, []any{payer, missing}, foreignKeyViolation},

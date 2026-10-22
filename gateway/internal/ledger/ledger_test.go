@@ -344,6 +344,105 @@ func TestPostRefRejectsBadReference(t *testing.T) {
 	}
 }
 
+// Migration 00005 seeds one clearing account per rail; ClearingAccount finds
+// each by its 'rail:<name>' owner and fails, naming the rail, for a rail that
+// has none.
+func TestClearingAccount(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	ctx := t.Context()
+
+	internal, err := ClearingAccount(ctx, pool, "internal")
+	if err != nil || internal == (ClearingAccountID{}) {
+		t.Fatalf("ClearingAccount(internal) = %v, %v; want the seeded account", internal, err)
+	}
+	fake, err := ClearingAccount(ctx, pool, "fake")
+	if err != nil || fake == (ClearingAccountID{}) || fake == internal {
+		t.Fatalf("ClearingAccount(fake) = %v, %v; want a second, distinct account (internal is %v)", fake, err, internal)
+	}
+
+	// A non-clearing account with a rail-shaped owner doesn't count: the
+	// lookup is by kind as well as owner.
+	if _, err := pool.Exec(ctx, "INSERT INTO accounts (owner, kind, currency) VALUES ('rail:stripe', 'merchant', 'GBP')"); err != nil {
+		t.Fatalf("insert merchant account: %v", err)
+	}
+	// A rail whose seeded account is gone fails the same way (what a missing
+	// migration or a hand-deleted row looks like to the service at startup).
+	if _, err := pool.Exec(ctx, "DELETE FROM accounts WHERE owner = 'rail:fake'"); err != nil {
+		t.Fatalf("delete fake clearing account: %v", err)
+	}
+	for _, railName := range []string{"stripe", "fake"} {
+		_, err := ClearingAccount(ctx, pool, railName)
+		if !errors.Is(err, ErrNoClearingAccount) {
+			t.Errorf("ClearingAccount(%s) = %v, want ErrNoClearingAccount", railName, err)
+			continue
+		}
+		// The error is what an operator sees when the service refuses to
+		// start, so it must say which rail and which account is missing.
+		if msg := err.Error(); !strings.Contains(msg, `"`+railName+`"`) || !strings.Contains(msg, `"rail:`+railName+`"`) {
+			t.Errorf("error %q doesn't name rail %q and owner rail:%s", msg, railName, railName)
+		}
+		// A missing account is a configuration error, never the transient
+		// kind a caller would retry.
+		if errors.Is(err, ErrClearingLookup) {
+			t.Errorf("ClearingAccount(%s) = %v, also matches ErrClearingLookup", railName, err)
+		}
+	}
+}
+
+// failingRow is a pgx.Row whose Scan fails with err.
+type failingRow struct{ err error }
+
+func (r failingRow) Scan(...any) error { return r.err }
+
+// failingQuerier is a Querier whose every query fails with err.
+type failingQuerier struct{ err error }
+
+func (q failingQuerier) QueryRow(context.Context, string, ...any) pgx.Row { return failingRow(q) }
+
+// When the lookup itself fails, ClearingAccount returns ErrClearingLookup,
+// not ErrNoClearingAccount, so a caller at startup retries instead of exiting;
+// and its text carries none of the driver's error (which names host, user
+// and database for a connection failure), while errors.Is/As still reach it.
+func TestClearingAccountLookupFailure(t *testing.T) {
+	t.Parallel()
+	// Shaped like a pgconn connect error: the detail that must not be printed.
+	cause := errors.New(`failed to connect to host=db.internal.example user=strata database=strata: dial error`)
+
+	_, err := ClearingAccount(t.Context(), failingQuerier{cause}, "internal")
+	if !errors.Is(err, ErrClearingLookup) {
+		t.Fatalf("ClearingAccount on a failing database = %v, want ErrClearingLookup", err)
+	}
+	if errors.Is(err, ErrNoClearingAccount) {
+		t.Errorf("ClearingAccount on a failing database = %v, also matches ErrNoClearingAccount (a config error)", err)
+	}
+	if !errors.Is(err, cause) {
+		t.Errorf("ClearingAccount's error doesn't unwrap to the database error")
+	}
+	if msg := err.Error(); msg != ErrClearingLookup.Error() {
+		t.Errorf("error text = %q, want only %q (no driver detail)", msg, ErrClearingLookup.Error())
+	}
+}
+
+// The case a fresh `make dev` stack hits before `make migrate`: the database
+// answers but has no accounts table. That is the transient kind too.
+func TestClearingAccountBeforeMigration(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	ctx := t.Context()
+	if _, err := pool.Exec(ctx, "DROP TABLE accounts CASCADE"); err != nil {
+		t.Fatalf("drop accounts: %v", err)
+	}
+	_, err := ClearingAccount(ctx, pool, "internal")
+	if !errors.Is(err, ErrClearingLookup) || errors.Is(err, ErrNoClearingAccount) {
+		t.Fatalf("ClearingAccount without an accounts table = %v, want ErrClearingLookup only", err)
+	}
+	// PostgreSQL's text here is `relation "accounts" does not exist`.
+	if strings.Contains(err.Error(), "does not exist") {
+		t.Errorf("error text %q carries the database's message", err.Error())
+	}
+}
+
 // fixture is a payer, a payee and a payment between them.
 type fixture struct {
 	payer, payee, payment uuid.UUID

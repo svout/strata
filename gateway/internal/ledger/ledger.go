@@ -184,8 +184,68 @@ func validate(paymentID uuid.UUID, entries []Entry) error {
 	return nil
 }
 
-// Querier is what Balance and Posted need; *pgxpool.Pool, *pgx.Conn and pgx.Tx all
-// satisfy it.
+// ClearingAccountID is the id of a rail's clearing account. It is a type of
+// its own, not a bare uuid.UUID, so that the code wiring a rail (cmd/gateway)
+// can't pass a payer or payee account where a clearing account belongs: the
+// constructors that need one take this type, and only ClearingAccount makes
+// one. Convert with uuid.UUID(id) where a ledger Entry needs it.
+type ClearingAccountID uuid.UUID
+
+// The two ways ClearingAccount fails, which a caller at startup must treat
+// differently (SPEC-002/10a-ii-b):
+//
+//   - ErrNoClearingAccount: the database answered and the rail has no
+//     clearing account. A configuration error: refuse to start.
+//   - ErrClearingLookup: the lookup itself failed (database unreachable,
+//     accounts table not there yet, any other database error). Usually
+//     transient, e.g. a fresh stack before `make migrate`: retry.
+var (
+	ErrNoClearingAccount = errors.New("ledger: no clearing account for rail")
+	ErrClearingLookup    = errors.New("ledger: clearing account lookup failed")
+)
+
+// lookupError is ErrClearingLookup carrying the database error as its cause.
+// Error() is only the fixed text: this lookup is the gateway's first real
+// connection, so the driver's error is the one that names host, user and
+// database (a bad DSN, the server down), and it would be printed when the
+// gateway refuses to start. Wrapping it with %w would put that text inside
+// Error(). The cause stays reachable through Unwrap for errors.Is/As.
+type lookupError struct{ cause error }
+
+func (e *lookupError) Error() string        { return ErrClearingLookup.Error() }
+func (e *lookupError) Unwrap() error        { return e.cause }
+func (e *lookupError) Is(target error) bool { return target == ErrClearingLookup }
+
+// ClearingAccount returns the id of railName's clearing account, the account
+// with kind = 'clearing' and owner = 'rail:<railName>' (ADR-123). railName
+// must be a registered adapter's Name() (rail.InternalName, rail.FakeName),
+// never request input: it is put in ErrNoClearingAccount's text.
+//
+// Call it once, at startup, and pass the id to what needs it: read inside a
+// settlement's SERIALIZABLE transaction it would add a predicate lock on
+// accounts to every settlement. Errors: see ErrNoClearingAccount and
+// ErrClearingLookup.
+//
+// It lives here rather than in payments or rail because ledger owns the
+// accounts SQL (ADR-117): both payments (the payer_<id> posting) and the
+// internal rail (the pay_<id> posting) need the id.
+func ClearingAccount(ctx context.Context, q Querier, railName string) (ClearingAccountID, error) {
+	owner := "rail:" + railName
+	var id pgtype.UUID
+	err := q.QueryRow(ctx, "SELECT id FROM accounts WHERE kind = 'clearing' AND owner = $1", owner).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// railName is a registered adapter's constant (see above), so it
+		// and the owner are safe in an error that gets logged.
+		return ClearingAccountID{}, fmt.Errorf("%w %q (no account with kind 'clearing' and owner %q)", ErrNoClearingAccount, railName, owner)
+	}
+	if err != nil {
+		return ClearingAccountID{}, &lookupError{cause: err}
+	}
+	return ClearingAccountID(id.Bytes), nil
+}
+
+// Querier is what Balance, Posted and ClearingAccount need; *pgxpool.Pool,
+// *pgx.Conn and pgx.Tx all satisfy it.
 type Querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }

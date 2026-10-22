@@ -212,7 +212,9 @@ func TestSerializableReturnsOtherErrorsAtOnceAndRollsBack(t *testing.T) {
 func countAccounts(ctx context.Context, t *testing.T, pool *pgxpool.Pool) int {
 	t.Helper()
 	var n int
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM accounts").Scan(&n); err != nil {
+	// Only the accounts these tests insert (no owner): migration 00005 seeds
+	// one clearing account per rail, and those have an owner.
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM accounts WHERE owner IS NULL").Scan(&n); err != nil {
 		t.Fatalf("count accounts: %v", err)
 	}
 	return n

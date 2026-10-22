@@ -33,8 +33,7 @@ import (
 // Metrics: latencies are nearest-rank percentiles in ms. Counters are per
 // request: non201/req and 503/req; commits/req and rollbacks/req are
 // PostgreSQL transactions in the run's database from pg_stat_database
-// (rollbacks are the serialization retries the Redis lock is meant to shed;
-// both include the warm-up and a few bookkeeping transactions: the counter
+// (rollbacks are serialization retries; both include the warm-up and a few bookkeeping transactions: the counter
 // reads and the payment count);
 // degraded/req is the share of Redis-mode requests that ran without the lock.
 
@@ -132,6 +131,56 @@ func BenchmarkCreatePaymentContended(b *testing.B) {
 	}
 }
 
+// BenchmarkCreatePaymentConcurrentSettled sends k concurrent requests per
+// iteration, each with its own key. Unlike BenchmarkCreatePaymentContended
+// (k duplicates of one key, one settlement) this is k settlements at once.
+// ns/op is per batch of k requests.
+//
+// It is the "before" for SPEC-002/10a-ii-a. Every bench payment already
+// shares one payer and one payee, so a shared hot account is present here
+// too; what 10a-ii-a changes is a second ledger.PostRef inside the
+// SERIALIZABLE settling -> settled transaction, and the internal rail
+// posting to clearing:internal. The before/after difference measures that
+// change, not a new shared account.
+//
+// Hypothesis under test: the ledger is append-only (no balance column), so
+// shared accounts add no row contention. That does not rule out
+// serialization failures: every transaction here is SERIALIZABLE, and SSI
+// predicate locks on index ranges can make unrelated payments conflict.
+// rollbacks/req is where either would show. A request runs several
+// transactions (create, transitions, the rail's posting) and a rollback may
+// come from any of them, so only the differences between the rail variants
+// attribute it: none is the create path alone (payments stay created), fake
+// adds the settlement transitions, internal adds the ledger posting.
+//
+// PostgreSQL mode only: the Redis lock is per key, so with distinct keys it
+// adds a fixed cost and no contention. The test pool has 8 connections, so
+// database concurrency is capped at 8: k = 16 adds pool wait, not more
+// contention.
+func BenchmarkCreatePaymentConcurrentSettled(b *testing.B) {
+	rails := append([]struct {
+		name    string
+		newRail railFor
+	}{{"none", nil}}, settleRails...)
+	for _, k := range []int{8, 16} {
+		for _, rl := range rails {
+			b.Run("k="+strconv.Itoa(k)+"/"+rl.name+"/postgres", func(b *testing.B) {
+				r := newBenchRun(b, nil, rl.newRail)
+				r.spread(b, "bench-warmup", k) // dials up to k connections outside the timer
+				var batchLat, reqLat []time.Duration
+				for b.Loop() {
+					start := time.Now()
+					reqLat = append(reqLat, r.spread(b, "bench-"+strconv.Itoa(len(batchLat)), k)...)
+					batchLat = append(batchLat, time.Since(start))
+				}
+				r.finish(b, (len(batchLat)+1)*k) // k payments per batch, warm-up included
+				reportLatency(b, "batch-", batchLat)
+				reportLatency(b, "req-", reqLat)
+			})
+		}
+	}
+}
+
 // benchRun is one benchmark run's API and outcome counts.
 type benchRun struct {
 	a       *testAPI
@@ -203,6 +252,24 @@ func (r *benchRun) batch(b *testing.B, key string, k int) []time.Duration {
 	}
 	if first < 0 {
 		b.Fatalf("batch %s: no request got 201 (codes %v)", key, codes)
+	}
+	return lat
+}
+
+// spread sends k concurrent creates with distinct keys (prefix-0 …
+// prefix-(k-1)) and returns their latencies. Every request must get 201:
+// there is nothing to deduplicate, so anything else is a failure.
+func (r *benchRun) spread(b *testing.B, prefix string, k int) []time.Duration {
+	codes, lat := make([]int, k), make([]time.Duration, k)
+	var wg sync.WaitGroup
+	for j := range k {
+		wg.Go(func() { codes[j], _, lat[j] = r.post(prefix + "-" + strconv.Itoa(j)) })
+	}
+	wg.Wait()
+	for j, c := range codes {
+		if c != http.StatusCreated {
+			b.Fatalf("spread %s: request %d got %d, want 201 (codes %v)", prefix, j, c, codes)
+		}
 	}
 	return lat
 }
