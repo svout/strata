@@ -70,15 +70,18 @@ func BenchmarkCreatePayment(b *testing.B) {
 }
 
 // settleRails are the rails BenchmarkCreatePaymentSettled compares with the
-// no-rail baseline. The fake answers in memory with no I/O, so fake minus
-// the baseline is what the settlement machinery costs (the outbox
-// transition, the call, the settled write); internal minus fake is what the
-// internal rail's own posting transaction costs.
+// no-rail baseline. Since 10a-ii-c the fake keeps its records in
+// PostgreSQL, so each new settle costs it two round trips on the pool (read
+// the reference, insert the outcome): fake minus the baseline is the
+// settlement machinery (the outbox transition, the call, the settled write)
+// plus those two statements, no longer the machinery alone. Internal minus
+// fake is what the internal rail's posting transaction costs over the fake's
+// two statements.
 var settleRails = []struct {
 	name    string
 	newRail railFor
 }{
-	{"fake", func(testing.TB, *pgxpool.Pool) rail.Adapter { return rail.NewFake() }},
+	{"fake", func(_ testing.TB, pool *pgxpool.Pool) rail.Adapter { return rail.NewFake(pool) }},
 	{"internal", internalRail},
 }
 

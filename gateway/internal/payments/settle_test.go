@@ -92,7 +92,7 @@ func TestSettle_FakeOutcomesAndRecovery(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			pool := testutil.Postgres(t)
-			fake := rail.NewFake(tc.step)
+			fake := rail.NewFake(pool, tc.step)
 			svc, _ := newSettleService(t, pool, fake)
 			svc.settleTimeout = 100 * time.Millisecond
 			res := createFor(t, svc, "k", newAccount(t.Context(), t, pool), newAccount(t.Context(), t, pool))
@@ -103,7 +103,7 @@ func TestSettle_FakeOutcomesAndRecovery(t *testing.T) {
 			assertState(t, svc, res.PaymentID, tc.afterCreate, reason)
 
 			if tc.resolve != "" {
-				if err := fake.Resolve(rail.Ref(res.PaymentID), tc.resolve, ""); err != nil {
+				if err := fake.Resolve(t.Context(), rail.Ref(res.PaymentID), tc.resolve, ""); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -114,7 +114,7 @@ func TestSettle_FakeOutcomesAndRecovery(t *testing.T) {
 				t.Fatalf("Recover: %v", err)
 			}
 			assertState(t, svc, res.PaymentID, tc.afterRecover, tc.reason)
-			if n := fake.Moves(rail.Ref(res.PaymentID)); n != tc.moves {
+			if n := fakeMoves(t, fake, res.PaymentID); n != tc.moves {
 				t.Fatalf("money moved %d times, want %d", n, tc.moves)
 			}
 			// ADR-123 on an external rail: the gateway's ledger holds only
@@ -132,13 +132,89 @@ func TestSettle_FakeOutcomesAndRecovery(t *testing.T) {
 	}
 }
 
+// SPEC-002 10a-ii-c: a lost response survives a full restart, the gateway's
+// and the fake's. The first fake applies the settle and loses the answer, so
+// the payment is left settling; then a new Service *and a new Fake* on the
+// same database recover it. The new fake must know the reference from the
+// table (Status says Settled), so recovery records it without settling
+// again: money moved once. With an in-memory fake this would re-settle
+// (Status: unknown reference) and the ledger's unique constraint would hide
+// the second payment.
+func TestRecover_FakeRestartAfterLostResponse(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	before, _ := newSettleService(t, pool, rail.NewFake(pool, rail.Step{LoseResponse: true}))
+	payer, payee := newAccount(t.Context(), t, pool), newAccount(t.Context(), t, pool)
+	res := createFor(t, before, "k", payer, payee)
+	assertState(t, before, res.PaymentID, Settling, nil)
+
+	restartedRail := &hookRail{Adapter: rail.NewFake(pool)}
+	after, _ := newSettleService(t, pool, restartedRail)
+	if st, err := after.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover = %+v, %v", st, err)
+	}
+	assertState(t, after, res.PaymentID, Settled, nil)
+	if n := restartedRail.settles.Load(); n != 0 {
+		t.Fatalf("restarted fake's Settle called %d times, want 0 (Status knew the reference)", n)
+	}
+	if n := fakeMoves(t, restartedRail.Adapter.(*rail.Fake), res.PaymentID); n != 1 {
+		t.Fatalf("money moved %d times, want 1", n)
+	}
+	// ADR-123 on an external rail: only the payer's posting is in the
+	// gateway's ledger (payer -> clearing:fake), once.
+	if n := ledgerEntries(t, pool, res.PaymentID); n != 2 {
+		t.Fatalf("ledger entries = %d, want 2 (the payer posting)", n)
+	}
+	assertBalances(t, pool, map[uuid.UUID]int64{payer: -1250, uuid.UUID(clearingFor(t, pool, rail.FakeName)): 1250})
+}
+
+// wire.go, option (a) (Ivan, 2026-10-25): a fake gateway on a database at
+// version 5 starts, but fake_rail_operations isn't there. Every fake Settle
+// is then rail.ErrFakeStore, an unknown outcome: the payment stays settling
+// with nothing posted, recovery retries it, and once 00006 is applied the
+// next pass settles it, once. Renaming the table away stands for "not
+// migrated yet", and renaming it back for `make migrate`.
+func TestRecover_FakeTableMissingThenMigrated(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	if _, err := pool.Exec(t.Context(), "ALTER TABLE fake_rail_operations RENAME TO fake_rail_operations_later"); err != nil {
+		t.Fatal(err)
+	}
+	fake := rail.NewFake(pool)
+	svc, _ := newSettleService(t, pool, fake)
+	payer, payee := newAccount(t.Context(), t, pool), newAccount(t.Context(), t, pool)
+	res := createFor(t, svc, "k", payer, payee)
+	assertState(t, svc, res.PaymentID, Settling, nil)
+	if _, err := svc.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover without the table = %v", err)
+	}
+	assertState(t, svc, res.PaymentID, Settling, nil)
+	if n := ledgerEntries(t, pool, res.PaymentID); n != 0 {
+		t.Fatalf("ledger entries without the fake's table = %d, want 0", n)
+	}
+
+	if _, err := pool.Exec(t.Context(), "ALTER TABLE fake_rail_operations_later RENAME TO fake_rail_operations"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover after the migration = %v", err)
+	}
+	assertState(t, svc, res.PaymentID, Settled, nil)
+	if n := fakeMoves(t, fake, res.PaymentID); n != 1 {
+		t.Fatalf("money moved %d times, want 1", n)
+	}
+	if n := ledgerEntries(t, pool, res.PaymentID); n != 2 {
+		t.Fatalf("ledger entries = %d, want 2 (the payer posting)", n)
+	}
+}
+
 // Decision 1 (Ivan, 2026-10-19): a request the rail rejects as invalid fails
 // the payment with its own reason, is logged at Error with the payment id as
 // text (AC8), and is never sent again, by recovery or anyone else.
 func TestSettle_InvalidRequestFailsOnceAndIsNotRetried(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
-	r := &hookRail{Adapter: rail.NewFake(rail.Step{Err: rail.ErrInvalidRequest})}
+	r := &hookRail{Adapter: rail.NewFake(pool, rail.Step{Err: rail.ErrInvalidRequest})}
 	svc, logs := newSettleService(t, pool, r)
 	res := createFor(t, svc, "k", newAccount(t.Context(), t, pool), newAccount(t.Context(), t, pool))
 	invalid := FailureInvalidRequest
@@ -248,7 +324,9 @@ func TestRecover_OwnRailOnly(t *testing.T) {
 		owner, recoverer func(t *testing.T, pool *pgxpool.Pool) rail.Adapter
 	}{
 		"fake payment, internal recovery": {
-			owner:     func(*testing.T, *pgxpool.Pool) rail.Adapter { return rail.NewFake(rail.Step{Outcome: rail.Pending}) },
+			owner: func(_ *testing.T, pool *pgxpool.Pool) rail.Adapter {
+				return rail.NewFake(pool, rail.Step{Outcome: rail.Pending})
+			},
 			recoverer: func(t *testing.T, pool *pgxpool.Pool) rail.Adapter { return internalRail(t, pool) },
 		},
 		"internal payment, fake recovery": {
@@ -256,7 +334,7 @@ func TestRecover_OwnRailOnly(t *testing.T) {
 			owner: func(t *testing.T, pool *pgxpool.Pool) rail.Adapter {
 				return &hookRail{Adapter: internalRail(t, pool), fail: context.DeadlineExceeded}
 			},
-			recoverer: func(*testing.T, *pgxpool.Pool) rail.Adapter { return rail.NewFake() },
+			recoverer: func(_ *testing.T, pool *pgxpool.Pool) rail.Adapter { return rail.NewFake(pool) },
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -318,7 +396,7 @@ func TestSettle_FirstWriterWins(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			pool := testutil.Postgres(t)
-			tc.r.Adapter = rail.NewFake()
+			tc.r.Adapter = rail.NewFake(pool)
 			svc, logs := newSettleService(t, pool, tc.r)
 			// The other writer: the payment is failed (declined) while the
 			// rail call is in progress.
@@ -349,7 +427,7 @@ func TestSettle_FirstWriterWins(t *testing.T) {
 func TestFinish_SecondSettleLosesOnTransitionNotLedger(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
-	svc, logs := newSettleService(t, pool, rail.NewFake())
+	svc, logs := newSettleService(t, pool, rail.NewFake(pool))
 	res := createFor(t, svc, "k", newAccount(t.Context(), t, pool), newAccount(t.Context(), t, pool))
 	assertState(t, svc, res.PaymentID, Settled, nil)
 	p, err := svc.Get(t.Context(), res.PaymentID)
@@ -391,7 +469,7 @@ func TestMarkSettled_PostingFailsAfterTransition(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			pool := testutil.Postgres(t)
-			svc, logs := newSettleService(t, pool, rail.NewFake())
+			svc, logs := newSettleService(t, pool, rail.NewFake(pool))
 			svc.clearing = ledger.ClearingAccountID(tc.clearing)
 			res := createFor(t, svc, "k", newAccount(t.Context(), t, pool), newAccount(t.Context(), t, pool))
 
@@ -424,7 +502,7 @@ func TestMarkSettled_CommitFailsAfterPosting(t *testing.T) {
 			EXECUTE FUNCTION test_refuse_settled();`); err != nil {
 		t.Fatal(err)
 	}
-	svc, logs := newSettleService(t, pool, rail.NewFake())
+	svc, logs := newSettleService(t, pool, rail.NewFake(pool))
 	res := createFor(t, svc, "k", newAccount(t.Context(), t, pool), newAccount(t.Context(), t, pool))
 
 	assertState(t, svc, res.PaymentID, Settling, nil)
@@ -446,7 +524,7 @@ func TestMarkSettled_CommitFailsAfterPosting(t *testing.T) {
 func TestProperty_SettledIffPayerPosting(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
-	fake := rail.NewFake()
+	fake := rail.NewFake(pool)
 	svc, _ := newSettleService(t, pool, fake)
 	// broken posts to a clearing account that doesn't exist: every
 	// settlement it records fails at the foreign key and must roll back.
@@ -475,7 +553,7 @@ func TestProperty_SettledIffPayerPosting(t *testing.T) {
 			},
 			"resolve pending": func(rt *rapid.T) {
 				// Errors (not pending) are expected and ignored.
-				_ = fake.Resolve(rail.Ref(pick(rt)), rapid.SampledFrom([]rail.Outcome{rail.Settled, rail.Declined}).Draw(rt, "outcome"), "")
+				_ = fake.Resolve(t.Context(), rail.Ref(pick(rt)), rapid.SampledFrom([]rail.Outcome{rail.Settled, rail.Declined}).Draw(rt, "outcome"), "")
 			},
 			"recover": func(rt *rapid.T) {
 				if _, err := rapid.SampledFrom(services).Draw(rt, "service").Recover(t.Context()); err != nil {
@@ -522,7 +600,7 @@ func TestProperty_SettledIffPayerPosting(t *testing.T) {
 func TestSettle_UnknownOutcomeLeavesSettling(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
-	svc, logs := newSettleService(t, pool, &hookRail{Adapter: rail.NewFake(), answer: &rail.Result{Outcome: "refunded"}})
+	svc, logs := newSettleService(t, pool, &hookRail{Adapter: rail.NewFake(pool), answer: &rail.Result{Outcome: "refunded"}})
 	res := createFor(t, svc, "k", newAccount(t.Context(), t, pool), newAccount(t.Context(), t, pool))
 	assertState(t, svc, res.PaymentID, Settling, nil)
 	if !strings.Contains(logs.String(), `"level":"ERROR","msg":"rail returned an unknown outcome`) {
@@ -540,7 +618,7 @@ func TestRecover_GraceLeavesInFlightSettleAlone(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			pool := testutil.Postgres(t)
-			fake := rail.NewFake(rail.Step{Delay: 300 * time.Millisecond})
+			fake := rail.NewFake(pool, rail.Step{Delay: 300 * time.Millisecond})
 			started := make(chan struct{})
 			live := &hookRail{Adapter: fake, onSettle: func(rail.Request) { close(started) }}
 			svc, _ := newSettleService(t, pool, live)
@@ -557,7 +635,7 @@ func TestRecover_GraceLeavesInFlightSettleAlone(t *testing.T) {
 			}
 			res := <-done
 			assertState(t, svc, res.PaymentID, Settled, nil)
-			if n := fake.Moves(rail.Ref(res.PaymentID)); n != 1 {
+			if n := fakeMoves(t, fake, res.PaymentID); n != 1 {
 				t.Fatalf("money moved %d times, want 1", n)
 			}
 			calls := pass.settles.Load() + pass.statuses.Load()
@@ -634,7 +712,7 @@ func TestListSettling_UsesSettlingIndex(t *testing.T) {
 func TestCreate_LockReleasedBeforeRailCall(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
-	fake := rail.NewFake(rail.Step{Delay: time.Second})
+	fake := rail.NewFake(pool, rail.Step{Delay: time.Second})
 	started := make(chan struct{})
 	r := &hookRail{Adapter: fake, onSettle: func(rail.Request) { close(started) }}
 	var logs syncBuffer
@@ -740,6 +818,16 @@ func ledgerEntries(t *testing.T, pool *pgxpool.Pool, id uuid.UUID) int {
 	t.Helper()
 	var n int
 	if err := pool.QueryRow(t.Context(), "SELECT count(*) FROM ledger_entries WHERE payment_id = $1", pgtype.UUID{Bytes: id, Valid: true}).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// fakeMoves is how many times fake moved money for payment id's reference.
+func fakeMoves(t *testing.T, fake *rail.Fake, id uuid.UUID) int {
+	t.Helper()
+	n, err := fake.Moves(t.Context(), rail.Ref(id))
+	if err != nil {
 		t.Fatal(err)
 	}
 	return n

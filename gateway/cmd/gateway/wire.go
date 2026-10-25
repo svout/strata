@@ -103,7 +103,18 @@ func wireSettlement(ctx context.Context, pool *pgxpool.Pool, allowFake bool, loc
 	}
 	var adapter rail.Adapter
 	if allowFake {
-		adapter = rail.NewFake()
+		// The fake keeps its records in fake_rail_operations (migration
+		// 00006). Startup only checks the version that seeds the clearing
+		// accounts (clearingSchemaVersion, 5), so a fake gateway on a
+		// database at version 5 wires and serves, and the table isn't there
+		// yet. Left that way on purpose (Ivan, 2026-10-25, option a): every
+		// fake Settle then fails with rail.ErrFakeStore, an unknown outcome,
+		// so the payment stays settling, nothing is posted, and Recover
+		// retries it every pass; once `make migrate` applies 00006 the next
+		// pass settles it, once. Nothing fails closed or double-pays, and
+		// the fake never runs in production, so a second startup gate just
+		// for the fake's table isn't worth its code.
+		adapter = rail.NewFake(pool)
 		log.LogAttrs(ctx, slog.LevelWarn, "fake rail registered: payments settle without moving real money (GATEWAY_ALLOW_FAKE_RAIL=1)")
 	} else {
 		adapter = rail.NewInternal(pool, id)

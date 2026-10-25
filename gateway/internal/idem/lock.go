@@ -3,6 +3,7 @@ package idem
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"log/slog"
 	randv2 "math/rand/v2"
 	"sync/atomic"
@@ -49,8 +50,8 @@ const (
 // so a holder whose lock expired can't delete the next holder's lock.
 var releaseScript = redis.NewScript(`if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) end return 0`)
 
-// RedisLocker is a Locker on one Redis key per Idempotency-Key: SET NX with a
-// random token, polled until it succeeds or the request's deadline ends.
+// RedisLocker is a Locker on one Redis key per Idempotency-Key: SET NX GET
+// with a random token, polled until it succeeds or the request's deadline ends.
 // When Redis fails, it fails open: Lock returns at once without a lock, logs
 // a Warn and counts it in Degraded, and the request runs on PostgreSQL alone.
 type RedisLocker struct {
@@ -105,10 +106,25 @@ func (l *RedisLocker) Lock(ctx context.Context, key Key) (func(), error) {
 	}
 }
 
+// tryLock is SET NX GET (Redis 7.0+; an older server rejects NX with GET, so
+// every Lock would fail open, never closed), not SETNX. go-redis retries a command
+// whose connection dropped, and if Redis had applied the first SET, the retry
+// finds our own token. SETNX would report that as "held" and the request would
+// poll its own lock until its deadline: a Redis error failing closed, which
+// ADR-119 rules out. GET returns the value the key held, so our own token
+// counts as acquired. On a free key Redis sets it and replies nil (redis.Nil).
 func (l *RedisLocker) tryLock(ctx context.Context, name, token string) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, redisCallTimeout)
 	defer cancel()
-	return l.rdb.SetNX(ctx, name, token, lockTTL).Result()
+	prev, err := l.rdb.SetArgs(ctx, name, token, redis.SetArgs{Mode: "NX", TTL: lockTTL, Get: true}).Result()
+	switch {
+	case errors.Is(err, redis.Nil):
+		return true, nil
+	case err != nil:
+		return false, err
+	default:
+		return prev == token, nil
+	}
 }
 
 // release runs even if the request's context has ended, so a timed-out

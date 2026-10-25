@@ -22,7 +22,7 @@ import (
 	"github.com/svout/strata/gateway/internal/testutil"
 )
 
-var schemaTables = []string{"accounts", "payments", "ledger_entries", "idempotency_keys"}
+var schemaTables = []string{"accounts", "payments", "ledger_entries", "idempotency_keys", "fake_rail_operations"}
 
 // schemaRelations is every table and index the migrations create; to_regclass
 // (tableExists) finds indexes as well as tables.
@@ -45,8 +45,8 @@ func TestUpAppliesSchema(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT max(version_id) FROM goose_db_version").Scan(&version); err != nil {
 		t.Fatalf("read goose version: %v", err)
 	}
-	if version != 5 {
-		t.Errorf("schema version = %d, want 5", version)
+	if version != 6 {
+		t.Errorf("schema version = %d, want 6", version)
 	}
 	var indexdef string
 	if err := pool.QueryRow(ctx, "SELECT indexdef FROM pg_indexes WHERE indexname = 'idempotency_keys_created_at_idx'").Scan(&indexdef); err != nil || !strings.HasSuffix(indexdef, "(created_at)") {
@@ -98,7 +98,7 @@ func TestDownRemovesSchemaAndUpRestoresIt(t *testing.T) {
 }
 
 // SchemaVersion reads goose's version without migrating anything: the
-// highest version recorded (5 after Up, 4 once that row is gone), and 0
+// highest version recorded (6 after Up, 4 once the rows above it are gone), and 0
 // with no version table, which it must not create (the gateway calls it and
 // never migrates).
 func TestSchemaVersion(t *testing.T) {
@@ -113,10 +113,10 @@ func TestSchemaVersion(t *testing.T) {
 			t.Errorf("SchemaVersion = %d, %v; want %d", got, err, want)
 		}
 	}
-	read(5)
+	read(6)
 	// A database migrated to 4 only, as the gateway's startup sees it before
 	// 00005: the version is the highest row.
-	mustExec(ctx, t, pool, "DELETE FROM goose_db_version WHERE version_id = 5")
+	mustExec(ctx, t, pool, "DELETE FROM goose_db_version WHERE version_id >= 5")
 	read(4)
 	mustExec(ctx, t, pool, "DROP TABLE goose_db_version")
 	read(0)
@@ -147,7 +147,9 @@ func TestSchemaVersion_UnreachableHidesDSN(t *testing.T) {
 
 // Down past 00005 refuses to discard postings: once a ledger entry
 // references a seeded clearing account, deleting it fails on the foreign key
-// and the migration rolls back, leaving the schema at version 5.
+// and the migration rolls back, leaving the schema at version 5. (Down runs
+// newest first, so 00006 has already been rolled back by then; only 00005's
+// own transaction is undone.)
 func TestDownKeepsClearingAccountsWithEntries(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
@@ -355,6 +357,14 @@ func TestSchemaConstraints(t *testing.T) {
 			 VALUES ($1, $2, 1250, 'GBP', 'internal', 'failed', $3) RETURNING id::text`, payer, payee, reason)
 	}
 
+	// 00006: the fake PSP's records. Each outcome is accepted, with a reason
+	// exactly when declined, and a 255-character reference is the upper
+	// bound, so a CHECK that blocked everything fails here.
+	mustExec(ctx, t, pool,
+		`INSERT INTO fake_rail_operations (ref, outcome, reason, moves) VALUES
+		 ('pay_settled', 'settled', NULL, 1), ('pay_pending', 'pending', NULL, 0), ('pay_declined', 'declined', 'insufficient_funds', 0), ($1, 'settled', NULL, 1)`,
+		strings.Repeat("r", 255))
+
 	const missing = "00000000-0000-0000-0000-000000000000" // no row has this id
 
 	tests := []struct {
@@ -394,6 +404,19 @@ func TestSchemaConstraints(t *testing.T) {
 		{"entry no direction", `INSERT INTO ledger_entries (payment_id, account_id, amount) VALUES ($1, $2, 100)`, []any{payment, payer}, notNullViolation},
 		{"entry dangling payment", `INSERT INTO ledger_entries (payment_id, account_id, direction, amount) VALUES ($1, $2, 'debit', 100)`, []any{missing, payer}, foreignKeyViolation},
 		{"entry dangling account", `INSERT INTO ledger_entries (payment_id, account_id, direction, amount) VALUES ($1, $2, 'debit', 100)`, []any{payment, missing}, foreignKeyViolation},
+
+		// fake_rail_operations (00006)
+		{"fake op duplicate ref", `INSERT INTO fake_rail_operations (ref, outcome, moves) VALUES ('pay_settled', 'settled', 1)`, nil, uniqueViolation},
+		{"fake op empty ref", `INSERT INTO fake_rail_operations (ref, outcome, moves) VALUES ('', 'settled', 1)`, nil, checkViolation},
+		{"fake op ref too long", `INSERT INTO fake_rail_operations (ref, outcome, moves) VALUES ($1, 'settled', 1)`, []any{strings.Repeat("r", 256)}, checkViolation},
+		{"fake op bad outcome", `INSERT INTO fake_rail_operations (ref, outcome, moves) VALUES ('pay_x1', 'refunded', 0)`, nil, checkViolation},
+		{"fake op declined without reason", `INSERT INTO fake_rail_operations (ref, outcome, moves) VALUES ('pay_x2', 'declined', 0)`, nil, checkViolation},
+		{"fake op settled with reason", `INSERT INTO fake_rail_operations (ref, outcome, reason, moves) VALUES ('pay_x3', 'settled', 'declined', 1)`, nil, checkViolation},
+		{"fake op empty reason", `INSERT INTO fake_rail_operations (ref, outcome, reason, moves) VALUES ('pay_x4', 'declined', '', 0)`, nil, checkViolation},
+		{"fake op negative moves", `INSERT INTO fake_rail_operations (ref, outcome, moves) VALUES ('pay_x5', 'settled', -1)`, nil, checkViolation},
+		{"fake op no moves", `INSERT INTO fake_rail_operations (ref, outcome) VALUES ('pay_x6', 'settled')`, nil, notNullViolation},
+		{"fake op no outcome", `INSERT INTO fake_rail_operations (ref, moves) VALUES ('pay_x7', 0)`, nil, notNullViolation},
+		{"fake op resolve keeps reason", `UPDATE fake_rail_operations SET outcome = 'settled' WHERE ref = 'pay_declined'`, nil, checkViolation},
 
 		// idempotency_keys
 		{"idempotency duplicate scope+key", `INSERT INTO idempotency_keys (key, request_hash, status) VALUES ('key-1', $1, 'in_progress')`, []any{hash(32)}, uniqueViolation},
