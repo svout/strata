@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/svout/strata/gateway/internal/store"
@@ -211,6 +212,164 @@ func TestClaim_ExpiredKeyRace(t *testing.T) {
 	if err != nil || !found || string(got.Body) != `{"new":true}` {
 		t.Fatalf("second claim = %s, found %v, %v; want the first claim's fresh response", got.Body, found, err)
 	}
+}
+
+// SPEC-002 Q11-i. CHARACTERISATION TEST: it pins down current, unwanted
+// behaviour as evidence for the Q11 fix; it is not a property the code
+// promises. Q11-ii must update or retire it (its scope says so): a fix to
+// claim's read-first or to the key design is expected to break the
+// conflict = true rows below.
+//
+// Finding: claim's read-first SELECT on a key that isn't there takes an SSI
+// predicate lock on the primary-key btree, not on the key: on the leaf page
+// it searched, or on the whole index while the index is empty (a btree with
+// no rows has no leaf page to lock). Two creates on distinct keys whose
+// searches lock the same page each insert into what the other read, and one
+// gets 40001. So adjacent keys conflict even in a large table, keys on
+// different leaf pages don't, and on an empty table every pair does. The
+// same mechanism made ledger.Posted roll back ~0.8 times per settle inside
+// the transaction (ADR-120 §4 clarification).
+//
+// It drives raw pgx transactions on purpose: store.Serializable would retry
+// the 40001 away, and seeing it is the point.
+func TestClaim_DistinctKeysConflictOnSharedPage(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		prefill  bool // 100k keys first, so the index has many leaf pages
+		k1, k2   string
+		conflict bool
+	}{
+		// An empty table's index has no leaf page yet: the search locks the
+		// whole index (relation lock), so every pair conflicts.
+		{"empty/adjacent", false, "k-1", "k-2", true},
+		{"empty/distant", false, "0000", "ffff", true},
+		// Prefilled keys are md5 hex (hex only, so the order is the same in
+		// any collation). The adjacent pair has no prefilled key between
+		// them, so they share a leaf; "0000" and "ffff" sort to opposite ends
+		// of the index.
+		{"prefilled/adjacent", true, "80000000000000000000000000000001", "80000000000000000000000000000002", true},
+		{"prefilled/distant", true, "0000", "ffff", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pool := testutil.Postgres(t)
+			ctx := t.Context()
+			if tc.prefill {
+				prefillKeys(t, pool, 100_000)
+			}
+			logPlan(t, pool)
+
+			// Interleave as concurrent requests do: both read "no row" before
+			// either inserts, then both claim, then both commit. Claim reads
+			// and inserts in one call, so a read is issued on its own first:
+			// a primary-key lookup like claim's, which takes the same
+			// predicate lock (the page searched, or the index while empty). Without it tx1 inserts before
+			// tx2 reads, which gives one rw-dependency (tx1 -> tx2) and no
+			// cycle; SSI only aborts on two, one in each direction. The 40001
+			// can come at either insert or at a commit.
+			h := Hash(base)
+			txs := make([]pgx.Tx, 2)
+			errs := make([]error, 2)
+			for i := range txs {
+				tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // no-op after commit
+				txs[i] = tx
+			}
+			keys := []string{tc.k1, tc.k2}
+			for i, k := range keys {
+				var n int
+				if err := txs[i].QueryRow(ctx, "SELECT count(*) FROM idempotency_keys WHERE scope = '' AND key = $1", k).Scan(&n); err != nil || n != 0 {
+					t.Fatalf("tx %d read: %d rows, %v", i+1, n, err)
+				}
+			}
+			for i, k := range keys {
+				_, _, errs[i] = Claim(ctx, txs[i], Key{Value: k}, h)
+			}
+			logSIReadLocks(t, pool) // both transactions still open
+			for i := range txs {
+				if errs[i] == nil {
+					errs[i] = txs[i].Commit(ctx)
+				}
+			}
+
+			failed := 0
+			for i, err := range errs {
+				switch {
+				case err == nil:
+				case isSerializationFailure(err):
+					failed++
+				default:
+					t.Fatalf("tx %d: %v, want nil or 40001", i+1, err)
+				}
+			}
+			t.Logf("errors: tx1 %v; tx2 %v", errs[0], errs[1])
+			if got := failed == 1; got != tc.conflict || failed > 1 {
+				t.Fatalf("%d of 2 got 40001, want conflict = %v (exactly one)", failed, tc.conflict)
+			}
+		})
+	}
+}
+
+// prefillKeys inserts n completed keys spread over the md5 hex key space,
+// then ANALYZEs so the planner sees a large table.
+func prefillKeys(t *testing.T, pool *pgxpool.Pool, n int) {
+	t.Helper()
+	ctx := t.Context()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO idempotency_keys (key, request_hash, status, response_code, response_body)
+		SELECT md5(i::text), sha256(i::text::bytea), 'completed', 201, '{}'
+		FROM generate_series(1, $1) AS i`, n); err != nil {
+		t.Fatalf("prefill: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "ANALYZE idempotency_keys"); err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+}
+
+// logPlan logs the claim SELECT's plan: an index scan locks leaf pages, a
+// sequential scan locks the whole relation.
+func logPlan(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	rows, err := pool.Query(t.Context(), `
+		EXPLAIN SELECT request_hash FROM idempotency_keys WHERE scope = '' AND key = 'k-plan'`)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	lines, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	t.Logf("claim plan: %s", strings.Join(lines, " | "))
+}
+
+// logSIReadLocks logs this database's SSI predicate locks by granularity and
+// relation. pg_locks is cluster-wide and parallel tests share the server,
+// hence the database filter.
+func logSIReadLocks(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	rows, err := pool.Query(t.Context(), `
+		SELECT locktype || ' ' || relation::regclass::text || ' x' || count(*)
+		FROM pg_locks
+		WHERE mode = 'SIReadLock'
+		  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+		GROUP BY locktype, relation ORDER BY 1`)
+	if err != nil {
+		t.Fatalf("pg_locks: %v", err)
+	}
+	locks, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatalf("pg_locks: %v", err)
+	}
+	t.Logf("SIRead locks: %s", strings.Join(locks, "; "))
+}
+
+func isSerializationFailure(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "40001"
 }
 
 // Complete only completes the request that was claimed.
