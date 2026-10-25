@@ -2,7 +2,12 @@ package payments
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net/http"
 	"slices"
@@ -11,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
@@ -184,6 +190,231 @@ func BenchmarkCreatePaymentConcurrentSettled(b *testing.B) {
 	}
 }
 
+// BenchmarkCreatePaymentConcurrentKeys is SPEC-002 Q11-i: why do k = 8
+// concurrent creates on distinct keys roll back ~0.97 times per request
+// (BenchmarkCreatePaymentConcurrentSettled, rail none)? Hypothesis: claim's
+// read-first SELECT takes an SSI predicate lock on the primary-key btree page
+// it searched (on the whole index while the index is empty), so creates whose
+// keys share a leaf page conflict. TestClaim_DistinctKeysConflictOnSharedPage
+// shows the mechanism with two transactions; this measures how much of the
+// rollback rate it explains. The same mechanism was seen once before, on
+// ledger.Posted inside the settle transaction (ADR-120 §4 clarification).
+// Two axes, no rail, PostgreSQL only, k = 8 (the pool cap):
+//   - keys: seq is the existing bench-N-j (consecutive, so every batch
+//     appends at the index's rightmost leaf); random is 32 hex characters
+//     per request.
+//   - table: empty is a fresh database as before; prefilled first inserts
+//     100k completed keys spread over the same hex space, so the index has
+//     hundreds of leaf pages for random keys to scatter across.
+//
+// Expected if the hypothesis holds: seq stays high whatever the table size;
+// random/prefilled falls to near zero; random/empty lies in between and
+// DEPENDS ON -benchtime. The empty table grows during the run (k rows per
+// batch), so random keys share one leaf page at first and scatter over more
+// as the index splits: measured ~0.95 rollbacks/req at 20 batches, ~0.45 at
+// 200. Quote a random/empty figure only with its batch count.
+//
+// siread-*-max are the most SIRead locks of each granularity seen at once in
+// pg_locks, sampled every 5 ms on a separate connection; siread-samples and
+// siread-failed say how far to trust them (a failed sample is not a zero).
+// The sampler perturbs the run: its transactions are counted in commits/req
+// (about 200 per second of run time), and reading SIRead entries in pg_locks
+// takes the predicate-lock manager's locks, which the requests need too. So
+// this benchmark's latencies are not comparable with ConcurrentSettled's;
+// compare rollbacks/req, which the sampler doesn't add to.
+func BenchmarkCreatePaymentConcurrentKeys(b *testing.B) {
+	const k = 8
+	keyings := []struct {
+		name string
+		keys func(batch int) []string
+	}{
+		{"seq", func(batch int) []string {
+			keys := make([]string, k)
+			for j := range k {
+				keys[j] = "bench-" + strconv.Itoa(batch) + "-" + strconv.Itoa(j)
+			}
+			return keys
+		}},
+		{"random", func(int) []string {
+			keys := make([]string, k)
+			for j := range k {
+				var buf [16]byte
+				rand.Read(buf[:]) // never fails (crypto/rand, Go 1.24+)
+				keys[j] = hex.EncodeToString(buf[:])
+			}
+			return keys
+		}},
+	}
+	for _, keying := range keyings {
+		for _, prefill := range []bool{false, true} {
+			table := "empty"
+			if prefill {
+				table = "prefilled"
+			}
+			b.Run(keying.name+"/"+table+"/postgres", func(b *testing.B) {
+				r := newBenchRun(b, nil, nil)
+				if prefill {
+					r.prefillKeys(b, 100_000)
+				}
+				r.spreadKeys(b, keying.keys(-1)) // warm-up: dials up to k connections outside the timer
+				stop := sampleSIRead(b, r.a.pool)
+				var batchLat, reqLat []time.Duration
+				for b.Loop() {
+					start := time.Now()
+					reqLat = append(reqLat, r.spreadKeys(b, keying.keys(len(batchLat)))...)
+					batchLat = append(batchLat, time.Since(start))
+				}
+				stop() // the sampler's commits must stop before finish reads pg_stat_database
+				r.finish(b, (len(batchLat)+1)*k)
+				reportLatency(b, "batch-", batchLat)
+				reportLatency(b, "req-", reqLat)
+			})
+		}
+	}
+}
+
+// prefillKeys inserts n completed idempotency keys (md5 hex, spread evenly
+// over the key space), ANALYZEs the table, and re-takes the counter
+// snapshot so the prefill isn't counted. It writes idempotency_keys from the
+// payments package: a bench fixture, not production SQL (ADR-117 governs the
+// latter; http_test.go reads the table the same way).
+func (r *benchRun) prefillKeys(b *testing.B, n int) {
+	b.Helper()
+	ctx := b.Context()
+	if _, err := r.a.pool.Exec(ctx, `
+		INSERT INTO idempotency_keys (key, request_hash, status, response_code, response_body)
+		SELECT md5(i::text), sha256(i::text::bytea), 'completed', 201, '{}'
+		FROM generate_series(1, $1) AS i`, n); err != nil {
+		b.Fatalf("prefill: %v", err)
+	}
+	if _, err := r.a.pool.Exec(ctx, "ANALYZE idempotency_keys"); err != nil {
+		b.Fatalf("analyze: %v", err)
+	}
+	time.Sleep(1500 * time.Millisecond) // as in newBenchRun: let the statistics land
+	r.before = settledCounters(b, r.a.pool, r.dbName)
+}
+
+// sampleSIRead polls pg_locks for this database's SIRead locks every 5 ms
+// on its own one-connection pool (so it never takes a connection the
+// requests need) until the returned stop is called. stop reports the maximum
+// count seen per granularity, how many samples were taken and failed, and
+// logs the relations involved.
+//
+// A sample that fails is skipped, not fatal, but never silent: a broken
+// sampler would report siread-*-max = 0, which reads exactly like "no
+// locks". So stop fails the run if no sample succeeded or more than 5%
+// failed, and warns on any failure.
+func sampleSIRead(b *testing.B, pool *pgxpool.Pool) (stop func()) {
+	b.Helper()
+	cfg := pool.Config()
+	cfg.MaxConns = 1
+	sp, err := pgxpool.NewWithConfig(b.Context(), cfg)
+	if err != nil {
+		b.Fatalf("sampler pool: %v", err)
+	}
+	maxBy := map[string]int{}      // locktype -> max count at once
+	relations := map[string]bool{} // "locktype relation" seen
+	var samples, failed int
+	var lastErr string // errKind of the last failure, never the error text
+	done, finished := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(finished)
+		tick := time.NewTicker(5 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+			}
+			samples++
+			now, err := siReadSample(sp, relations)
+			if err != nil {
+				failed++
+				lastErr = errKind(err)
+				continue
+			}
+			for lt, n := range now {
+				maxBy[lt] = max(maxBy[lt], n)
+			}
+		}
+	}()
+	// Teardown runs from stop or, if the run fails first (b.Fatalf inside
+	// b.Loop skips stop), from Cleanup: a leaked sampler would keep polling
+	// pg_locks and perturb every benchmark after it.
+	var once sync.Once
+	teardown := func() {
+		once.Do(func() {
+			close(done)
+			<-finished
+			sp.Close()
+		})
+	}
+	b.Cleanup(teardown)
+	return func() {
+		teardown()
+		for _, lt := range []string{"tuple", "page", "relation"} {
+			b.ReportMetric(float64(maxBy[lt]), "siread-"+lt+"-max")
+		}
+		b.ReportMetric(float64(samples), "siread-samples")
+		b.ReportMetric(float64(failed), "siread-failed")
+		b.Logf("SIRead locks seen on: %v", slices.Sorted(maps.Keys(relations)))
+		switch {
+		case samples == failed:
+			b.Fatalf("SIRead sampler: none of %d samples succeeded (last error: %s); siread-*-max are meaningless", samples, lastErr)
+		case failed*20 > samples:
+			b.Errorf("SIRead sampler: %d of %d samples failed (last error: %s); siread-*-max undercount", failed, samples, lastErr)
+		case failed > 0:
+			b.Logf("WARNING: SIRead sampler: %d of %d samples failed (last error: %s); siread-*-max may undercount", failed, samples, lastErr)
+		}
+	}
+}
+
+// errKind names a sampler error without its text: a connection error's text
+// carries host, user and database name, and bench output feeds the Baseline
+// note (SPEC-002 Q10: log excerpts may reach a dissertation appendix).
+func errKind(err error) string {
+	var pgErr *pgconn.PgError
+	switch {
+	case errors.As(err, &pgErr):
+		return "SQLSTATE " + pgErr.Code
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline exceeded"
+	default:
+		return fmt.Sprintf("%T", err)
+	}
+}
+
+// siReadSample reads this database's SIRead lock counts by granularity, and
+// adds each "locktype relation" seen to relations. The query has its own
+// deadline (gateway/CLAUDE.md: no blocking I/O without one), so a hung
+// sample can't block stop.
+func siReadSample(sp *pgxpool.Pool, relations map[string]bool) (map[string]int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	rows, err := sp.Query(ctx, `
+		SELECT locktype, coalesce(relation::regclass::text, ''), count(*)
+		FROM pg_locks
+		WHERE mode = 'SIReadLock'
+		  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+		GROUP BY 1, 2`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	now := map[string]int{}
+	for rows.Next() {
+		var locktype, rel string
+		var n int
+		if err := rows.Scan(&locktype, &rel, &n); err != nil {
+			return nil, err
+		}
+		now[locktype] += n
+		relations[locktype+" "+rel] = true
+	}
+	return now, rows.Err()
+}
+
 // benchRun is one benchmark run's API and outcome counts.
 type benchRun struct {
 	a       *testAPI
@@ -260,18 +491,28 @@ func (r *benchRun) batch(b *testing.B, key string, k int) []time.Duration {
 }
 
 // spread sends k concurrent creates with distinct keys (prefix-0 …
-// prefix-(k-1)) and returns their latencies. Every request must get 201:
-// there is nothing to deduplicate, so anything else is a failure.
+// prefix-(k-1)) and returns their latencies.
 func (r *benchRun) spread(b *testing.B, prefix string, k int) []time.Duration {
-	codes, lat := make([]int, k), make([]time.Duration, k)
-	var wg sync.WaitGroup
+	keys := make([]string, k)
 	for j := range k {
-		wg.Go(func() { codes[j], _, lat[j] = r.post(prefix + "-" + strconv.Itoa(j)) })
+		keys[j] = prefix + "-" + strconv.Itoa(j)
+	}
+	return r.spreadKeys(b, keys)
+}
+
+// spreadKeys sends one concurrent create per key and returns their
+// latencies. Every request must get 201: the keys are distinct, so there is
+// nothing to deduplicate and anything else is a failure.
+func (r *benchRun) spreadKeys(b *testing.B, keys []string) []time.Duration {
+	codes, lat := make([]int, len(keys)), make([]time.Duration, len(keys))
+	var wg sync.WaitGroup
+	for j, key := range keys {
+		wg.Go(func() { codes[j], _, lat[j] = r.post(key) })
 	}
 	wg.Wait()
 	for j, c := range codes {
 		if c != http.StatusCreated {
-			b.Fatalf("spread %s: request %d got %d, want 201 (codes %v)", prefix, j, c, codes)
+			b.Fatalf("spread %s: request %d got %d, want 201 (codes %v)", keys[0], j, c, codes)
 		}
 	}
 	return lat
