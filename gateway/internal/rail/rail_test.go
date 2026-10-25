@@ -46,12 +46,7 @@ func TestInternal_Contract(t *testing.T) {
 			// The id is looked up while the database is reachable, as
 			// cmd/gateway does at startup; then the database goes away.
 			clearing := clearingAccount(t, pool)
-			closed, err := pgxpool.NewWithConfig(t.Context(), pool.Config())
-			if err != nil {
-				t.Fatal(err)
-			}
-			closed.Close()
-			return rail.NewInternal(closed, clearing), newPaymentRequest(t, pool)
+			return rail.NewInternal(closedPool(t, pool), clearing), newPaymentRequest(t, pool)
 		},
 	})
 }
@@ -144,20 +139,20 @@ func TestInternal_ConcurrentDifferentPayments(t *testing.T) {
 	}
 }
 
-// AC6: the fake PSP passes the contract, including declines, pending and a
-// lost response. It has no transport to cut, so the unreachable test skips;
-// a Step's Err is its failure before acting (TestFake_ErrorBeforeApplying).
+// AC6: the fake PSP passes the contract, including declines, pending, a
+// lost response and, now that it keeps its records in PostgreSQL
+// (10a-ii-c), an unreachable store: the fake on a closed pool. A Step's Err
+// is its other failure before acting (TestFake_ErrorBeforeApplying).
 func TestFake_Contract(t *testing.T) {
 	t.Parallel()
-	var current *rail.Fake // subtests run one at a time
+	pool := testutil.Postgres(t)
 	fake := func(a rail.Adapter) *rail.Fake { return a.(*rail.Fake) }
 	railtest.Run(t, railtest.Harness{
-		New: func(*testing.T) rail.Adapter {
-			current = rail.NewFake()
-			return current
-		},
+		New:     func(*testing.T) rail.Adapter { return rail.NewFake(pool) },
 		Request: func(*testing.T) rail.Request { return fakeRequest() },
-		Effects: func(_ *testing.T, ref string) int { return current.Moves(ref) },
+		// Any fake on the pool reads the same table, so effects are counted
+		// from the database, not from the adapter under test.
+		Effects: func(t *testing.T, ref string) int { return moves(t, pool, ref) },
 		Decline: func(_ *testing.T, a rail.Adapter) rail.Request {
 			fake(a).Push(rail.Step{Outcome: rail.Declined, Reason: "insufficient_funds"})
 			return fakeRequest()
@@ -167,7 +162,7 @@ func TestFake_Contract(t *testing.T) {
 			return fakeRequest()
 		},
 		Resolve: func(t *testing.T, a rail.Adapter, ref string, outcome rail.Outcome) {
-			if err := fake(a).Resolve(ref, outcome, ""); err != nil {
+			if err := fake(a).Resolve(t.Context(), ref, outcome, ""); err != nil {
 				t.Fatal(err)
 			}
 		},
@@ -175,7 +170,151 @@ func TestFake_Contract(t *testing.T) {
 			fake(a).Push(rail.Step{LoseResponse: true})
 			return fakeRequest()
 		},
+		Unreachable: func(t *testing.T, _ rail.Adapter) (rail.Adapter, rail.Request) {
+			return rail.NewFake(closedPool(t, pool)), fakeRequest()
+		},
 	})
+}
+
+// The point of 10a-ii-c: a new Fake on the same database (a restarted
+// gateway) knows every reference the old one recorded. Settled, declined and
+// pending survive; a repeat Settle returns the stored outcome without taking
+// a step of the new script and without moving money again; a pending
+// operation can still be resolved after the restart.
+func TestFake_SurvivesRestart(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	before := rail.NewFake(pool, rail.Step{}, rail.Step{Outcome: rail.Declined, Reason: "insufficient_funds"}, rail.Step{Outcome: rail.Pending})
+	settled, declined, pending := fakeRequest(), fakeRequest(), fakeRequest()
+	want := map[string]rail.Result{
+		settled.Ref:  {Outcome: rail.Settled},
+		declined.Ref: {Outcome: rail.Declined, Reason: "insufficient_funds"},
+		pending.Ref:  {Outcome: rail.Pending},
+	}
+	for _, req := range []rail.Request{settled, declined, pending} {
+		if res, err := before.Settle(t.Context(), req); err != nil || res != want[req.Ref] {
+			t.Fatalf("Settle before the restart = %+v, %v; want %+v", res, err, want[req.Ref])
+		}
+	}
+
+	// The restarted fake's script would decline anything new: if a repeat
+	// took a step, it would come back declined with reason "new step".
+	after := rail.NewFake(pool, rail.Step{Outcome: rail.Declined, Reason: "new step"})
+	for _, req := range []rail.Request{settled, declined, pending} {
+		if res, err := after.Status(t.Context(), req.Ref); err != nil || res != want[req.Ref] {
+			t.Errorf("Status after the restart = %+v, %v; want %+v", res, err, want[req.Ref])
+		}
+		if res, err := after.Settle(t.Context(), req); err != nil || res != want[req.Ref] {
+			t.Errorf("repeat Settle after the restart = %+v, %v; want the stored %+v", res, err, want[req.Ref])
+		}
+	}
+	if n := moves(t, pool, settled.Ref); n != 1 {
+		t.Errorf("moves for the settled reference = %d after a repeat on the restarted fake, want 1", n)
+	}
+	if err := after.Resolve(t.Context(), pending.Ref, rail.Settled, ""); err != nil {
+		t.Fatalf("Resolve after the restart = %v", err)
+	}
+	if res, err := before.Status(t.Context(), pending.Ref); err != nil || res.Outcome != rail.Settled || moves(t, pool, pending.Ref) != 1 {
+		t.Errorf("resolved pending = %+v, %v (moves %d); want Settled, moved once", res, err, moves(t, pool, pending.Ref))
+	}
+	// The new script's step is still there for a reference nobody has seen.
+	if res, err := after.Settle(t.Context(), fakeRequest()); err != nil || res.Reason != "new step" {
+		t.Errorf("first new reference after the restart = %+v, %v; want the new script's step", res, err)
+	}
+}
+
+// Two gateways on one database (or a restart racing the old process) settle
+// the same reference at once: one row, the first writer's outcome for every
+// caller, and money moved at most once. Each Fake shares in-flight calls
+// only within itself, so this is the database's ON CONFLICT doing the work.
+// The steps are delayed so that both fakes read "no record" before either
+// inserts. With different outcomes, a loser that reported its own outcome
+// instead of the stored one would be caught.
+func TestFake_ConcurrentFakesOneRef(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	const delay = 50 * time.Millisecond
+	for name, steps := range map[string][2]rail.Step{
+		"same outcome":       {{Delay: delay}, {Delay: delay}},
+		"different outcomes": {{Delay: delay}, {Delay: delay, Outcome: rail.Declined, Reason: "second_fake"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fakes := []*rail.Fake{rail.NewFake(pool, steps[0]), rail.NewFake(pool, steps[1])}
+			req := fakeRequest()
+			const n = 16
+			results := make([]rail.Result, n)
+			errs := make([]error, n)
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			for i := range n {
+				wg.Go(func() {
+					<-start
+					results[i], errs[i] = fakes[i%2].Settle(t.Context(), req)
+				})
+			}
+			close(start)
+			wg.Wait()
+
+			stored, err := fakes[0].Status(t.Context(), req.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := range n {
+				if errs[i] != nil || results[i] != stored {
+					t.Errorf("Settle %d (fake %d) = %+v, %v; want the stored %+v", i, i%2, results[i], errs[i], stored)
+				}
+			}
+			var rows int
+			if err := pool.QueryRow(t.Context(), "SELECT count(*) FROM fake_rail_operations WHERE ref = $1", req.Ref).Scan(&rows); err != nil || rows != 1 {
+				t.Errorf("rows for the reference = %d (%v), want 1", rows, err)
+			}
+			wantMoves := 0
+			if stored.Outcome == rail.Settled {
+				wantMoves = 1
+			}
+			if got := moves(t, pool, req.Ref); got != wantMoves {
+				t.Errorf("moves = %d for stored %+v, want %d", got, stored, wantMoves)
+			}
+		})
+	}
+}
+
+// AC8: an unreachable store gives ErrFakeStore whose text is fixed, with
+// nothing from the DSN in it; the driver's error stays reachable through
+// Unwrap. Settle, Status, Resolve and Moves all go through the same mapping.
+func TestFake_StoreErrorHidesDSN(t *testing.T) {
+	t.Parallel()
+	pool, err := pgxpool.New(t.Context(), "postgres://leakuser:leakpass@127.0.0.1:1/leakdb?connect_timeout=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	f := rail.NewFake(pool)
+	req := fakeRequest()
+	_, settleErr := f.Settle(t.Context(), req)
+	_, statusErr := f.Status(t.Context(), req.Ref)
+	resolveErr := f.Resolve(t.Context(), req.Ref, rail.Settled, "")
+	_, movesErr := f.Moves(t.Context(), req.Ref)
+	for name, err := range map[string]error{"Settle": settleErr, "Status": statusErr, "Resolve": resolveErr, "Moves": movesErr} {
+		if !errors.Is(err, rail.ErrFakeStore) {
+			t.Errorf("%s = %v, want ErrFakeStore", name, err)
+			continue
+		}
+		// The exact-text check is the real guard. The substring checks name
+		// what the driver's connect error does contain (user, database,
+		// host), so a failure says what leaked; pgx never prints the password.
+		if err.Error() != rail.ErrFakeStore.Error() {
+			t.Errorf("%s error text = %q, want only %q", name, err, rail.ErrFakeStore)
+		}
+		for _, leak := range []string{"leakuser", "leakdb", "127.0.0.1"} {
+			if strings.Contains(err.Error(), leak) {
+				t.Errorf("%s error text %q contains %q", name, err, leak)
+			}
+		}
+		if errors.Unwrap(err) == nil {
+			t.Errorf("%s: the driver error isn't reachable through Unwrap", name)
+		}
+	}
 }
 
 // A delay shorter than the deadline settles; a longer one returns the
@@ -183,7 +322,8 @@ func TestFake_Contract(t *testing.T) {
 // settles once.
 func TestFake_DelayAndTimeout(t *testing.T) {
 	t.Parallel()
-	f := rail.NewFake(rail.Step{Delay: 5 * time.Millisecond}, rail.Step{Delay: time.Second})
+	pool := testutil.Postgres(t)
+	f := rail.NewFake(pool, rail.Step{Delay: 5 * time.Millisecond}, rail.Step{Delay: time.Second})
 	ctx := func() context.Context {
 		c, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 		t.Cleanup(cancel)
@@ -199,7 +339,7 @@ func TestFake_DelayAndTimeout(t *testing.T) {
 	if _, err := f.Status(t.Context(), slow.Ref); !errors.Is(err, rail.ErrUnknownRef) {
 		t.Fatalf("Status after timeout = %v, want ErrUnknownRef (nothing applied)", err)
 	}
-	if res, err := f.Settle(t.Context(), slow); err != nil || res.Outcome != rail.Settled || f.Moves(slow.Ref) != 1 {
+	if res, err := f.Settle(t.Context(), slow); err != nil || res.Outcome != rail.Settled || moves(t, pool, slow.Ref) != 1 {
 		t.Fatalf("retry = %+v, %v; want Settled once", res, err)
 	}
 }
@@ -208,7 +348,7 @@ func TestFake_DelayAndTimeout(t *testing.T) {
 func TestFake_ErrorBeforeApplying(t *testing.T) {
 	t.Parallel()
 	boom := errors.New("connection reset")
-	f := rail.NewFake(rail.Step{Err: boom})
+	f := rail.NewFake(testutil.Postgres(t), rail.Step{Err: boom})
 	req := fakeRequest()
 	if _, err := f.Settle(t.Context(), req); !errors.Is(err, boom) {
 		t.Fatalf("Settle = %v, want the scripted error", err)
@@ -222,7 +362,7 @@ func TestFake_ErrorBeforeApplying(t *testing.T) {
 // decline always carries a reason.
 func TestFake_Resolve(t *testing.T) {
 	t.Parallel()
-	f := rail.NewFake(rail.Step{Outcome: rail.Pending}, rail.Step{Outcome: rail.Declined})
+	f := rail.NewFake(testutil.Postgres(t), rail.Step{Outcome: rail.Pending}, rail.Step{Outcome: rail.Declined})
 	pending, declined := fakeRequest(), fakeRequest()
 	for _, req := range []rail.Request{pending, declined} {
 		if _, err := f.Settle(t.Context(), req); err != nil {
@@ -232,13 +372,13 @@ func TestFake_Resolve(t *testing.T) {
 	if res, _ := f.Status(t.Context(), declined.Ref); res.Reason != rail.DefaultDeclineReason {
 		t.Fatalf("decline without a scripted reason = %+v, want reason %q", res, rail.DefaultDeclineReason)
 	}
-	if err := f.Resolve(pending.Ref, rail.Pending, ""); !errors.Is(err, rail.ErrInvalidRequest) {
+	if err := f.Resolve(t.Context(), pending.Ref, rail.Pending, ""); !errors.Is(err, rail.ErrInvalidRequest) {
 		t.Fatalf("Resolve to Pending = %v, want ErrInvalidRequest", err)
 	}
-	if err := f.Resolve(declined.Ref, rail.Settled, ""); !errors.Is(err, rail.ErrNotPending) {
+	if err := f.Resolve(t.Context(), declined.Ref, rail.Settled, ""); !errors.Is(err, rail.ErrNotPending) {
 		t.Fatalf("Resolve of a final outcome = %v, want ErrNotPending", err)
 	}
-	if err := f.Resolve("pay_unknown", rail.Settled, ""); !errors.Is(err, rail.ErrUnknownRef) {
+	if err := f.Resolve(t.Context(), "pay_unknown", rail.Settled, ""); !errors.Is(err, rail.ErrUnknownRef) {
 		t.Fatalf("Resolve of an unknown ref = %v, want ErrUnknownRef", err)
 	}
 }
@@ -248,7 +388,7 @@ func TestFake_Resolve(t *testing.T) {
 func TestFake_ScriptPlaysInOrder(t *testing.T) {
 	t.Parallel()
 	reset := errors.New("reset")
-	f := rail.NewFake(
+	f := rail.NewFake(testutil.Postgres(t),
 		rail.Step{Outcome: rail.Declined, Reason: "insufficient_funds"},
 		rail.Step{LoseResponse: true},
 		rail.Step{Outcome: rail.Pending},
@@ -287,7 +427,7 @@ func TestFake_ScriptPlaysInOrder(t *testing.T) {
 // the next step (review should 1, for the subtask 11 chaos runs).
 func TestFake_ConcurrentCallsShareOneStep(t *testing.T) {
 	t.Parallel()
-	f := rail.NewFake(
+	f := rail.NewFake(testutil.Postgres(t),
 		rail.Step{Delay: 20 * time.Millisecond, Outcome: rail.Declined, Reason: "first"},
 		rail.Step{Outcome: rail.Declined, Reason: "second"},
 	)
@@ -329,6 +469,29 @@ func TestRef_Deterministic(t *testing.T) {
 func fakeRequest() rail.Request {
 	id := uuid.New()
 	return rail.Request{PaymentID: id, Ref: rail.Ref(id), Amount: 1250, Currency: "GBP", Payer: uuid.New(), Payee: uuid.New()}
+}
+
+// moves reads how many times money moved for ref, through a Fake on pool
+// (they all read the same table).
+func moves(t *testing.T, pool *pgxpool.Pool, ref string) int {
+	t.Helper()
+	n, err := rail.NewFake(pool).Moves(t.Context(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// closedPool is a pool for the same database as pool, already closed: every
+// call on it fails before reaching the database.
+func closedPool(t *testing.T, pool *pgxpool.Pool) *pgxpool.Pool {
+	t.Helper()
+	closed, err := pgxpool.NewWithConfig(t.Context(), pool.Config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed.Close()
+	return closed
 }
 
 // newPaymentRequest creates two accounts and a payment between them, and

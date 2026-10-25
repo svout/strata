@@ -65,10 +65,11 @@ func exec(t *testing.T, pool *pgxpool.Pool, sql string) {
 }
 
 // atSchemaV4 makes a migrated test database look like one migrated to 4
-// only, as far as startup can tell: no clearing accounts, no version 5 row.
+// only, as far as startup can tell: no clearing accounts, no row for
+// version 5 or anything after it (startup reads the highest version).
 func atSchemaV4(t *testing.T, pool *pgxpool.Pool) {
 	exec(t, pool, "DELETE FROM accounts WHERE kind = 'clearing'")
-	exec(t, pool, "DELETE FROM goose_db_version WHERE version_id = 5")
+	exec(t, pool, "DELETE FROM goose_db_version WHERE version_id >= 5")
 }
 
 // migrateToV5 is `make migrate` for a database atSchemaV4 left behind. The
@@ -153,6 +154,9 @@ func TestResolveClearing_MigrationBetweenReadsDoesNotExit(t *testing.T) {
 func TestResolveClearing_SchemaV5MissingSeedExits(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
+	// Exactly version 5, the boundary (clearingSchemaVersion): the test
+	// database is migrated to the latest, so drop the rows above it.
+	exec(t, pool, "DELETE FROM goose_db_version WHERE version_id > 5")
 	exec(t, pool, "DELETE FROM accounts WHERE owner = 'rail:internal'")
 	log, logs := testLogger()
 
