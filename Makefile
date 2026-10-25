@@ -26,7 +26,7 @@ COMPOSE := docker compose -f infra/compose/compose.yml
 # must never echo it: it can hold a real password.
 DATABASE_URL ?= postgres://agentgate:agentgate@127.0.0.1:5432/agentgate?sslmode=disable
 
-.PHONY: help install-lint lint test bench dev dev-down dev-logs migrate export-docs check-docs
+.PHONY: help install-lint lint test test-cold bench dev dev-down dev-logs migrate export-docs check-docs
 
 help: ## List the make targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-13s %s\n", $$1, $$2}'
@@ -54,13 +54,29 @@ lint: ## Lint every scaffolded service
 	fi
 	@$(MAKE) --no-print-directory check-docs
 
-test: ## Run every scaffolded service's tests
-	@if [ -f gateway/go.mod ]; then echo "== gateway"; (cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) go test -race ./...); fi
+# `make test` keeps Go's test cache: it is the inner loop, and caching is what
+# makes it usable. The gates run `make test-cold` instead (/verify and CI), so
+# a cached pass can never reach a merge. That matters more here than usual:
+# the gateway tests depend on a live PostgreSQL and applied migrations, which
+# the cache can't see, so a cached PASS can be stale in a way it can't detect.
+#
+# Two different meanings of -count; don't collapse one into the other:
+#   -count=1         disables caching for this run (what test-cold adds)
+#   -race -count=5   repeats each test to shake out flakes (ad hoc, by hand)
+# Prefer -count=1 over `go clean -testcache`, which discards every cached
+# result, related or not, and makes the next inner-loop run slow.
+GO_TEST_FLAGS ?=
+
+test: ## Run every scaffolded service's tests (Go test cache allowed: inner loop)
+	@if [ -f gateway/go.mod ]; then echo "== gateway"; (cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) go test -race $(GO_TEST_FLAGS) ./...); fi
 	@for s in $(PY_SERVICES); do \
 	  if [ -f $$s/pyproject.toml ]; then echo "== $$s"; (cd $$s && uv run pytest) || [ $$? -eq 5 ]; fi; \
 	done
 	@if [ -f console/package.json ]; then echo "== console"; (cd console && pnpm install --frozen-lockfile && pnpm test); fi
 	@echo "== scripts"; python3 -m unittest discover -s scripts -p 'test_*.py'
+
+test-cold: ## Run every test with the Go test cache off (the gate: /verify and CI)
+	@$(MAKE) --no-print-directory test GO_TEST_FLAGS=-count=1
 
 # Baseline for P6, ADR-119's evidence (SPEC-002/8b-ii) and the before/after
 # for SPEC-002/10a-ii. Never under -race, not in CI (runners are too noisy).

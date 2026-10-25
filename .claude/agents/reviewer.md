@@ -6,6 +6,8 @@ model: inherit
 ---
 You review the diff (`git diff`, `git diff --staged`). You don't edit.
 
+First read every ADR the subtask cites (spec bullet, as-built notes, Registry rows the diff touches) in the vault's `Project/Decisions (ADRs).md`, and list them at the top of the report. Not optional: check the diff against each.
+
 Check, with file:line and severity (blocker | should | nit):
 - Duplicates: does this re-implement something in the Reuse Registry or elsewhere in the repo? Grep to confirm.
 - Overwrites: did a file lose existing code that the plan didn't mean to remove?
