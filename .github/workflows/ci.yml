@@ -15,8 +15,8 @@ concurrency:
 
 # Each language step runs only once that service has its project file,
 # so the workflow passes on the empty skeleton and tightens as code lands.
-# The jobs only install toolchains; `make lint` / `make test` are the entry
-# points, the same commands developers run locally (Reuse Registry).
+# The jobs only install toolchains; `make lint` / `make test-cold` are the
+# entry points, the same commands developers run locally (Reuse Registry).
 # The runner image is pinned like the toolchains (ADR-116): ubuntu-latest
 # moves to Ubuntu 26.04 on 2026-10-19, and an image change should be a
 # deliberate bump, not a surprise on an unrelated PR.
@@ -95,8 +95,10 @@ jobs:
           cache: pnpm
           cache-dependency-path: console/pnpm-lock.yaml
 
-      - name: Test (make test)
-        run: make test
+      # Explicitly uncached: today's cold runner cache is incidental, and if a
+      # cache were ever restored between runs a false green would merge.
+      - name: Test (make test-cold)
+        run: make test-cold
 
       - name: Summary
         if: always()
