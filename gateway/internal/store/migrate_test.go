@@ -4,8 +4,12 @@ package store_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"errors"
+	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -16,8 +20,10 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/pressly/goose/v3"
 	"github.com/pressly/goose/v3/lock"
 
+	"github.com/svout/strata/gateway/internal/idem"
 	"github.com/svout/strata/gateway/internal/store"
 	"github.com/svout/strata/gateway/internal/testutil"
 )
@@ -45,8 +51,18 @@ func TestUpAppliesSchema(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT max(version_id) FROM goose_db_version").Scan(&version); err != nil {
 		t.Fatalf("read goose version: %v", err)
 	}
-	if version != 6 {
-		t.Errorf("schema version = %d, want 6", version)
+	if version != 7 {
+		t.Errorf("schema version = %d, want 7", version)
+	}
+	// 00007: keyed by the hash, and the CHECK that ties the hash to the key.
+	for name, want := range map[string]string{
+		"idempotency_keys_pkey":             "PRIMARY KEY (key_hash)",
+		"idempotency_keys_key_hash_matches": "CHECK ((key_hash = sha256(",
+	} {
+		var def string
+		if err := pool.QueryRow(ctx, "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = $1", name).Scan(&def); err != nil || !strings.HasPrefix(def, want) {
+			t.Errorf("%s = %q (%v), want %s...", name, def, err, want)
+		}
 	}
 	var indexdef string
 	if err := pool.QueryRow(ctx, "SELECT indexdef FROM pg_indexes WHERE indexname = 'idempotency_keys_created_at_idx'").Scan(&indexdef); err != nil || !strings.HasSuffix(indexdef, "(created_at)") {
@@ -98,7 +114,7 @@ func TestDownRemovesSchemaAndUpRestoresIt(t *testing.T) {
 }
 
 // SchemaVersion reads goose's version without migrating anything: the
-// highest version recorded (6 after Up, 4 once the rows above it are gone), and 0
+// highest version recorded (7 after Up, 4 once the rows above it are gone), and 0
 // with no version table, which it must not create (the gateway calls it and
 // never migrates).
 func TestSchemaVersion(t *testing.T) {
@@ -113,7 +129,7 @@ func TestSchemaVersion(t *testing.T) {
 			t.Errorf("SchemaVersion = %d, %v; want %d", got, err, want)
 		}
 	}
-	read(6)
+	read(7)
 	// A database migrated to 4 only, as the gateway's startup sees it before
 	// 00005: the version is the highest row.
 	mustExec(ctx, t, pool, "DELETE FROM goose_db_version WHERE version_id >= 5")
@@ -148,8 +164,8 @@ func TestSchemaVersion_UnreachableHidesDSN(t *testing.T) {
 // Down past 00005 refuses to discard postings: once a ledger entry
 // references a seeded clearing account, deleting it fails on the foreign key
 // and the migration rolls back, leaving the schema at version 5. (Down runs
-// newest first, so 00006 has already been rolled back by then; only 00005's
-// own transaction is undone.)
+// newest first, so 00007 and 00006 have already been rolled back by then;
+// only 00005's own transaction is undone.)
 func TestDownKeepsClearingAccountsWithEntries(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
@@ -301,6 +317,59 @@ func TestUpWaitsForHeldLock(t *testing.T) {
 	}
 }
 
+// 00007's backfill gives rows written before it the hash that idem looks
+// keys up by: a completed key stored at version 6 is still found and
+// replayed after the migration, not claimed a second time. This is the
+// backfill-to-Go parity check; idem's TestKeyHash_MatchesSchemaCheck covers
+// new rows.
+//
+// It drives goose itself to stop at version 6, which store's API doesn't
+// offer (production only moves forward). It reads the same files from disk
+// (go test runs in the package directory) rather than adding a test-only
+// export of store's embedded FS.
+func TestMigration7BackfillsKeyHash(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	ctx := testContext(t)
+	db := sqlDB(t, pool)
+	p, err := goose.NewProvider(goose.DialectPostgres, db, os.DirFS("migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.DownTo(ctx, 6); err != nil {
+		t.Fatalf("down to 6: %v", err)
+	}
+	// 00007's Down restores the old key.
+	var pkey string
+	if err := pool.QueryRow(ctx, "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'idempotency_keys_pkey'").Scan(&pkey); err != nil || pkey != "PRIMARY KEY (scope, key)" {
+		t.Errorf("primary key at version 6 = %q (%v), want PRIMARY KEY (scope, key)", pkey, err)
+	}
+
+	keys := []idem.Key{{Value: "old-1"}, {Scope: "agent-a", Value: "old-1"}, {Scope: "agent-ü", Value: "ключ-€"}}
+	reqHash := idem.Hash(idem.Request{Method: "POST", Path: "/v1/payments", Body: []byte(`{}`)})
+	for i, k := range keys {
+		mustExec(ctx, t, pool,
+			`INSERT INTO idempotency_keys (scope, key, request_hash, status, response_code, response_body) VALUES ($1, $2, $3, 'completed', 201, $4)`,
+			k.Scope, k.Value, reqHash[:], fmt.Appendf(nil, `{"n":%d}`, i))
+	}
+	if err := store.Up(ctx, db); err != nil {
+		t.Fatalf("up to 7: %v", err)
+	}
+
+	for i, k := range keys {
+		var resp idem.Response
+		var found bool
+		err := store.Serializable(ctx, pool, func(tx pgx.Tx) error {
+			var err error
+			resp, found, err = idem.Claim(ctx, tx, k, reqHash)
+			return err
+		})
+		if want := fmt.Sprintf(`{"n":%d}`, i); err != nil || !found || string(resp.Body) != want {
+			t.Errorf("%+v after 00007: Claim = %s, found %v, %v; want the stored %s", k, resp.Body, found, err, want)
+		}
+	}
+}
+
 // TestSchemaConstraints inserts one valid row per table, then checks that each
 // kind of bad row is rejected by the database itself with the expected
 // SQLSTATE, independent of any Go validation added later.
@@ -321,14 +390,14 @@ func TestSchemaConstraints(t *testing.T) {
 		`INSERT INTO ledger_entries (payment_id, account_id, direction, amount) VALUES ($1, $2, 'debit', 1250), ($1, $3, 'credit', 1250)`,
 		payment, payer, payee)
 	mustExec(ctx, t, pool,
-		`INSERT INTO idempotency_keys (key, request_hash, status) VALUES ('key-1', $1, 'in_progress')`, hash(32))
+		`INSERT INTO idempotency_keys (key_hash, key, request_hash, status) VALUES ($1, 'key-1', $2, 'in_progress')`, keyHash("", "key-1"), hash(32))
 	// The same key under another scope is a different record (P2 per-agent scoping).
 	mustExec(ctx, t, pool,
-		`INSERT INTO idempotency_keys (scope, key, request_hash, status) VALUES ('agent-a', 'key-1', $1, 'in_progress')`, hash(32))
+		`INSERT INTO idempotency_keys (key_hash, scope, key, request_hash, status) VALUES ($1, 'agent-a', 'key-1', $2, 'in_progress')`, keyHash("agent-a", "key-1"), hash(32))
 	// A completed key carries the response to replay.
 	mustExec(ctx, t, pool,
-		`INSERT INTO idempotency_keys (key, request_hash, status, response_code, response_body) VALUES ('key-done', $1, 'completed', 201, $2)`,
-		hash(32), []byte(`{"id":"p1"}`))
+		`INSERT INTO idempotency_keys (key_hash, key, request_hash, status, response_code, response_body) VALUES ($1, 'key-done', $2, 'completed', 201, $3)`,
+		keyHash("", "key-done"), hash(32), []byte(`{"id":"p1"}`))
 
 	// 00005 accepts as well as rejects: without these, a CHECK or index with
 	// a typo that blocks everything would pass the rejection cases below.
@@ -418,16 +487,25 @@ func TestSchemaConstraints(t *testing.T) {
 		{"fake op no outcome", `INSERT INTO fake_rail_operations (ref, moves) VALUES ('pay_x7', 0)`, nil, notNullViolation},
 		{"fake op resolve keeps reason", `UPDATE fake_rail_operations SET outcome = 'settled' WHERE ref = 'pay_declined'`, nil, checkViolation},
 
-		// idempotency_keys
-		{"idempotency duplicate scope+key", `INSERT INTO idempotency_keys (key, request_hash, status) VALUES ('key-1', $1, 'in_progress')`, []any{hash(32)}, uniqueViolation},
-		{"idempotency empty key", `INSERT INTO idempotency_keys (key, request_hash, status) VALUES ('', $1, 'in_progress')`, []any{hash(32)}, checkViolation},
-		{"idempotency key too long", `INSERT INTO idempotency_keys (key, request_hash, status) VALUES ($1, $2, 'in_progress')`, []any{strings.Repeat("k", 256), hash(32)}, checkViolation},
-		{"idempotency short hash", `INSERT INTO idempotency_keys (key, request_hash, status) VALUES ('key-2', $1, 'in_progress')`, []any{hash(31)}, checkViolation},
-		{"idempotency bad status", `INSERT INTO idempotency_keys (key, request_hash, status) VALUES ('key-3', $1, 'done')`, []any{hash(32)}, checkViolation},
-		{"idempotency completed without response", `INSERT INTO idempotency_keys (key, request_hash, status) VALUES ('key-4', $1, 'completed')`, []any{hash(32)}, checkViolation},
-		{"idempotency in_progress with response", `INSERT INTO idempotency_keys (key, request_hash, status, response_code) VALUES ('key-5', $1, 'in_progress', 201)`, []any{hash(32)}, checkViolation},
-		{"idempotency response code 99", `INSERT INTO idempotency_keys (key, request_hash, status, response_code) VALUES ('key-6', $1, 'completed', 99)`, []any{hash(32)}, checkViolation},
-		{"idempotency response code 600", `INSERT INTO idempotency_keys (key, request_hash, status, response_code) VALUES ('key-7', $1, 'completed', 600)`, []any{hash(32)}, checkViolation},
+		// idempotency_keys. Each row carries its key's correct key_hash
+		// unless the case is about key_hash, so the constraint under test is
+		// the one that fires (NOT NULL is checked before any CHECK).
+		{"idempotency duplicate scope+key", `INSERT INTO idempotency_keys (key_hash, key, request_hash, status) VALUES ($1, 'key-1', $2, 'in_progress')`, []any{keyHash("", "key-1"), hash(32)}, uniqueViolation},
+		{"idempotency empty key", `INSERT INTO idempotency_keys (key_hash, key, request_hash, status) VALUES ($1, '', $2, 'in_progress')`, []any{keyHash("", ""), hash(32)}, checkViolation},
+		{"idempotency key too long", `INSERT INTO idempotency_keys (key_hash, key, request_hash, status) VALUES ($1, $2, $3, 'in_progress')`, []any{keyHash("", strings.Repeat("k", 256)), strings.Repeat("k", 256), hash(32)}, checkViolation},
+		{"idempotency short hash", `INSERT INTO idempotency_keys (key_hash, key, request_hash, status) VALUES ($1, 'key-2', $2, 'in_progress')`, []any{keyHash("", "key-2"), hash(31)}, checkViolation},
+		{"idempotency bad status", `INSERT INTO idempotency_keys (key_hash, key, request_hash, status) VALUES ($1, 'key-3', $2, 'done')`, []any{keyHash("", "key-3"), hash(32)}, checkViolation},
+		{"idempotency completed without response", `INSERT INTO idempotency_keys (key_hash, key, request_hash, status) VALUES ($1, 'key-4', $2, 'completed')`, []any{keyHash("", "key-4"), hash(32)}, checkViolation},
+		{"idempotency in_progress with response", `INSERT INTO idempotency_keys (key_hash, key, request_hash, status, response_code) VALUES ($1, 'key-5', $2, 'in_progress', 201)`, []any{keyHash("", "key-5"), hash(32)}, checkViolation},
+		{"idempotency response code 99", `INSERT INTO idempotency_keys (key_hash, key, request_hash, status, response_code) VALUES ($1, 'key-6', $2, 'completed', 99)`, []any{keyHash("", "key-6"), hash(32)}, checkViolation},
+		{"idempotency response code 600", `INSERT INTO idempotency_keys (key_hash, key, request_hash, status, response_code) VALUES ($1, 'key-7', $2, 'completed', 600)`, []any{keyHash("", "key-7"), hash(32)}, checkViolation},
+		// 00007: the hash must be present and must be the row's own key's.
+		{"idempotency no key_hash", `INSERT INTO idempotency_keys (key, request_hash, status) VALUES ('key-8', $1, 'in_progress')`, []any{hash(32)}, notNullViolation},
+		{"idempotency another key's hash", `INSERT INTO idempotency_keys (key_hash, key, request_hash, status) VALUES ($1, 'key-9', $2, 'in_progress')`, []any{keyHash("", "key-1x"), hash(32)}, checkViolation},
+		// The encoding without length prefixes, i.e. a drifted keyHash.
+		{"idempotency unprefixed hash", `INSERT INTO idempotency_keys (key_hash, key, request_hash, status) VALUES (sha256('key-10'::bytea), 'key-10', $1, 'in_progress')`, []any{hash(32)}, checkViolation},
+		// Same key, other scope: the scope is part of the hash.
+		{"idempotency hash of another scope", `INSERT INTO idempotency_keys (key_hash, scope, key, request_hash, status) VALUES ($1, 'agent-b', 'key-11', $2, 'in_progress')`, []any{keyHash("", "key-11"), hash(32)}, checkViolation},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -444,8 +522,8 @@ func TestSchemaConstraints(t *testing.T) {
 
 	// A 255-character key is the upper bound and must be accepted.
 	mustExec(ctx, t, pool,
-		`INSERT INTO idempotency_keys (key, request_hash, status) VALUES ($1, $2, 'in_progress')`,
-		strings.Repeat("k", 255), hash(32))
+		`INSERT INTO idempotency_keys (key_hash, key, request_hash, status) VALUES ($1, $2, $3, 'in_progress')`,
+		keyHash("", strings.Repeat("k", 255)), strings.Repeat("k", 255), hash(32))
 }
 
 func testContext(t *testing.T) context.Context {
@@ -504,3 +582,16 @@ func mustExec(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sql string,
 
 // hash returns n bytes standing in for a SHA-256 digest.
 func hash(n int) []byte { return make([]byte, n) }
+
+// keyHash is the key_hash 00007 requires for (scope, key): a test-side copy
+// of idem's unexported keyHash, so fixtures can insert rows by hand. The
+// table's CHECK verifies every row, so a wrong copy fails these tests rather
+// than passing silently.
+func keyHash(scope, key string) []byte {
+	h := sha256.New()
+	for _, f := range []string{scope, key} {
+		h.Write(binary.BigEndian.AppendUint64(nil, uint64(len(f))))
+		h.Write([]byte(f))
+	}
+	return h.Sum(nil)
+}

@@ -59,6 +59,37 @@ func (k Key) Digest() string {
 	return hex.EncodeToString(sum[:16])
 }
 
+// keyHash is the key's primary key in idempotency_keys (ADR-126): SHA-256
+// over scope then value, each length-prefixed as in Hash. Storing the key by
+// its hash spreads neighbouring keys over the index, so concurrent claims on
+// distinct keys stop sharing a btree page and conflicting under SSI
+// (SPEC-002 Q11).
+//
+// The table's idempotency_keys_key_hash_matches CHECK recomputes this in SQL
+// (migration 00007), and that CHECK is what keeps one row per key: if this
+// encoding ever changes, every insert fails with 23514 instead of creating a
+// second row for an existing key. Change it only with a migration that
+// rehashes the table and replaces the CHECK.
+//
+// It is not Digest: Digest is the Redis lock key and the value in logs
+// (ADR-119), and keeps its own, unrelated encoding.
+//
+// The length-prefix loop repeats Hash's on purpose. Only keyHash has a SQL
+// twin that must match it byte for byte (the CHECK, guarded by
+// TestKeyHash_MatchesSchemaCheck); Hash has none. A shared helper would let
+// a change made for Hash's sake silently change keyHash too, and every
+// insert would then fail the CHECK. Keep them separate.
+func keyHash(k Key) [32]byte {
+	h := sha256.New()
+	for _, f := range []string{k.Scope, k.Value} {
+		h.Write(binary.BigEndian.AppendUint64(nil, uint64(len(f))))
+		h.Write([]byte(f))
+	}
+	var sum [32]byte
+	copy(sum[:], h.Sum(nil))
+	return sum
+}
+
 // ErrMissingKey means the header is absent or longer than MaxKeyLen.
 var ErrMissingKey = errors.New("idem: Idempotency-Key header is missing or too long")
 
@@ -83,6 +114,10 @@ type Request struct {
 // reused by another caller or on another endpoint never matches (ADR-118).
 // Each field is length-prefixed, so no two different requests share an
 // encoding.
+//
+// Its loop looks like keyHash's but is deliberately not shared with it:
+// keyHash is pinned to a SQL CHECK (migration 00007), Hash is not, and a
+// shared helper would couple the two (see keyHash).
 func Hash(r Request) [32]byte {
 	h := sha256.New()
 	for _, f := range [][]byte{[]byte(r.Caller), []byte(r.Method), []byte(r.Path), r.Body} {
