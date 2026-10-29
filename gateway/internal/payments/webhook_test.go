@@ -3,6 +3,7 @@ package payments
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/svout/strata/gateway/internal/httpx"
@@ -248,7 +250,7 @@ func TestWebhook_RejectsBeforeIO(t *testing.T) {
 		"ref not a string":  {rail.FakeName, `{"ref":42}`, http.StatusBadRequest, "invalid_ref"},
 		"wrong prefix":      {rail.FakeName, `{"ref":"payer_` + id.String() + `"}`, http.StatusBadRequest, "invalid_ref"},
 		"not a uuid":        {rail.FakeName, `{"ref":"pay_` + strings.Repeat("z", 36) + `"}`, http.StatusBadRequest, "invalid_ref"},
-		"over 255":          {rail.FakeName, `{"ref":"pay_` + strings.Repeat("a", 300) + `"}`, http.StatusBadRequest, "invalid_ref"},
+		"oversized ref":     {rail.FakeName, `{"ref":"pay_` + strings.Repeat("a", 300) + `"}`, http.StatusBadRequest, "invalid_ref"},
 		"body over 1 KiB":   {rail.FakeName, `{"ref":"` + rail.Ref(id) + `","pad":"` + strings.Repeat("a", 1<<10) + `"}`, http.StatusRequestEntityTooLarge, "request_too_large"},
 		"non-canonical ref": {rail.FakeName, `{"ref":"pay_` + strings.ToUpper(id.String()) + `"}`, http.StatusBadRequest, "invalid_ref"},
 	} {
@@ -395,6 +397,9 @@ func TestWebhook_BoundDefaultAndOption(t *testing.T) {
 	if got := cap(New(nil).webhookSlots); got != 8 {
 		t.Fatalf("default bound = %d, want 8", got)
 	}
+	if d := New(nil); d.webhookLookupTimeout != 300*time.Millisecond || d.webhookStatusTimeout != 2*time.Second {
+		t.Fatalf("default timeouts = lookup %v, Status %v; want 300ms, 2s", d.webhookLookupTimeout, d.webhookStatusTimeout)
+	}
 	if got := cap(New(nil, WithWebhookBound(3)).webhookSlots); got != 3 {
 		t.Fatalf("WithWebhookBound(3) gave %d slots, want 3", got)
 	}
@@ -408,4 +413,228 @@ func TestWebhook_BoundDefaultAndOption(t *testing.T) {
 			New(nil, WithWebhookBound(n))
 		}()
 	}
+}
+
+// Review nit 5: pending -> declined is the one path where a webhook drives a
+// payment to failed. The rail's decline is recorded as failed(declined),
+// nothing is posted and no money moved.
+func TestWebhook_PendingThenDeclined(t *testing.T) {
+	t.Parallel()
+	a := newWebhookAPI(t, []rail.Step{{Outcome: rail.Pending}})
+	id := a.create("k")
+	a.resolve(id, rail.Declined)
+
+	wantCode(t, a.post(rail.FakeName, hint(id)), http.StatusNoContent)
+	declined := FailureDeclined
+	assertState(t, a.svc, id, Failed, &declined)
+	if got := payerEntries(t, a.pool, id); got != 0 {
+		t.Fatalf("payer posting legs = %d, want 0", got)
+	}
+	if got := fakeMoves(t, a.fake, id); got != 0 {
+		t.Fatalf("money moved %d times, want 0", got)
+	}
+	assertBalances(t, a.pool, map[uuid.UUID]int64{a.payer: 0, uuid.UUID(clearingFor(t, a.pool, rail.FakeName)): 0})
+}
+
+// midSettleRail runs before and after around each Settle, so a test can
+// fire a webhook while the creating request's settle is in flight.
+type midSettleRail struct {
+	rail.Adapter
+	before, after func(rail.Request)
+}
+
+func (m *midSettleRail) Settle(ctx context.Context, req rail.Request) (rail.Result, error) {
+	if m.before != nil {
+		m.before(req)
+	}
+	res, err := m.Adapter.Settle(ctx, req)
+	if m.after != nil {
+		m.after(req)
+	}
+	return res, err
+}
+
+// Review nit 6: a webhook racing the creating request's own settle. The
+// review reasoned it safe (the webhook only asks Status; the forward-only
+// transition admits one writer; UNIQUE (rail_ref, leg) is the backstop);
+// this tests it, because money moves on this path. In every ordering the
+// payment ends settled, money moves once, the payer posting is two legs,
+// and Settle is called only by create.
+func TestWebhook_RacesCreatesSettle(t *testing.T) {
+	t.Parallel()
+	setup := func(t *testing.T) (*webhookAPI, *midSettleRail) {
+		pool := testutil.Postgres(t)
+		fake := rail.NewFake(pool)
+		hook := &hookRail{Adapter: fake}
+		mid := &midSettleRail{Adapter: hook}
+		a := newWebhookAPIOn(t, pool, mid)
+		a.fake, a.hook = fake, hook
+		return a, mid
+	}
+	settledOnce := func(t *testing.T, a *webhookAPI, id uuid.UUID) {
+		t.Helper()
+		assertState(t, a.svc, id, Settled, nil)
+		if got := fakeMoves(t, a.fake, id); got != 1 {
+			t.Errorf("money moved %d times, want 1", got)
+		}
+		if got := payerEntries(t, a.pool, id); got != 2 {
+			t.Errorf("payer posting legs = %d, want 2", got)
+		}
+	}
+
+	// Before the rail acted: Status doesn't know the reference, so the
+	// webhook leaves the payment settling (no Settle fallback) and create's
+	// own settle finishes it.
+	t.Run("before the rail acted", func(t *testing.T) {
+		t.Parallel()
+		a, mid := setup(t)
+		mid.before = func(req rail.Request) { wantCode(t, a.post(rail.FakeName, hint(req.PaymentID)), http.StatusNoContent) }
+		id := a.create("k")
+		settledOnce(t, a, id)
+		if got := a.hook.settles.Load(); got != 1 {
+			t.Fatalf("Settle called %d times, want 1", got)
+		}
+		if !strings.Contains(a.log.String(), "rail has no record of a webhook's payment") {
+			t.Fatalf("webhook didn't see ErrUnknownRef:\n%s", a.log)
+		}
+	})
+
+	// After the rail acted, before create records it: the webhook records
+	// settled first, and create's finish loses the transition and accepts
+	// it (same final state). Both log "payment settled", so the log shows
+	// one settlement twice: the same ordering anomaly as open question 12,
+	// which P5's audit chain has to fix or chapter 5 has to explain.
+	t.Run("after the rail acted, webhook first", func(t *testing.T) {
+		t.Parallel()
+		a, mid := setup(t)
+		mid.after = func(req rail.Request) { wantCode(t, a.post(rail.FakeName, hint(req.PaymentID)), http.StatusNoContent) }
+		id := a.create("k")
+		settledOnce(t, a, id)
+		if got := a.hook.settles.Load(); got != 1 {
+			t.Fatalf("Settle called %d times, want 1", got)
+		}
+		if got := strings.Count(a.log.String(), `"msg":"payment settled","payment_id":"`+id.String()+`"`); got != 2 {
+			t.Fatalf(`"payment settled" logged %d times, want 2 (open question 12)`, got)
+		}
+	})
+
+	// Truly concurrent: the webhook starts as the rail answers and races
+	// create's finish, on 20 payments.
+	t.Run("concurrent with create's finish", func(t *testing.T) {
+		t.Parallel()
+		a, mid := setup(t)
+		var wg sync.WaitGroup
+		mid.after = func(req rail.Request) {
+			wg.Go(func() {
+				if rec := a.post(rail.FakeName, hint(req.PaymentID)); rec.Code != http.StatusNoContent {
+					t.Errorf("webhook = %d, want 204", rec.Code)
+				}
+			})
+		}
+		ids := make([]uuid.UUID, 20)
+		for i := range ids {
+			ids[i] = a.create(fmt.Sprint("k", i))
+		}
+		wg.Wait()
+		for _, id := range ids {
+			settledOnce(t, a, id)
+		}
+		if got := int(a.hook.settles.Load()); got != len(ids) {
+			t.Fatalf("Settle called %d times, want %d (create only)", got, len(ids))
+		}
+	})
+}
+
+// Should 1 (Ivan, 2026-10-29): the slot is given back once Status returns,
+// before the write. With a bound of 1, payment A's write is held on a row
+// lock after its Status has answered; a webhook for payment B is still
+// handled, not shed. Called on the Service, without HTTP.
+func TestHint_SlotFreedBeforeWrite(t *testing.T) {
+	t.Parallel()
+	a := newWebhookAPI(t, []rail.Step{{Outcome: rail.Pending}, {Outcome: rail.Pending}}, WithWebhookBound(1))
+	idA, idB := a.create("a"), a.create("b")
+	a.resolve(idA, rail.Settled)
+
+	tx, err := a.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(t.Context(), "SELECT 1 FROM payments WHERE id = $1 FOR UPDATE", pgtype.UUID{Bytes: idA, Valid: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan hintResult, 1)
+	go func() {
+		r, err := a.svc.hint(t.Context(), idA)
+		if err != nil {
+			t.Errorf("hint A: %v", err)
+		}
+		done <- r
+	}()
+	// A's write is waiting on the row lock: its Status has answered.
+	waitFor(t, func() bool {
+		var n int
+		err := a.pool.QueryRow(t.Context(), "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'").Scan(&n)
+		return err == nil && n > 0
+	})
+
+	if r, err := a.svc.hint(t.Context(), idB); err != nil || r != hintHandled {
+		t.Fatalf("hint B while A writes = %v, %v; want handled (the slot is free)", r, err)
+	}
+	if got := a.svc.WebhookShed(); got != 0 {
+		t.Fatalf("WebhookShed = %d, want 0", got)
+	}
+
+	if err := tx.Rollback(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if r := <-done; r != hintHandled {
+		t.Fatalf("hint A = %v, want handled", r)
+	}
+	assertState(t, a.svc, idA, Settled, nil)
+	assertState(t, a.svc, idB, Settling, nil)
+}
+
+// Should 1: the lookup has its own deadline too. With the payments table
+// locked, the lookup gives up after webhookLookupTimeout, not the request's
+// deadline, and the slot is free again.
+func TestHint_LookupBounded(t *testing.T) {
+	t.Parallel()
+	const timeout = 100 * time.Millisecond
+	a := newWebhookAPI(t, []rail.Step{{Outcome: rail.Pending}}, WithWebhookBound(1))
+	a.svc.webhookLookupTimeout = timeout
+	id := a.create("k")
+
+	tx, err := a.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(t.Context(), "LOCK TABLE payments IN ACCESS EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second) // the router's deadline
+	defer cancel()
+	start := time.Now()
+	_, err = a.svc.hint(ctx, id)
+	if d := time.Since(start); !errors.Is(err, context.DeadlineExceeded) || d < timeout || d > time.Second {
+		t.Fatalf("hint on a locked table = %v after %v; want DeadlineExceeded after about %v", err, d, timeout)
+	}
+	if n := len(a.svc.webhookSlots); n != 0 {
+		t.Fatalf("%d slots still held after the lookup gave up", n)
+	}
+	if got := a.hook.statuses.Load(); got != 0 {
+		t.Fatalf("Status called %d times, want 0", got)
+	}
+
+	if err := tx.Rollback(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	a.resolve(id, rail.Settled)
+	if r, err := a.svc.hint(t.Context(), id); err != nil || r != hintHandled {
+		t.Fatalf("hint after unlock = %v, %v; want handled", r, err)
+	}
+	assertState(t, a.svc, id, Settled, nil)
 }

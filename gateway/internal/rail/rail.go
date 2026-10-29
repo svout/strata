@@ -104,11 +104,15 @@ var ErrInvalidRef = errors.New("rail: reference is not pay_<uuid>")
 // It does no I/O, so a webhook can reject a malformed reference before
 // touching the database or the rail (ADR-124).
 //
-// It is strict: s must be exactly what Ref returns for its id. uuid.Parse
-// alone also accepts upper case, braces and urn:uuid: forms, which would
-// give one payment several spellings. The exact length rules out braces
-// and urn (and oversized input, at no cost); the round trip rules out the
-// rest, such as upper case.
+// It is strict: s must be exactly what Ref returns for a payment id, so
+// ParseRef(s) succeeds only when Ref(id) == s, and string equality with a
+// stored rail_ref is safe. uuid.Parse alone also accepts upper case,
+// braces, urn:uuid: and the 32-hex form without hyphens, which would give
+// one payment several spellings. The exact length rules out braces, urn and
+// the hyphenless form (and oversized input, at no cost); the round trip
+// rules out the rest, such as upper case. The nil UUID is rejected too:
+// payment ids come from gen_random_uuid() (migration 00001), a v4 UUID that never
+// returns it, so a reference naming it is malformed, not unknown.
 func ParseRef(s string) (uuid.UUID, error) {
 	if len(s) != len(refPrefix)+36 || !strings.HasPrefix(s, refPrefix) {
 		return uuid.Nil, ErrInvalidRef

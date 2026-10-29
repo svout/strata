@@ -124,11 +124,13 @@ type Service struct {
 	recoverPage   int
 
 	// Rail webhooks (ADR-124, webhook.go). webhookSlots bounds concurrent
-	// Status calls (capacity webhookBound); webhookStatusTimeout bounds how
-	// long one call holds its slot; webhookShed counts requests turned away
-	// because every slot was taken.
+	// webhooks between the lookup and the end of Status (capacity
+	// webhookBound); the two timeouts bound how long each of those holds a
+	// slot; webhookShed counts requests turned away because every slot was
+	// taken.
 	webhookBound         int
 	webhookSlots         chan struct{}
+	webhookLookupTimeout time.Duration
 	webhookStatusTimeout time.Duration
 	webhookShed          atomic.Uint64
 }
@@ -172,7 +174,7 @@ func WithWebhookBound(n int) Option {
 // New returns a Service on pool.
 func New(pool *pgxpool.Pool, opts ...Option) *Service {
 	s := &Service{pool: pool, log: slog.New(slog.DiscardHandler), settleTimeout: defaultSettleTimeout, recoverGrace: defaultRecoverGrace, recoverPage: defaultRecoverPage,
-		webhookBound: defaultWebhookBound, webhookStatusTimeout: defaultWebhookStatusTimeout}
+		webhookBound: defaultWebhookBound, webhookLookupTimeout: defaultWebhookLookupTimeout, webhookStatusTimeout: defaultWebhookStatusTimeout}
 	for _, o := range opts {
 		o(s)
 	}
