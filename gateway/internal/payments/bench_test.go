@@ -277,14 +277,17 @@ func BenchmarkCreatePaymentConcurrentKeys(b *testing.B) {
 // over the key space), ANALYZEs the table, and re-takes the counter
 // snapshot so the prefill isn't counted. It writes idempotency_keys from the
 // payments package: a bench fixture, not production SQL (ADR-117 governs the
-// latter; http_test.go reads the table the same way).
+// latter; http_test.go reads the table the same way). key_hash is computed
+// in SQL as migration 00007 does, and the table's CHECK rejects the prefill
+// if it ever disagrees.
 func (r *benchRun) prefillKeys(b *testing.B, n int) {
 	b.Helper()
 	ctx := b.Context()
 	if _, err := r.a.pool.Exec(ctx, `
-		INSERT INTO idempotency_keys (key, request_hash, status, response_code, response_body)
-		SELECT md5(i::text), sha256(i::text::bytea), 'completed', 201, '{}'
-		FROM generate_series(1, $1) AS i`, n); err != nil {
+		INSERT INTO idempotency_keys (key_hash, key, request_hash, status, response_code, response_body)
+		SELECT sha256(int8send(0::bigint) || int8send(32::bigint) || convert_to(k, 'UTF8')),
+		       k, sha256(i::text::bytea), 'completed', 201, '{}'
+		FROM generate_series(1, $1) AS i, md5(i::text) AS k`, n); err != nil {
 		b.Fatalf("prefill: %v", err)
 	}
 	if _, err := r.a.pool.Exec(ctx, "ANALYZE idempotency_keys"); err != nil {
