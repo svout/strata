@@ -43,6 +43,25 @@ const (
 	// transaction (bounded by the 5 s request deadline) plus the rail call
 	// and the write after it (settleTimeout each): 11 s, rounded up.
 	defaultRecoverGrace = 15 * time.Second
+
+	// defaultWebhookBound is how many webhooks may be asking the rail's
+	// Status at once (ADR-124's amendment: default 8, configurable).
+	defaultWebhookBound = 8
+	// defaultWebhookLookupTimeout and defaultWebhookStatusTimeout bound the
+	// two things a webhook does while it holds a slot (webhook.go): the
+	// payment lookup and the rail's Status. The slot is given back as soon
+	// as Status returns, before the write, so together they are the most a
+	// slot can be held: 2.3 s. Without them a rail that accepts the
+	// connection and never answers (or a stalled database) would hold every
+	// slot until the router's 5 s request deadline, and keep doing so for as
+	// long as it hangs: every other webhook gets 503 meanwhile.
+	//
+	// The lookup is one primary-key read; a few hundred milliseconds is
+	// generous (Ivan, 2026-10-29). Status is shorter than
+	// defaultSettleTimeout because it only reads (assumed: a PSP answers a
+	// status read well within 2 s; revisit with Stripe in 12).
+	defaultWebhookLookupTimeout = 300 * time.Millisecond
+	defaultWebhookStatusTimeout = 2 * time.Second
 )
 
 // outcome is what one settle attempt left the payment as.
@@ -146,6 +165,31 @@ func (s *Service) resolve(ctx context.Context, p Payment) outcome {
 		// Status has no "invalid request" case: any error is unknown.
 		return s.unknown(ctx, p, err)
 	}
+	return s.apply(ctx, p, res, nil)
+}
+
+// confirm records a rail webhook's Status answer for p (ADR-124), as
+// resolve does for Recover. The caller has already asked Status (and given
+// back its webhook slot); this is the write.
+//
+// There is deliberately no Settle fallback here, unlike resolve. If the
+// rail has no record of the reference (ErrUnknownRef), the payment stays
+// settling and Recover, after its grace period, settles it. A fallback
+// would let a forged webhook make the gateway settle a payment the rail
+// never saw, which is exactly what ADR-124 exists to prevent (Ivan,
+// 2026-10-28). This is not a missing case.
+func (s *Service) confirm(ctx context.Context, p Payment, res rail.Result, err error) outcome {
+	if errors.Is(err, rail.ErrUnknownRef) {
+		s.log.LogAttrs(ctx, slog.LevelWarn, "rail has no record of a webhook's payment; left settling for recovery",
+			slog.String("payment_id", p.ID.String()), slog.String("rail", p.Rail))
+		return outcomeUnknown
+	}
+	if err != nil {
+		return s.unknown(ctx, p, err)
+	}
+	// apply records the answer on a context the caller can't cancel (finish
+	// detaches it), so once the rail has answered, a client that hangs up
+	// doesn't lose it.
 	return s.apply(ctx, p, res, nil)
 }
 

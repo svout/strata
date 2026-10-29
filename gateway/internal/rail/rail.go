@@ -24,6 +24,7 @@ package rail
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/google/uuid"
 )
@@ -88,7 +89,39 @@ var (
 // Ref is the rail reference for settling paymentID: deterministic, so every
 // attempt and every recovery for the payment names the same operation.
 func Ref(paymentID uuid.UUID) string {
-	return "pay_" + paymentID.String()
+	return refPrefix + paymentID.String()
+}
+
+const refPrefix = "pay_"
+
+// ErrInvalidRef means a string is not a reference Ref could have made. The
+// message is fixed and never quotes the input: ParseRef reads text from
+// unauthenticated webhooks (ADR-124), and quoting it would let a caller
+// write into the log.
+var ErrInvalidRef = errors.New("rail: reference is not pay_<uuid>")
+
+// ParseRef is the inverse of Ref: the payment id in s, or ErrInvalidRef.
+// It does no I/O, so a webhook can reject a malformed reference before
+// touching the database or the rail (ADR-124).
+//
+// It is strict: s must be exactly what Ref returns for a payment id, so
+// ParseRef(s) succeeds only when Ref(id) == s, and string equality with a
+// stored rail_ref is safe. uuid.Parse alone also accepts upper case,
+// braces, urn:uuid: and the 32-hex form without hyphens, which would give
+// one payment several spellings. The exact length rules out braces, urn and
+// the hyphenless form (and oversized input, at no cost); the round trip
+// rules out the rest, such as upper case. The nil UUID is rejected too:
+// payment ids come from gen_random_uuid() (migration 00001), a v4 UUID that never
+// returns it, so a reference naming it is malformed, not unknown.
+func ParseRef(s string) (uuid.UUID, error) {
+	if len(s) != len(refPrefix)+36 || !strings.HasPrefix(s, refPrefix) {
+		return uuid.Nil, ErrInvalidRef
+	}
+	id, err := uuid.Parse(s[len(refPrefix):])
+	if err != nil || id == uuid.Nil || Ref(id) != s {
+		return uuid.Nil, ErrInvalidRef
+	}
+	return id, nil
 }
 
 // validate checks a request without I/O. Which currencies are allowed is
