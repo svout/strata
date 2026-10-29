@@ -96,9 +96,18 @@ func wantCode(t *testing.T, rec *httptest.ResponseRecorder, code int) {
 	}
 }
 
-// AC5: 32 concurrent duplicate webhooks for one payment settle it once. Money
-// moves once at the rail, the payer posting is two legs, and only create
-// ever calls Settle: the webhook path asks Status and nothing else.
+// AC5: 32 concurrent duplicate webhooks for one payment settle it once.
+// AC5 is about money, not status codes: duplicated callbacks never
+// double-post. The webhook is built to shed load (ADR-124: 503 with
+// Retry-After, the PSP retries and Recover is the backstop), so a response
+// may be 204 or that 503 and nothing else. Here 32 webhooks share 8 pool
+// connections (testutil.testPoolMaxConns), so a lookup can spend its 300 ms
+// deadline queueing for a connection and answer 503 request_timeout. An
+// earlier version asserted all 204 and failed once in a full -race run;
+// the message was lost, and that failure is consistent with this cause
+// (shrinking the lookup deadline reproduces it), not known to be it. With
+// these assertions the test is immune to that cause, so a failure here is
+// a new signal, not the old flake.
 func TestWebhook_AC5_ConcurrentDuplicatesSettleOnce(t *testing.T) {
 	t.Parallel()
 	const n = 32
@@ -106,17 +115,61 @@ func TestWebhook_AC5_ConcurrentDuplicatesSettleOnce(t *testing.T) {
 	id := a.create("k")
 	a.resolve(id, rail.Settled)
 
-	var wg sync.WaitGroup
-	codes := make([]int, n)
-	for i := range n {
-		wg.Go(func() { codes[i] = a.post(rail.FakeName, hint(id)).Code })
-	}
-	wg.Wait()
-	for i, c := range codes {
-		if c != http.StatusNoContent {
-			t.Fatalf("webhook %d = %d, want 204", i, c)
+	handled := 0
+	for i, rec := range a.burst(id, n) {
+		switch {
+		case rec.Code == http.StatusNoContent:
+			handled++
+		case rec.Code == http.StatusServiceUnavailable && rec.Header().Get("Retry-After") != "":
+		default:
+			t.Fatalf("webhook %d = %d (Retry-After %q), want 204, or 503 with Retry-After",
+				i, rec.Code, rec.Header().Get("Retry-After"))
 		}
 	}
+	if handled == 0 {
+		t.Fatal("no webhook was handled")
+	}
+	a.assertSettledOnce(id)
+}
+
+// AC5, the normal case: a duplicate burst the pool can serve is handled in
+// full. Each webhook uses one connection at a time (lookup, Status, then the
+// settle write, in sequence), so 4 never queue for one of the pool's 8, and
+// 4 is within the default bound of 8 slots: nothing should shed. Without
+// this, a regression that made the endpoint shed every burst would pass the
+// test above.
+func TestWebhook_AC5_BurstWithinPoolAllHandled(t *testing.T) {
+	t.Parallel()
+	const n = 4
+	a := newWebhookAPI(t, []rail.Step{{Outcome: rail.Pending}})
+	id := a.create("k")
+	a.resolve(id, rail.Settled)
+
+	for i, rec := range a.burst(id, n) {
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("webhook %d = %d, want 204: %s", i, rec.Code, rec.Body)
+		}
+	}
+	a.assertSettledOnce(id)
+}
+
+// burst sends n identical webhooks for id at once.
+func (a *webhookAPI) burst(id uuid.UUID, n int) []*httptest.ResponseRecorder {
+	var wg sync.WaitGroup
+	recs := make([]*httptest.ResponseRecorder, n)
+	for i := range n {
+		wg.Go(func() { recs[i] = a.post(rail.FakeName, hint(id)) })
+	}
+	wg.Wait()
+	return recs
+}
+
+// assertSettledOnce checks that id settled and money moved exactly once:
+// one move at the rail, a two-leg payer posting, and Settle called only by
+// create.
+func (a *webhookAPI) assertSettledOnce(id uuid.UUID) {
+	t := a.t
+	t.Helper()
 	assertState(t, a.svc, id, Settled, nil)
 	if got := fakeMoves(t, a.fake, id); got != 1 {
 		t.Fatalf("money moved %d times, want 1", got)
@@ -332,6 +385,11 @@ func TestWebhook_HungRailCantHoldTheBound(t *testing.T) {
 	}
 	if got := hung.statuses.Load(); got != bound {
 		t.Fatalf("Status called %d times, want %d (a shed request never asks)", got, bound)
+	}
+	// Review nit 3 (Ivan, 2026-10-29): the counter is the signal; the log
+	// line is Debug, so a flood of shed requests can't flood the log.
+	if out := a.log.String(); strings.Contains(out, `"level":"WARN","msg":"rail webhook shed`) || !strings.Contains(out, `"level":"DEBUG","msg":"rail webhook shed`) {
+		t.Fatalf("shed request not logged at Debug only:\n%s", out)
 	}
 
 	wg.Wait()
@@ -637,4 +695,45 @@ func TestHint_LookupBounded(t *testing.T) {
 		t.Fatalf("hint after unlock = %v, %v; want handled", r, err)
 	}
 	assertState(t, a.svc, id, Settled, nil)
+}
+
+// Review nit 4 (Ivan, 2026-10-29): a webhook failure is logged as a webhook
+// failure, never as "payment request …" (AC8 and chapter 5 read these logs),
+// and is never a 404.
+func TestWebhook_ErrorsLabelledAsWebhook(t *testing.T) {
+	t.Parallel()
+	t.Run("database down", func(t *testing.T) {
+		t.Parallel()
+		a := newWebhookAPI(t, nil)
+		a.pool.Close()
+		wantCode(t, a.post(rail.FakeName, hint(uuid.New())), http.StatusInternalServerError)
+		assertWebhookLabel(t, a.log.String(), "rail webhook failed")
+	})
+	t.Run("lookup timed out", func(t *testing.T) {
+		t.Parallel()
+		a := newWebhookAPI(t, []rail.Step{{Outcome: rail.Pending}})
+		a.svc.webhookLookupTimeout = 100 * time.Millisecond
+		id := a.create("k")
+		tx, err := a.pool.Begin(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+		if _, err := tx.Exec(t.Context(), "LOCK TABLE payments IN ACCESS EXCLUSIVE MODE"); err != nil {
+			t.Fatal(err)
+		}
+		rec := a.post(rail.FakeName, hint(id))
+		wantCode(t, rec, http.StatusServiceUnavailable)
+		if rec.Header().Get("Retry-After") == "" || !strings.Contains(rec.Body.String(), `"code":"request_timeout"`) {
+			t.Fatalf("timeout response = %v %s", rec.Header(), rec.Body)
+		}
+		assertWebhookLabel(t, a.log.String(), "rail webhook timed out")
+	})
+}
+
+func assertWebhookLabel(t *testing.T, out, want string) {
+	t.Helper()
+	if !strings.Contains(out, `"msg":"`+want+`"`) || strings.Contains(out, "payment request") {
+		t.Fatalf("log should say %q and never \"payment request\":\n%s", want, out)
+	}
 }
