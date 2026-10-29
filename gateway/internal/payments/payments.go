@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -121,6 +122,15 @@ type Service struct {
 	settleTimeout time.Duration
 	recoverGrace  time.Duration
 	recoverPage   int
+
+	// Rail webhooks (ADR-124, webhook.go). webhookSlots bounds concurrent
+	// Status calls (capacity webhookBound); webhookStatusTimeout bounds how
+	// long one call holds its slot; webhookShed counts requests turned away
+	// because every slot was taken.
+	webhookBound         int
+	webhookSlots         chan struct{}
+	webhookStatusTimeout time.Duration
+	webhookShed          atomic.Uint64
 }
 
 // Option configures a Service.
@@ -150,14 +160,34 @@ func WithLogger(l *slog.Logger) Option {
 	return func(s *Service) { s.log = l }
 }
 
+// WithWebhookBound sets how many rail webhooks may be asking the rail's
+// Status at once (default 8; ADR-124's amendment). A request beyond it is
+// turned away with 503 at once, never queued. It is an option so that
+// wiring can take it from configuration and an incident can change it
+// without a deploy. n must be at least 1; New panics otherwise.
+func WithWebhookBound(n int) Option {
+	return func(s *Service) { s.webhookBound = n }
+}
+
 // New returns a Service on pool.
 func New(pool *pgxpool.Pool, opts ...Option) *Service {
-	s := &Service{pool: pool, log: slog.New(slog.DiscardHandler), settleTimeout: defaultSettleTimeout, recoverGrace: defaultRecoverGrace, recoverPage: defaultRecoverPage}
+	s := &Service{pool: pool, log: slog.New(slog.DiscardHandler), settleTimeout: defaultSettleTimeout, recoverGrace: defaultRecoverGrace, recoverPage: defaultRecoverPage,
+		webhookBound: defaultWebhookBound, webhookStatusTimeout: defaultWebhookStatusTimeout}
 	for _, o := range opts {
 		o(s)
 	}
+	if s.webhookBound < 1 {
+		panic("payments: WithWebhookBound needs at least 1")
+	}
+	s.webhookSlots = make(chan struct{}, s.webhookBound)
 	return s
 }
+
+// WebhookShed is the number of rail webhooks turned away with 503 because
+// every Status slot was taken. Without it, a hung rail or a flood would look
+// the same as quiet traffic. Like idem.RedisLocker.Degraded (ADR-119), it is
+// read in-process for now; the OTel work (SPEC-002 subtask 13) exports it.
+func (s *Service) WebhookShed() uint64 { return s.webhookShed.Load() }
 
 // create validates in and inserts a payment in state created on the internal
 // rail. It posts nothing to the ledger; settlement does (SPEC-002 subtask 10).

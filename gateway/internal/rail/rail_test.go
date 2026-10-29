@@ -542,3 +542,36 @@ func xactCounts(t *testing.T, pool *pgxpool.Pool, db string) [2]int64 {
 	}
 	return prev
 }
+
+// ParseRef accepts exactly what Ref produces (ADR-124: shape before I/O).
+// The non-canonical spellings are ones uuid.Parse alone would accept, so
+// each is a second name for one payment unless ParseRef rejects it.
+func TestParseRef(t *testing.T) {
+	t.Parallel()
+	id := uuid.New()
+	got, err := rail.ParseRef(rail.Ref(id))
+	if err != nil || got != id {
+		t.Fatalf("ParseRef(Ref(id)) = %s, %v; want %s", got, err, id)
+	}
+	for name, s := range map[string]string{
+		"empty":          "",
+		"no prefix":      id.String(),
+		"wrong prefix":   "payer_" + id.String(),
+		"not a uuid":     "pay_" + strings.Repeat("z", 36),
+		"nil uuid":       rail.Ref(uuid.Nil),
+		"upper case":     "pay_" + strings.ToUpper(id.String()),
+		"braces":         "pay_{" + id.String() + "}",
+		"urn":            "pay_urn:uuid:" + id.String(),
+		"no hyphens":     "pay_" + strings.ReplaceAll(id.String(), "-", ""),
+		"trailing space": rail.Ref(id) + " ",
+		"too long":       rail.Ref(id) + strings.Repeat("a", 300),
+	} {
+		if got, err := rail.ParseRef(s); !errors.Is(err, rail.ErrInvalidRef) || got != uuid.Nil {
+			t.Errorf("%s: ParseRef = %s, %v; want ErrInvalidRef", name, got, err)
+		}
+	}
+	// The error never quotes its input.
+	if _, err := rail.ParseRef("pay_secret-sk_live_4242"); strings.Contains(err.Error(), "sk_live") {
+		t.Errorf("error quotes the input: %v", err)
+	}
+}

@@ -43,6 +43,18 @@ const (
 	// transaction (bounded by the 5 s request deadline) plus the rail call
 	// and the write after it (settleTimeout each): 11 s, rounded up.
 	defaultRecoverGrace = 15 * time.Second
+
+	// defaultWebhookBound is how many webhooks may be asking the rail's
+	// Status at once (ADR-124's amendment: default 8, configurable).
+	defaultWebhookBound = 8
+	// defaultWebhookStatusTimeout bounds one webhook's Status call, and so
+	// how long it holds a slot. Without it a rail that accepts the
+	// connection and never answers would hold every slot until the
+	// router's 5 s request deadline, and keep doing so for as long as it
+	// hangs: every other webhook gets 503 meanwhile. It is shorter than
+	// defaultSettleTimeout because Status only reads (assumed: a PSP
+	// answers a status read well within 2 s; revisit with Stripe in 12).
+	defaultWebhookStatusTimeout = 2 * time.Second
 )
 
 // outcome is what one settle attempt left the payment as.
@@ -146,6 +158,34 @@ func (s *Service) resolve(ctx context.Context, p Payment) outcome {
 		// Status has no "invalid request" case: any error is unknown.
 		return s.unknown(ctx, p, err)
 	}
+	return s.apply(ctx, p, res, nil)
+}
+
+// confirm is resolve for a rail webhook (ADR-124): it asks the rail's
+// Status for one settling payment and applies the answer, with a deadline
+// of its own (webhookStatusTimeout) inside whatever ctx allows.
+//
+// There is deliberately no Settle fallback here, unlike resolve. If the
+// rail has no record of the reference (ErrUnknownRef), the payment stays
+// settling and Recover, after its grace period, settles it. A fallback
+// would let a forged webhook make the gateway settle a payment the rail
+// never saw, which is exactly what ADR-124 exists to prevent (Ivan,
+// 2026-10-28). This is not a missing case.
+func (s *Service) confirm(ctx context.Context, p Payment) outcome {
+	cctx, cancel := context.WithTimeout(ctx, s.webhookStatusTimeout)
+	defer cancel()
+	res, err := s.rail.Status(cctx, ref(p))
+	if errors.Is(err, rail.ErrUnknownRef) {
+		s.log.LogAttrs(ctx, slog.LevelWarn, "rail has no record of a webhook's payment; left settling for recovery",
+			slog.String("payment_id", p.ID.String()), slog.String("rail", p.Rail))
+		return outcomeUnknown
+	}
+	if err != nil {
+		return s.unknown(ctx, p, err)
+	}
+	// apply records the answer on a context the caller can't cancel (finish
+	// detaches it), so once the rail has answered, a client that hangs up
+	// doesn't lose it.
 	return s.apply(ctx, p, res, nil)
 }
 
