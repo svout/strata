@@ -47,10 +47,12 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 		return 2
 	}
 
-	// config.Load also reads GATEWAY_ADDR, REDIS_ADDR and the rail settings,
-	// but only DATABASE_URL is required, so it fits here unchanged. An
-	// invalid rail setting fails the migration too, which is fine: the same
-	// environment would stop the gateway.
+	// config.Load also reads GATEWAY_ADDR, REDIS_ADDR, the rail settings
+	// and the webhook bound, rate and burst, but only DATABASE_URL is
+	// required, so it fits here unchanged. An invalid rail or webhook
+	// setting fails the migration too, which is fine: the same environment
+	// would stop the gateway. (The bound's check against the pool size is
+	// in cmd/gateway only, so migrate doesn't make that one.)
 	cfg, err := config.Load(getenv)
 	if err != nil {
 		printErr(stderr, "migrate: "+err.Error()+"\n")

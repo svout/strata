@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/svout/strata/gateway/internal/config"
 	"github.com/svout/strata/gateway/internal/httpx"
 	"github.com/svout/strata/gateway/internal/idem"
 	"github.com/svout/strata/gateway/internal/ledger"
@@ -64,6 +65,67 @@ var defaultTimings = timings{
 	recoverTimeout: time.Minute,
 }
 
+// wiring is what wireSettlement builds the payments Service from: settings
+// decided once at startup.
+type wiring struct {
+	allowFake bool
+	// webhookBound is the Service's webhook bound (payments.WithWebhookBound),
+	// derived from or checked against the pool by wiringFor (ADR-127).
+	webhookBound int
+	// fakeSteps scripts the fake rail's outcomes. It is test-only and
+	// unreachable from configuration: wiringFor never sets it, nothing
+	// reads it from the environment, and only a test in this package can
+	// construct a wiring with it (SPEC-002 10b-ii). In production the fake
+	// runs unscripted (it settles at once), and only when allowFake.
+	fakeSteps []rail.Step
+}
+
+// Webhook pool share (ADR-127): the payment path keeps the majority of the
+// pool, so the webhook's bound is a minority fraction of it. A fraction
+// rather than "below the pool", because a webhook gives its slot back
+// before its write (payments, ADR-124 addendum), so in-flight webhook
+// writes come on top of the bound. assumed: both fractions (not measured;
+// revisit with P6's load numbers).
+const (
+	webhookPoolDivisor = 4 // default bound: a quarter of the pool
+	webhookPoolMaxDiv  = 2 // an explicit bound may take at most half
+	maxDefaultBound    = 64
+)
+
+// errPoolTooSmall is errConfig's text when the pool has fewer than 2
+// connections: it can't give payments the majority and the webhook a
+// share, and the default bound of 1 would break the half-pool rule below.
+var errPoolTooSmall = errors.New("the PostgreSQL pool (pool_max_conns) needs at least 2 connections: " +
+	"one route can't keep the majority of a one-connection pool while another has a share")
+
+// errWebhookBoundTooLarge is errConfig's text when GATEWAY_WEBHOOK_BOUND
+// would take more than half the pool. Fixed text: the numbers stay out, as
+// with every errConfig error.
+var errWebhookBoundTooLarge = errors.New("GATEWAY_WEBHOOK_BOUND is more than half the PostgreSQL pool (pool_max_conns); " +
+	"the payments API must keep the majority, so lower the bound or raise pool_max_conns")
+
+// wiringFor decides the wiring from cfg and the pool's size (maxConns,
+// from pool.Config(), which opens no connection). An unset bound is a
+// quarter of the pool, clamped to 1..64; an explicit one above half the
+// pool is an errConfig error and the gateway exits, as is a pool below 2.
+// The derived default always passes the check explicit values get
+// (ADR-127's invariant): with at least 2 connections, the clamped quarter
+// is at most half.
+func wiringFor(cfg config.Config, maxConns int32) (wiring, error) {
+	if maxConns < 2 {
+		return wiring{}, fmt.Errorf("%w: %w", errConfig, errPoolTooSmall)
+	}
+	w := wiring{allowFake: cfg.AllowFakeRail, webhookBound: cfg.WebhookBound}
+	if w.webhookBound == 0 {
+		w.webhookBound = min(max(int(maxConns)/webhookPoolDivisor, 1), maxDefaultBound)
+		return w, nil
+	}
+	if w.webhookBound*webhookPoolMaxDiv > int(maxConns) {
+		return wiring{}, fmt.Errorf("%w: %w", errConfig, errWebhookBoundTooLarge)
+	}
+	return w, nil
+}
+
 // railName is the one rail this process registers. The fake replaces the
 // internal rail rather than sitting beside it: choosing a rail per payment
 // is a P2 decision (mandates, policy), not a flag.
@@ -77,14 +139,16 @@ func railName(allowFake bool) string {
 // wireSettlement wires the payments API to its rail and then runs recovery
 // until ctx ends. It returns nil when ctx ends, and an errConfig error if
 // the gateway must exit. It runs in the background, so /readyz answers
-// throughout and reports "rail" as failing until g is set.
-func wireSettlement(ctx context.Context, pool *pgxpool.Pool, allowFake bool, locker idem.Locker, log *slog.Logger, g *gate, tm timings) error {
+// throughout and reports "rail" as failing until pay is set. hooks (the
+// rail webhook) opens first, so a ready gateway serves both; the gap
+// between the two sets is harmless (see compose).
+func wireSettlement(ctx context.Context, pool *pgxpool.Pool, w wiring, locker idem.Locker, log *slog.Logger, pay, hooks *gate, tm timings) error {
 	// goose (store.SchemaVersion) works over database/sql; this wraps the
 	// same pool, and closing it leaves the pool open.
 	db := stdlib.OpenDBFromPool(pool)
 	defer func() { _ = db.Close() }()
 
-	name := railName(allowFake)
+	name := railName(w.allowFake)
 	id, err := resolveClearing(ctx, pool, db, name, log, tm.lookupRetry, tm.lookupTimeout)
 	if err == nil {
 		err = checkClearing(name, id)
@@ -102,7 +166,7 @@ func wireSettlement(ctx context.Context, pool *pgxpool.Pool, allowFake bool, loc
 		return err
 	}
 	var adapter rail.Adapter
-	if allowFake {
+	if w.allowFake {
 		// The fake keeps its records in fake_rail_operations (migration
 		// 00006). Startup only checks the version that seeds the clearing
 		// accounts (clearingSchemaVersion, 5), so a fake gateway on a
@@ -114,13 +178,15 @@ func wireSettlement(ctx context.Context, pool *pgxpool.Pool, allowFake bool, loc
 		// pass settles it, once. Nothing fails closed or double-pays, and
 		// the fake never runs in production, so a second startup gate just
 		// for the fake's table isn't worth its code.
-		adapter = rail.NewFake(pool)
+		adapter = rail.NewFake(pool, w.fakeSteps...)
 		log.LogAttrs(ctx, slog.LevelWarn, "fake rail registered: payments settle without moving real money (GATEWAY_ALLOW_FAKE_RAIL=1)")
 	} else {
 		adapter = rail.NewInternal(pool, id)
 	}
-	svc := payments.New(pool, payments.WithLocker(locker), payments.WithRail(adapter, id), payments.WithLogger(log))
-	g.set(svc.Handler(log))
+	svc := payments.New(pool, payments.WithLocker(locker), payments.WithRail(adapter, id), payments.WithLogger(log),
+		payments.WithWebhookBound(w.webhookBound))
+	hooks.set(svc.Webhook(log))
+	pay.set(svc.Handler(log))
 	log.LogAttrs(ctx, slog.LevelInfo, "rail wired", slog.String("rail", name))
 
 	recoverLoop(ctx, svc, log, tm.recoverEvery, tm.recoverRetry, tm.recoverTimeout)
@@ -294,8 +360,10 @@ func recoverPass(ctx context.Context, svc recoverer, timeout time.Duration) erro
 	return err
 }
 
-// gate serves the payments API once it is wired and 503 before that, so no
-// payment is ever created without a rail to settle it.
+// gate serves an API once it is wired and 503 before that, so no payment is
+// ever created, and no webhook handled, without a rail. There is one per
+// mount (/v1/payments, /v1/rail/webhooks), each with its own 503 title, so
+// an integrator reading the webhook's 503 isn't told about payments.
 //
 // It covers the whole /v1/payments mount, GET included, although only POST
 // needs a rail. "Not ready, so 503 for everything" is a simpler contract
@@ -304,14 +372,19 @@ func recoverPass(ctx context.Context, svc recoverer, timeout time.Duration) erro
 //
 // atomic.Pointer needs a concrete type, so it holds a pointer to the
 // handler interface value; ServeHTTP dereferences it.
-type gate struct{ h atomic.Pointer[http.Handler] }
+type gate struct {
+	title string // the 503's problem title until set
+	h     atomic.Pointer[http.Handler]
+}
+
+func newGate(title string) *gate { return &gate{title: title} }
 
 // set opens the gate. A nil handler panics here, at startup, rather than on
 // the first request after the gate opened: a missing handler is a wiring
 // bug, and it should fail where it was made.
 func (g *gate) set(h http.Handler) {
 	if h == nil {
-		panic("gate: nil payments handler")
+		panic("gate: nil handler")
 	}
 	g.h.Store(&h)
 }
@@ -325,7 +398,7 @@ func (g *gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// Same code and Retry-After as the payments API's own 503s.
 	w.Header().Set("Retry-After", "1")
-	httpx.WriteProblem(w, http.StatusServiceUnavailable, "try_again_later", "Payments are not available yet; retry later")
+	httpx.WriteProblem(w, http.StatusServiceUnavailable, "try_again_later", g.title)
 }
 
 // errNotWired is the readiness check's failure until the rail is wired.
