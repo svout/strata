@@ -206,7 +206,8 @@ func (h handler) webhook(w http.ResponseWriter, r *http.Request) {
 //
 //   - fail turns ErrNotFound into 404 payment_not_found. A webhook error
 //     that reached it would reopen the existence oracle the uniform 204
-//     closes (ADR-124's amendment). Here every error is a 503 or a 500.
+//     closes (ADR-124's amendment). Here every error is a 503 or a 500,
+//     or nothing at all when the caller has gone.
 //   - Its log lines name the webhook. AC8 and chapter 5 are read from these
 //     logs, so a webhook failure logged as "payment request failed" would
 //     be mislabelled evidence, not just an untidy message.

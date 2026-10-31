@@ -105,7 +105,9 @@ func wantCode(t *testing.T, rec *httptest.ResponseRecorder, code int) {
 // deadline queueing for a connection and answer 503 request_timeout. An
 // earlier version asserted all 204 and failed once in a full -race run;
 // the message was lost, and that failure is consistent with this cause
-// (shrinking the lookup deadline reproduces it), not known to be it. With
+// (with webhookLookupTimeout cut to 5 ms, the old assertion fails
+// every run with "webhook 0 = 503, want 204"; SPEC-002 10b-ii-a as-built
+// notes), not known to be it. With
 // these assertions the test is immune to that cause, so a failure here is
 // a new signal, not the old flake.
 func TestWebhook_AC5_ConcurrentDuplicatesSettleOnce(t *testing.T) {
@@ -115,19 +117,19 @@ func TestWebhook_AC5_ConcurrentDuplicatesSettleOnce(t *testing.T) {
 	id := a.create("k")
 	a.resolve(id, rail.Settled)
 
-	handled := 0
+	ok204 := 0 // 204s: a handled hint, or one ignored because another settled it
 	for i, rec := range a.burst(id, n) {
 		switch {
 		case rec.Code == http.StatusNoContent:
-			handled++
+			ok204++
 		case rec.Code == http.StatusServiceUnavailable && rec.Header().Get("Retry-After") != "":
 		default:
 			t.Fatalf("webhook %d = %d (Retry-After %q), want 204, or 503 with Retry-After",
 				i, rec.Code, rec.Header().Get("Retry-After"))
 		}
 	}
-	if handled == 0 {
-		t.Fatal("no webhook was handled")
+	if ok204 == 0 {
+		t.Fatal("no webhook got 204")
 	}
 	a.assertSettledOnce(id)
 }
@@ -135,15 +137,18 @@ func TestWebhook_AC5_ConcurrentDuplicatesSettleOnce(t *testing.T) {
 // AC5, the normal case: a duplicate burst the pool can serve is handled in
 // full. Each webhook uses one connection at a time (lookup, Status, then the
 // settle write, in sequence), so 4 never queue for one of the pool's 8, and
-// 4 is within the default bound of 8 slots: nothing should shed. Without
-// this, a regression that made the endpoint shed every burst would pass the
-// test above.
+// 4 is within the default bound of 8 slots: nothing should shed. The pool
+// opens connections lazily, so it is warmed first: otherwise a lookup could
+// spend its 300 ms deadline dialling Postgres, and this test is only worth
+// having if it is deterministic. Without it, a regression that made the
+// endpoint shed every burst would pass the test above.
 func TestWebhook_AC5_BurstWithinPoolAllHandled(t *testing.T) {
 	t.Parallel()
 	const n = 4
 	a := newWebhookAPI(t, []rail.Step{{Outcome: rail.Pending}})
 	id := a.create("k")
 	a.resolve(id, rail.Settled)
+	warmPool(t, a.pool, n)
 
 	for i, rec := range a.burst(id, n) {
 		if rec.Code != http.StatusNoContent {
@@ -151,6 +156,23 @@ func TestWebhook_AC5_BurstWithinPoolAllHandled(t *testing.T) {
 		}
 	}
 	a.assertSettledOnce(id)
+}
+
+// warmPool opens n connections in pool and returns them idle, so the next n
+// concurrent users don't dial.
+func warmPool(t *testing.T, pool *pgxpool.Pool, n int) {
+	t.Helper()
+	conns := make([]*pgxpool.Conn, 0, n)
+	for range n {
+		c, err := pool.Acquire(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, c)
+	}
+	for _, c := range conns {
+		c.Release()
+	}
 }
 
 // burst sends n identical webhooks for id at once.

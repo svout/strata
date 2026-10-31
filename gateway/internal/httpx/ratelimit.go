@@ -20,8 +20,8 @@ import (
 //
 // Source identity (Ivan, 2026-10-29). The source is the host of
 // r.RemoteAddr: IPv4 per address, IPv4-mapped IPv6 as IPv4, other IPv6 per
-// /64, because one host usually holds a whole /64 and a per-address limit
-// would be trivial to dodge there. X-Forwarded-For is ignored: P1 has no
+// /64, because one host usually holds a whole /64 (assumed: not checked
+// against a source) and a per-address limit would be trivial to dodge there. X-Forwarded-For is ignored: P1 has no
 // trusted proxy, and the header is whatever the caller says. Behind a proxy
 // every caller would share the proxy's bucket and this would become one
 // global limit, so trusted-proxy configuration is on P1's pre-deploy
@@ -70,13 +70,15 @@ const defaultMaxSources = 10_000
 
 // NewRateLimiter returns a limiter allowing each source burst requests at
 // once and rate per second after that. rate must be above 0 and burst at
-// least 1 (configuration validates both, SPEC-002 10b-ii-b); it panics
-// otherwise. Limited requests are logged at Debug only: the Limited counter
+// least 1, and rate finite (configuration validates both, SPEC-002
+// 10b-ii-b; this is the second line); it panics otherwise. NaN and +Inf
+// matter because rate is configurable: either would refuse every request,
+// and a tiny rate overflows the sweep interval, so configuration bounds it. Limited requests are logged at Debug only: the Limited counter
 // is the signal, and a log line per refused request would let a flood fill
 // the log.
 func NewRateLimiter(rate float64, burst int, log *slog.Logger) *RateLimiter {
-	if rate <= 0 || burst < 1 {
-		panic("httpx: NewRateLimiter needs rate > 0 and burst >= 1")
+	if !(rate > 0) || math.IsInf(rate, 0) || burst < 1 { // !(rate > 0) also rejects NaN
+		panic("httpx: NewRateLimiter needs a finite rate > 0 and burst >= 1")
 	}
 	start := time.Now() // carries a monotonic reading, so time.Since(start) does too
 	l := &RateLimiter{
@@ -111,10 +113,13 @@ func (l *RateLimiter) Middleware(next http.Handler) http.Handler {
 
 // allow takes a token for remoteAddr's source. When there is none, it
 // returns false and the whole seconds until the next token (at least 1).
+// The time is read under the lock, so buckets see readings in the order they
+// are applied: read before it, a request could apply an earlier reading
+// after a later one from the same source (SPEC-002 10b-ii-a review S1).
 func (l *RateLimiter) allow(remoteAddr string) (bool, int) {
-	now := l.elapsed()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := l.elapsed()
 	return l.take(l.bucketFor(remoteAddr, now), now)
 }
 
@@ -141,9 +146,15 @@ func (l *RateLimiter) bucketFor(remoteAddr string, now time.Duration) *bucket {
 }
 
 // sweep drops buckets that have refilled completely: a fresh bucket would be
-// the same. It walks the whole map, so it runs at most once per refill time
-// (burst/rate): sooner, few more buckets could have refilled, and a flood of
-// new sources would make every request walk the map.
+// the same. It runs at most once per burst/rate, the longest any bucket takes
+// to refill, so each sweep drops every bucket untouched since the one before,
+// and the walk of the whole map under the lock happens at most that often
+// rather than on every request from a new source. The cost: once the map is
+// full, a legitimate new source can wait in the overflow bucket until the
+// next sweep, about 2 s at the planned defaults (burst 40,
+// 20 per second; SPEC-002 10b-ii), even if most
+// buckets refilled sooner. That is acceptable because the map fills only
+// under abnormal traffic, and a PSP retries.
 func (l *RateLimiter) sweep(now time.Duration) {
 	refill := time.Duration(l.burst / l.rate * float64(time.Second))
 	if l.swept && now-l.lastSweep < refill {

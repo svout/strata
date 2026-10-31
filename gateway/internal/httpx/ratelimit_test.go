@@ -2,12 +2,15 @@ package httpx
 
 import (
 	"bytes"
+	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -82,9 +85,70 @@ func TestRateLimiter_RetryAfterRoundsUp(t *testing.T) {
 	clock := &fakeElapsed{}
 	l.elapsed = clock.get
 	l.allow("192.0.2.1:1")
-	clock.advance(time.Second)
+	clock.advance(1500 * time.Millisecond) // 0.375 tokens: 2.5 s to go
 	if _, wait := l.allow("192.0.2.1:1"); wait != 3 {
-		t.Fatalf("Retry-After = %d, want 3", wait)
+		t.Fatalf("Retry-After = %d, want 3 (2.5 s rounded up)", wait)
+	}
+}
+
+// lockedClock is a clock that ticks one millisecond per reading and records
+// any reading taken while l.mu is free: the time must be read under the
+// lock, or two requests from one source can apply their readings out of
+// order (SPEC-002 10b-ii-a review S1).
+type lockedClock struct {
+	l        *RateLimiter
+	ticks    atomic.Int64
+	unlocked atomic.Int64
+}
+
+func (c *lockedClock) get() time.Duration {
+	if c.l.mu.TryLock() { // free: nobody, so not this request, holds it
+		c.l.mu.Unlock()
+		c.unlocked.Add(1)
+	}
+	return time.Duration(c.ticks.Add(1)) * time.Millisecond
+}
+
+// Concurrent requests share the limiter safely and never get more than the
+// bucket allows. One source is hammered from many goroutines on a clock that
+// ticks 1 ms per reading, at 200/s: 0.2 tokens a tick, and half the readings
+// are this source's, so it earns 0.4 tokens per request and stays drained.
+// Every grant is then paid for by elapsed time, so allowed can't exceed
+// burst + rate * elapsed, and an interval credited twice would show. Many sources against a small map run the sweep and the overflow
+// bucket concurrently too. Run with -race (make test does), which reports a
+// missing or bypassed lock.
+func TestRateLimiter_ConcurrentRequestsShareTheBucket(t *testing.T) {
+	t.Parallel()
+	const goroutines, perGoroutine = 8, 2000
+	var buf syncBuffer
+	l := NewRateLimiter(200, 10, NewLogger(&buf, slog.LevelDebug))
+	l.maxSources = 16
+	clock := &lockedClock{l: l}
+	l.elapsed = clock.get
+
+	if l.allow("192.0.2.1:1"); clock.unlocked.Load() != 0 {
+		t.Fatal("the clock was read outside the lock")
+	}
+	var allowed atomic.Int64
+	var wg sync.WaitGroup
+	for g := range goroutines {
+		wg.Go(func() {
+			for i := range perGoroutine {
+				if ok, _ := l.allow("192.0.2.1:1"); ok {
+					allowed.Add(1)
+				}
+				l.allow(fmt.Sprintf("198.51.100.%d:1", (g*perGoroutine+i)%64)) // churns the map
+			}
+		})
+	}
+	wg.Wait()
+	if n := clock.unlocked.Load(); n != 0 {
+		t.Fatalf("the clock was read outside the lock %d times", n)
+	}
+	// Every allow reads the clock once, so ticks is the elapsed time in ms.
+	limit := l.burst + l.rate*(time.Duration(clock.ticks.Load())*time.Millisecond).Seconds()
+	if got := float64(allowed.Load() + 1); got > limit { // +1: the first, serial request
+		t.Fatalf("allowed %v requests from one source, more than burst + rate*elapsed = %v", got, limit)
 	}
 }
 
@@ -241,7 +305,7 @@ func TestNewRateLimiter_RejectsBadValues(t *testing.T) {
 	for _, tc := range []struct {
 		rate  float64
 		burst int
-	}{{0, 1}, {-1, 1}, {1, 0}} {
+	}{{0, 1}, {-1, 1}, {math.NaN(), 1}, {math.Inf(1), 1}, {1, 0}} {
 		func() {
 			defer func() {
 				if recover() == nil {
