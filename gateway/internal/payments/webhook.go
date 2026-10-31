@@ -42,7 +42,8 @@ import (
 // Steps 1 and 2 are the handler's (parsing); 3 to 5 are the Service's
 // (hint), so they can be tested without HTTP.
 //
-// The handler is not mounted until 10b-ii adds the per-source rate limit:
+// The handler is not mounted until 10b-ii-b, behind the per-source rate
+// limiter (httpx.RateLimiter, 10b-ii-a):
 // an unauthenticated, state-changing endpoint shouldn't exist on the network
 // before its protections do.
 
@@ -150,7 +151,7 @@ func (s *Service) ignore(ctx context.Context, id uuid.UUID, why string) hintResu
 }
 
 // Webhook serves POST /{rail}; mount it at /v1/rail/webhooks on the httpx
-// router (10b-ii).
+// router, behind httpx.RateLimiter (10b-ii-b).
 func (s *Service) Webhook(log *slog.Logger) http.Handler {
 	h := handler{svc: s, log: log}
 	r := chi.NewRouter()
@@ -182,12 +183,12 @@ func (h handler) webhook(w http.ResponseWriter, r *http.Request) {
 	result, err := h.svc.hint(r.Context(), id)
 	switch {
 	case err != nil:
-		// TODO(10b-ii, review nit 4): fail logs this as a payment request.
-		h.fail(w, r, err)
+		h.failWebhook(w, r, err)
 	case result == hintShed:
-		// TODO(10b-ii, review nit 3): WebhookShed is the signal; this log
-		// line moves to Debug or is sampled.
-		h.log.LogAttrs(r.Context(), slog.LevelWarn, "rail webhook shed: every slot is taken",
+		// Debug, not Warn (Ivan, 2026-10-29): WebhookShed is the signal. A
+		// line per shed request on an unauthenticated endpoint would let a
+		// flood fill the log and bury the real signal.
+		h.log.LogAttrs(r.Context(), slog.LevelDebug, "rail webhook shed: every slot is taken",
 			slog.String("rail", chi.URLParam(r, "rail")),
 			slog.String("request_id", httpx.RequestID(r.Context())),
 		)
@@ -197,5 +198,39 @@ func (h handler) webhook(w http.ResponseWriter, r *http.Request) {
 		// The outcome is logged by confirm and finish; the caller learns
 		// nothing from it.
 		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// failWebhook maps a webhook's lookup error to a response. It is separate
+// from fail on purpose, and must stay so (Ivan, 2026-10-29):
+//
+//   - fail turns ErrNotFound into 404 payment_not_found. A webhook error
+//     that reached it would reopen the existence oracle the uniform 204
+//     closes (ADR-124's amendment). Here every error is a 503 or a 500,
+//     or nothing at all when the caller has gone.
+//   - Its log lines name the webhook. AC8 and chapter 5 are read from these
+//     logs, so a webhook failure logged as "payment request failed" would
+//     be mislabelled evidence, not just an untidy message.
+func (h handler) failWebhook(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		// The lookup's own deadline (webhookLookupTimeout) or the
+		// router's ran out.
+		h.log.LogAttrs(r.Context(), slog.LevelError, "rail webhook timed out",
+			slog.String("request_id", httpx.RequestID(r.Context())),
+		)
+		w.Header().Set("Retry-After", retryAfterSeconds)
+		httpx.WriteProblem(w, http.StatusServiceUnavailable, "request_timeout", "Request timed out")
+	case errors.Is(err, context.Canceled):
+		// The caller went away; there is no one to answer (as in fail).
+		h.log.LogAttrs(r.Context(), slog.LevelDebug, "rail webhook cancelled by caller",
+			slog.String("request_id", httpx.RequestID(r.Context())),
+		)
+	default:
+		h.log.LogAttrs(r.Context(), slog.LevelError, "rail webhook failed",
+			slog.Any("error", err),
+			slog.String("request_id", httpx.RequestID(r.Context())),
+		)
+		httpx.WriteProblem(w, http.StatusInternalServerError, "internal_error", "Internal Server Error")
 	}
 }
