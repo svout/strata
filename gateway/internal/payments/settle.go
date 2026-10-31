@@ -45,7 +45,12 @@ const (
 	defaultRecoverGrace = 15 * time.Second
 
 	// defaultWebhookBound is how many webhooks may be asking the rail's
-	// Status at once (ADR-124's amendment: default 8, configurable).
+	// Status at once when no WithWebhookBound is given. It is a library and
+	// test default ONLY: cmd/gateway always passes WithWebhookBound with a
+	// bound derived from or checked against the pool (ADR-127), so nothing
+	// in production ever uses this 8. It is not tied to the
+	// pool here, so a Service given a small pool and no option can have a
+	// bound at or above the pool, the condition ADR-127 exists to prevent.
 	defaultWebhookBound = 8
 	// defaultWebhookLookupTimeout and defaultWebhookStatusTimeout bound the
 	// two things a webhook does while it holds a slot (webhook.go): the

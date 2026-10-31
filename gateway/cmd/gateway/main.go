@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/svout/strata/gateway/internal/config"
@@ -53,21 +55,19 @@ func run() error {
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, ContextTimeoutEnabled: true})
 	defer func() { _ = rdb.Close() }()
 
-	// The payments API is behind a gate until its rail is wired (wire.go).
-	payGate := &gate{}
-	checks := []httpx.ReadyCheck{
-		{Name: "postgres", Check: pool.Ping},
-		{Name: "redis", Check: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
-		payGate.readyCheck(),
+	gw, err := compose(cfg, pool, log,
+		httpx.ReadyCheck{Name: "postgres", Check: pool.Ping},
+		httpx.ReadyCheck{Name: "redis", Check: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }})
+	if err != nil {
+		log.LogAttrs(context.Background(), slog.LevelError, "invalid configuration; the gateway will exit",
+			slog.String("error", err.Error()))
+		return err
 	}
-
-	router := httpx.NewRouter(log, checks...)
 	locker := idem.NewRedisLocker(rdb, log)
-	router.Mount("/v1/payments", payGate)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           router,
+		Handler:           gw.router,
 		ErrorLog:          httpx.NewServerErrorLog(log),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
@@ -92,8 +92,12 @@ func run() error {
 	wireCtx, cancelWire := context.WithCancel(ctx)
 	defer cancelWire()
 	wireErr := make(chan error, 1)
+	// gw.wired is passed as compose decided it. This one assignment is the
+	// only part of the bound's path no test reaches (compose and
+	// wireSettlement are both tested through it); a deliberate stopping
+	// point, since it has no branches (Ivan, 2026-10-31).
 	wg.Go(func() {
-		if err := wireSettlement(wireCtx, pool, cfg.AllowFakeRail, locker, log, payGate, defaultTimings); err != nil {
+		if err := wireSettlement(wireCtx, pool, gw.wired, locker, log, gw.pay, gw.hooks, defaultTimings); err != nil {
 			wireErr <- err
 		}
 	})
@@ -114,6 +118,69 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return errors.Join(exitErr, srv.Shutdown(shutdownCtx))
+}
+
+// gateway is what run serves: the router with both APIs mounted behind their
+// gates, and the wiring wireSettlement opens the gates with.
+type gateway struct {
+	router     http.Handler
+	wired      wiring
+	pay, hooks *gate
+	limiter    *httpx.RateLimiter
+}
+
+// compose builds the gateway from cfg and the pool, with checks as the
+// readiness checks besides "rail". It is the composition run uses, kept out
+// of run so tests can call it: run keeps only the process (signals, the
+// server, exit codes). The webhook bound is decided here, before serving,
+// from the pool's size (ADR-127; pool.Config() opens no connection), so a
+// bound over half the pool is an errConfig error and the gateway exits,
+// and the bound wireSettlement passes to payments.New is never 0.
+func compose(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, checks ...httpx.ReadyCheck) (gateway, error) {
+	wired, err := wiringFor(cfg, pool.Config().MaxConns)
+	if err != nil {
+		return gateway{}, err
+	}
+	// Both APIs are behind gates until the rail is wired (wire.go). Only
+	// the payments gate is a readiness check. wireSettlement opens the
+	// webhook gate first, so a ready gateway serves both. Between the two
+	// sets, webhooks are already served while /readyz is not ready and
+	// payments still answer 503; that is harmless, because the Service
+	// behind both gates is fully built before either opens. The order isn't
+	// pinned by a test (Ivan, 2026-10-31).
+	gw := gateway{wired: wired, pay: newGate(payGateTitle), hooks: newGate(hookGateTitle),
+		limiter: httpx.NewRateLimiter(cfg.WebhookRate, cfg.WebhookBurst, log)}
+	r := httpx.NewRouter(log, append(checks, gw.pay.readyCheck())...)
+	mountAPIs(r, gw.pay, gw.hooks, gw.limiter)
+	gw.router = r
+	return gw, nil
+}
+
+// The gates' 503 titles, one per API, so neither tells its callers about
+// the other.
+const (
+	payGateTitle  = "Payments are not available yet; retry later"
+	hookGateTitle = "Rail webhooks are not available yet; retry later"
+)
+
+// mountAPIs mounts the gateway's APIs on r. It is the one place they are
+// mounted; the end-to-end tests call it too, so they test this order.
+//
+// The rail webhook's chain is limiter → gate → payments.Webhook, with the
+// limiter outermost: a flood is refused before anything else runs, gate
+// closed or not. The webhook is unauthenticated (ADR-124), so the limiter
+// is load-bearing twice over: for the rail's quota, and for log volume. A
+// failing webhook logs one Error line per request, and only the limiter's
+// per-source rate (with its overflow bucket for the many-source case)
+// bounds how many lines a caller can cause (Ivan, 2026-10-31). Moving the
+// limiter inward, exempting a webhook route from it, or raising the rate
+// far beyond its default of 20/s reopens an unbounded log flood on an
+// unauthenticated endpoint. TestMountedAPIs_LimiterBeforeGate pins the
+// order. /v1/payments has no limiter: P1's payments API has no per-source
+// limit, and a test pins that too.
+func mountAPIs(r chi.Router, pay, hooks http.Handler, limiter *httpx.RateLimiter) {
+	r.Mount("/v1/payments", pay)
+	r.Mount("/v1/rail/webhooks", limiter.Middleware(hooks))
 }
 
 // redisLogger replaces go-redis's own logger, which prints plain-text lines to
