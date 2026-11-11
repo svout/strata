@@ -3,15 +3,15 @@
 #
 # The credentials below are DEV-ONLY placeholders for a throwaway local
 # database: they are not secrets and must never be reused anywhere else.
-name: agentgate
+name: strata
 
 services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: agentgate      # dev-only
-      POSTGRES_PASSWORD: agentgate  # dev-only
-      POSTGRES_DB: agentgate
+      POSTGRES_USER: strata      # dev-only
+      POSTGRES_PASSWORD: strata  # dev-only
+      POSTGRES_DB: strata
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
@@ -20,7 +20,7 @@ services:
       # -h 127.0.0.1: probe over TCP, as clients connect. Without it pg_isready
       # uses the Unix socket, which is up during initdb's temporary server, so
       # the check could pass before the real server is listening.
-      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "agentgate", "-d", "agentgate"]
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "strata", "-d", "strata"]
       interval: 2s
       timeout: 3s
       retries: 15
@@ -43,7 +43,7 @@ services:
     environment:
       GATEWAY_ADDR: ":8080"
       LOG_LEVEL: info
-      DATABASE_URL: "postgres://agentgate:agentgate@postgres:5432/agentgate?sslmode=disable"  # dev-only
+      DATABASE_URL: "postgres://strata:strata@postgres:5432/strata?sslmode=disable"  # dev-only
       REDIS_ADDR: "redis:6379"
     ports:
       - "127.0.0.1:8080:8080"
