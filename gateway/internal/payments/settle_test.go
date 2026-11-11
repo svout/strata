@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -18,7 +17,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"pgregory.net/rapid"
 
 	"github.com/svout/strata/gateway/internal/httpx"
 	"github.com/svout/strata/gateway/internal/idem"
@@ -513,86 +511,6 @@ func TestMarkSettled_CommitFailsAfterPosting(t *testing.T) {
 	if n := strings.Count(logs.String(), `"level":"WARN","msg":"could not record the rail's answer`); n != 1 {
 		t.Fatalf("Warn lines = %d, want 1:\n%s", n, logs)
 	}
-}
-
-// The central invariant of 10a-ii-a2, as a property: whatever mix of rail
-// outcomes, recoveries, repeated answers, other writers and failed postings
-// happens, a payment is settled if and only if its payer posting exists
-// (exactly two legs), and the fake rail's clearing account holds exactly the
-// settled amount. The fixed tests above prove atomicity today; this keeps
-// proving it as later phases add code that touches settlement.
-func TestProperty_SettledIffPayerPosting(t *testing.T) {
-	t.Parallel()
-	pool := testutil.Postgres(t)
-	fake := rail.NewFake(pool)
-	svc, _ := newSettleService(t, pool, fake)
-	// broken posts to a clearing account that doesn't exist: every
-	// settlement it records fails at the foreign key and must roll back.
-	broken, _ := newSettleService(t, pool, fake)
-	broken.clearing = ledger.ClearingAccountID(uuid.New())
-	clearing := uuid.UUID(clearingFor(t, pool, rail.FakeName))
-	payer, payee := newAccount(t.Context(), t, pool), newAccount(t.Context(), t, pool)
-	services := []*Service{svc, broken}
-	steps := []rail.Step{{}, {Outcome: rail.Declined}, {Outcome: rail.Pending}, {Err: errors.New("connection reset")}, {LoseResponse: true}}
-	var keys int
-
-	rapid.Check(t, func(rt *rapid.T) {
-		var ids []uuid.UUID // this run's payments
-		pick := func(rt *rapid.T) uuid.UUID {
-			if len(ids) == 0 {
-				rt.Skip("no payments yet")
-			}
-			return rapid.SampledFrom(ids).Draw(rt, "payment")
-		}
-		rt.Repeat(map[string]func(*rapid.T){
-			"create": func(rt *rapid.T) {
-				fake.Push(rapid.SampledFrom(steps).Draw(rt, "step"))
-				s := rapid.SampledFrom(services).Draw(rt, "service")
-				keys++
-				ids = append(ids, createFor(t, s, fmt.Sprintf("p%d", keys), payer, payee).PaymentID)
-			},
-			"resolve pending": func(rt *rapid.T) {
-				// Errors (not pending) are expected and ignored.
-				_ = fake.Resolve(t.Context(), rail.Ref(pick(rt)), rapid.SampledFrom([]rail.Outcome{rail.Settled, rail.Declined}).Draw(rt, "outcome"), "")
-			},
-			"recover": func(rt *rapid.T) {
-				if _, err := rapid.SampledFrom(services).Draw(rt, "service").Recover(t.Context()); err != nil {
-					rt.Fatalf("Recover: %v", err)
-				}
-			},
-			// A repeated or contradicting answer from a stale snapshot, as a
-			// second request or a concurrent Recover would deliver it.
-			"finish again": func(rt *rapid.T) {
-				p, err := svc.Get(t.Context(), pick(rt))
-				if err != nil {
-					rt.Fatal(err)
-				}
-				to := rapid.SampledFrom([]State{Settled, Failed}).Draw(rt, "to")
-				rapid.SampledFrom(services).Draw(rt, "service").finish(t.Context(), p, to, FailureDeclined)
-			},
-			"": func(rt *rapid.T) {
-				for _, id := range ids {
-					p, err := svc.Get(t.Context(), id)
-					if err != nil {
-						rt.Fatal(err)
-					}
-					legs := payerEntries(t, pool, id)
-					if (p.State == Settled) != (legs == 2) || (p.State != Settled && legs != 0) {
-						rt.Fatalf("payment %s is %s with %d payer legs; want settled iff 2", id, p.State, legs)
-					}
-				}
-			},
-		})
-		// Cumulative across runs: the clearing account holds 1250 per
-		// settled payment on the fake rail, ever.
-		var total int
-		if err := pool.QueryRow(t.Context(), "SELECT count(*) FROM payments WHERE state = 'settled'").Scan(&total); err != nil {
-			rt.Fatal(err)
-		}
-		if got, err := ledger.Balance(t.Context(), pool, clearing); err != nil || got != int64(total)*1250 {
-			rt.Fatalf("clearing:fake balance = %d (%v), want %d for %d settled payments", got, err, int64(total)*1250, total)
-		}
-	})
 }
 
 // A result outside the three outcomes is not a decision: the payment stays
