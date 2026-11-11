@@ -460,9 +460,18 @@ func (f fixture) balanced(amount int64) []Entry {
 	return []Entry{{f.payer, Debit, amount}, {f.payee, Credit, amount}}
 }
 
+// fataler is what the database helpers need from a test: *testing.T and
+// *rapid.T both satisfy it. Inside rapid.Check, pass the *rapid.T: a failure
+// through the outer *testing.T stops the test without rapid shrinking the
+// case or saving it for replay.
+type fataler interface {
+	Helper()
+	Fatalf(format string, args ...any)
+}
+
 // The helpers below talk to the database directly, so they convert at the SQL
 // boundary the same way ledger does (pgUUID, and back with uuid.UUID(id.Bytes)).
-func newAccount(ctx context.Context, t *testing.T, pool *pgxpool.Pool, kind string) uuid.UUID {
+func newAccount(ctx context.Context, t fataler, pool *pgxpool.Pool, kind string) uuid.UUID {
 	t.Helper()
 	var id pgtype.UUID
 	err := pool.QueryRow(ctx, "INSERT INTO accounts (kind, currency) VALUES ($1, 'GBP') RETURNING id", kind).Scan(&id)
@@ -472,7 +481,7 @@ func newAccount(ctx context.Context, t *testing.T, pool *pgxpool.Pool, kind stri
 	return uuid.UUID(id.Bytes)
 }
 
-func newPayment(ctx context.Context, t *testing.T, pool *pgxpool.Pool, payer, payee uuid.UUID, amount int64) uuid.UUID {
+func newPayment(ctx context.Context, t fataler, pool *pgxpool.Pool, payer, payee uuid.UUID, amount int64) uuid.UUID {
 	t.Helper()
 	var id pgtype.UUID
 	err := pool.QueryRow(ctx, `
@@ -484,7 +493,7 @@ func newPayment(ctx context.Context, t *testing.T, pool *pgxpool.Pool, payer, pa
 	return uuid.UUID(id.Bytes)
 }
 
-func countEntries(ctx context.Context, t *testing.T, pool *pgxpool.Pool, payment uuid.UUID) int {
+func countEntries(ctx context.Context, t fataler, pool *pgxpool.Pool, payment uuid.UUID) int {
 	t.Helper()
 	var n int
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM ledger_entries WHERE payment_id = $1", pgUUID(payment)).Scan(&n); err != nil {
@@ -495,7 +504,7 @@ func countEntries(ctx context.Context, t *testing.T, pool *pgxpool.Pool, payment
 
 // paymentSum is the signed sum (credits − debits) of payment's entries: 0 for
 // a balanced payment, and for one with no entries.
-func paymentSum(ctx context.Context, t *testing.T, pool *pgxpool.Pool, payment uuid.UUID) int64 {
+func paymentSum(ctx context.Context, t fataler, pool *pgxpool.Pool, payment uuid.UUID) int64 {
 	t.Helper()
 	var signed int64
 	err := pool.QueryRow(ctx, `

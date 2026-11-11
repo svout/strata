@@ -16,7 +16,7 @@ make dev-down   # stop the stack (keeps the PostgreSQL data volume)
 | Service | Port (127.0.0.1 only) |
 |---|---|
 | gateway | 8080: `/healthz`, `/readyz` |
-| postgres | 5432: user, password and database `agentgate` (dev-only) |
+| postgres | 5432: user, password and database `strata` (dev-only) |
 | redis | 6379 |
 
 If you already run PostgreSQL or Redis locally, ports 5432 or 6379 may be taken; stop the local service first.
@@ -35,8 +35,10 @@ If `make dev` reports that the gateway is not ready, `make dev-logs` shows why.
 
 ```sh
 make dev-down
-docker volume rm agentgate_pgdata
+docker volume rm strata_pgdata
 ```
+
+The stack was named `agentgate` until 2026-11-11. A stack started before then left containers and a volume under the old name: stop them with `docker compose -p agentgate down`, then `docker volume rm agentgate_pgdata`, or the old PostgreSQL keeps port 5432.
 
 ## Without Docker
 

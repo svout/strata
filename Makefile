@@ -24,7 +24,7 @@ COMPOSE := docker compose -f infra/compose/compose.yml
 # PostgreSQL, with the same dev-only placeholder credentials as compose.yml.
 # Set DATABASE_URL in the environment to migrate another database. Recipes
 # must never echo it: it can hold a real password.
-DATABASE_URL ?= postgres://agentgate:agentgate@127.0.0.1:5432/agentgate?sslmode=disable
+DATABASE_URL ?= postgres://strata:strata@127.0.0.1:5432/strata?sslmode=disable
 
 .PHONY: help install-lint lint test test-cold bench dev dev-down dev-logs migrate export-docs check-docs
 

@@ -93,9 +93,9 @@ func TestPropertyMoneyConservation(t *testing.T) {
 	var ops atomic.Int64
 
 	rapid.Check(t, func(rt *rapid.T) {
-		user := newAccount(ctx, t, pool, "user")
-		merchant := newAccount(ctx, t, pool, "merchant")
-		clearing := newAccount(ctx, t, pool, "clearing")
+		user := newAccount(ctx, rt, pool, "user")
+		merchant := newAccount(ctx, rt, pool, "merchant")
+		clearing := newAccount(ctx, rt, pool, "clearing")
 		want := map[uuid.UUID]int64{user: 0, merchant: 0, clearing: 0}
 		var payments []*modelPayment
 
@@ -143,7 +143,7 @@ func TestPropertyMoneyConservation(t *testing.T) {
 
 			switch kind {
 			case opCreate:
-				id := newPayment(ctx, t, pool, user, merchant, o.amount)
+				id := newPayment(ctx, rt, pool, user, merchant, o.amount)
 				payments = append(payments, &modelPayment{id: id, amount: o.amount})
 			case opSettle:
 				fee := o.fee % p.amount
@@ -172,11 +172,11 @@ func TestPropertyMoneyConservation(t *testing.T) {
 		}
 
 		for _, p := range payments {
-			if s := paymentSum(ctx, t, pool, p.id); s != 0 {
+			if s := paymentSum(ctx, rt, pool, p.id); s != 0 {
 				rt.Errorf("payment %v (state %d): signed sum = %d, want 0", p.id, p.state, s)
 			}
 			if p.state == stateCreated || p.state == stateFailed {
-				if n := countEntries(ctx, t, pool, p.id); n != 0 {
+				if n := countEntries(ctx, rt, pool, p.id); n != 0 {
 					rt.Errorf("payment %v (state %d): %d entries, want 0", p.id, p.state, n)
 				}
 			}
@@ -350,14 +350,14 @@ func TestPropertyNoPartialPostings(t *testing.T) {
 			t.Parallel()
 			rapid.Check(t, func(rt *rapid.T) {
 				accounts := []uuid.UUID{
-					newAccount(ctx, t, pool, "user"),
-					newAccount(ctx, t, pool, "merchant"),
-					newAccount(ctx, t, pool, "clearing"),
-					newAccount(ctx, t, pool, "user"),
+					newAccount(ctx, rt, pool, "user"),
+					newAccount(ctx, rt, pool, "merchant"),
+					newAccount(ctx, rt, pool, "clearing"),
+					newAccount(ctx, rt, pool, "user"),
 				}
 				legs := balancedLegs(rt, accounts)
-				payment := newPayment(ctx, t, pool, accounts[0], accounts[1], 1)
-				before := balances(ctx, t, pool, accounts)
+				payment := newPayment(ctx, rt, pool, accounts[0], accounts[1], 1)
+				before := balances(ctx, rt, pool, accounts)
 
 				cctx, cancel := context.WithCancel(ctx)
 				defer cancel()
@@ -431,10 +431,10 @@ func TestPropertyNoPartialPostings(t *testing.T) {
 				if wantErr != nil && !errors.Is(err, wantErr) {
 					rt.Errorf("fault %v: err = %v, want %v", f, err, wantErr)
 				}
-				if n := countEntries(ctx, t, pool, payment); n != 0 {
+				if n := countEntries(ctx, rt, pool, payment); n != 0 {
 					rt.Errorf("fault %v: %d entries after the failed posting, want 0", f, n)
 				}
-				after := balances(ctx, t, pool, accounts)
+				after := balances(ctx, rt, pool, accounts)
 				for i := range accounts {
 					if after[i] != before[i] {
 						rt.Errorf("fault %v: balance of account %d = %d, want %d (unchanged)", f, i, after[i], before[i])
@@ -450,7 +450,7 @@ func TestPropertyNoPartialPostings(t *testing.T) {
 				if err != nil {
 					rt.Fatalf("control post: %v", err)
 				}
-				if n := countEntries(ctx, t, pool, payment); n != len(legs) {
+				if n := countEntries(ctx, rt, pool, payment); n != len(legs) {
 					rt.Errorf("control post: %d entries, want %d", n, len(legs))
 				}
 			})
@@ -458,7 +458,7 @@ func TestPropertyNoPartialPostings(t *testing.T) {
 	}
 }
 
-func balances(ctx context.Context, t *testing.T, pool *pgxpool.Pool, accounts []uuid.UUID) []int64 {
+func balances(ctx context.Context, t fataler, pool *pgxpool.Pool, accounts []uuid.UUID) []int64 {
 	t.Helper()
 	out := make([]int64, len(accounts))
 	for i, id := range accounts {
