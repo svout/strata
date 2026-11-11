@@ -141,6 +141,28 @@ def cmd_prompt(data):
           "When this step is done, run /wrap-up (spec ☑, Now, Reuse Registry, Session Log) before starting the next one.")
 
 
+def declared(table, today):
+    """True if the AI Use Log already has a real (filled-in) row dated today.
+
+    Why: /wrap-up writes the Session Log and then this log, so its own edit is newer
+    than the Session Log and the end hook saw it as unrecorded work, adding a
+    placeholder after every wrap-up (three had to be reconciled by hand, 2026-10-25).
+    A row counts when its date cell is today or a range ending today
+    ("2026-10-19 → 2026-10-21") and its category is not the placeholder. Category is
+    read from the end of the row, so a pipe inside a description can't shift it.
+    Trade-off (Ivan, 2026-10-25): a second session on the same day that skips
+    /wrap-up gets no placeholder here; its ⚠ Session Log entry below still flags it.
+    """
+    for line in table.splitlines():
+        cells = [c.strip() for c in line.split("|")]
+        if len(cells) < 7 or not cells[1][:4].isdigit():
+            continue  # not a data row (header, separator, prose)
+        date, category = cells[1], cells[-3]
+        if (date == today or date.endswith("→ " + today)) and category != "_set at /wrap-up_":
+            return True
+    return False
+
+
 def append_ai_log(vault, project, hits, reason):
     """Declare this session in the AI Use Log (COMP6013 requires every use to be declared)."""
     path = os.path.join(vault, "Dissertation", "AI Use Log.md")
@@ -150,9 +172,12 @@ def append_ai_log(vault, project, hits, reason):
         return
     if AI_MARK not in text:
         return
+    today = datetime.now().strftime('%Y-%m-%d')
+    if declared(text.split(AI_MARK, 1)[1], today):
+        return  # /wrap-up already wrote today's real row; its own edits must not add a placeholder
     names = ", ".join(f"`{h[1]}`" for h in hits[:6]) + (f" (+{len(hits) - 6} more)" if len(hits) > 6 else "")
     where = os.path.basename(project.rstrip("/"))
-    row = (f"| {datetime.now().strftime('%Y-%m-%d')} | Claude Code | Working session in `{where}`"
+    row = (f"| {today} | Claude Code | Working session in `{where}`"
            f" ({reason}): {names} | _set at /wrap-up_ | {where} |\n")
     head, tail = text.split(AI_MARK, 1)
     tail = tail.lstrip("\n")
