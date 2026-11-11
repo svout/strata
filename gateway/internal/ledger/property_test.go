@@ -197,22 +197,14 @@ func TestPropertyMoneyConservation(t *testing.T) {
 		}
 	})
 
-	// Across everything every check wrote: no payment is out of balance,
+	// Across everything every check wrote: no posting is out of balance,
 	// and all entries together sum to zero.
-	var unbalanced int
-	var total int64
-	err := pool.QueryRow(ctx, `
-		SELECT
-			(SELECT count(*) FROM (
-				SELECT payment_id FROM ledger_entries GROUP BY payment_id
-				HAVING sum(CASE direction WHEN 'credit' THEN amount ELSE -amount END) <> 0) u),
-			(SELECT COALESCE(sum(CASE direction WHEN 'credit' THEN amount ELSE -amount END), 0)::bigint
-			 FROM ledger_entries)`).Scan(&unbalanced, &total)
+	unbalanced, total, err := testutil.LedgerSums(ctx, pool)
 	if err != nil {
 		t.Fatalf("global check: %v", err)
 	}
 	if unbalanced != 0 {
-		t.Errorf("%d payments with a non-zero signed sum, want 0", unbalanced)
+		t.Errorf("%d postings with a non-zero signed sum, want 0", unbalanced)
 	}
 	if total != 0 {
 		t.Errorf("signed sum of all entries = %d, want 0", total)
