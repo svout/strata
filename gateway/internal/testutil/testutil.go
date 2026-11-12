@@ -177,18 +177,36 @@ var (
 	dockerErr  error
 )
 
-// requireDocker skips the test (locally) or fails it (CI) when no Docker
-// daemon is reachable. The check runs once per test binary.
+// requireDocker skips the test (locally) or fails it (CI, or a gate that
+// sets STRATA_REQUIRE_DOCKER=1) when no Docker daemon is reachable. The check
+// runs once per test binary.
 func requireDocker(t testing.TB) {
 	t.Helper()
 	dockerOnce.Do(func() { dockerErr = dockerHealth() })
-	if dockerErr == nil {
-		return
+	if fail, msg := dockerVerdict(dockerErr, os.Getenv); fail {
+		t.Fatal(msg)
+	} else if msg != "" {
+		t.Skip(msg)
 	}
-	if os.Getenv("CI") != "" {
-		t.Fatalf("testutil: Docker is required in CI but unreachable: %v", dockerErr)
+}
+
+// dockerVerdict decides what an unreachable Docker means: nothing when err is
+// nil; a failure in CI or when STRATA_REQUIRE_DOCKER is "1" (`make test-cold`
+// sets it, so the gate can't pass with every integration test skipped);
+// otherwise a skip, so the inner loop (`make test`) still runs
+// without Docker. It takes getenv so a test can drive it: requireDocker's
+// own check runs once per binary.
+func dockerVerdict(err error, getenv func(string) string) (fail bool, msg string) {
+	switch {
+	case err == nil:
+		return false, ""
+	case getenv("CI") != "":
+		return true, fmt.Sprintf("testutil: Docker is required in CI but unreachable: %v", err)
+	case getenv("STRATA_REQUIRE_DOCKER") == "1":
+		return true, fmt.Sprintf("testutil: Docker is required (STRATA_REQUIRE_DOCKER=1) but unreachable: %v", err)
+	default:
+		return false, fmt.Sprintf("testutil: Docker unreachable, skipping integration test: %v", err)
 	}
-	t.Skipf("testutil: Docker unreachable, skipping integration test: %v", dockerErr)
 }
 
 func dockerHealth() (err error) {
