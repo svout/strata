@@ -26,7 +26,7 @@ COMPOSE := docker compose -f infra/compose/compose.yml
 # must never echo it: it can hold a real password.
 DATABASE_URL ?= postgres://strata:strata@127.0.0.1:5432/strata?sslmode=disable
 
-.PHONY: help install-lint lint test test-cold bench dev dev-down dev-logs migrate export-docs check-docs
+.PHONY: help install-lint lint test test-cold bench dev dev-down dev-logs dev-seed migrate chaos export-docs check-docs
 
 help: ## List the make targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-13s %s\n", $$1, $$2}'
@@ -46,7 +46,7 @@ lint: ## Lint every scaffolded service
 	  if [ -f $$s/pyproject.toml ]; then echo "== $$s"; (cd $$s && uv run ruff check .); fi; \
 	done
 	@if [ -f console/package.json ]; then echo "== console"; (cd console && pnpm install --frozen-lockfile && pnpm lint); fi
-	@echo "== scripts"; python3 -m py_compile scripts/*.py
+	@echo "== scripts"; python3 -m py_compile scripts/*.py scripts/chaos/*.py
 	@if [ -f infra/compose/compose.yml ]; then \
 	  echo "== compose"; \
 	  command -v docker >/dev/null || { echo "docker CLI not found: needed to validate infra/compose/compose.yml" >&2; exit 1; }; \
@@ -75,8 +75,14 @@ test: ## Run every scaffolded service's tests (Go test cache allowed: inner loop
 	@if [ -f console/package.json ]; then echo "== console"; (cd console && pnpm install --frozen-lockfile && pnpm test); fi
 	@echo "== scripts"; python3 -m unittest discover -s scripts -p 'test_*.py'
 
-test-cold: ## Run every test with the Go test cache off (the gate: /verify and CI)
-	@$(MAKE) --no-print-directory test GO_TEST_FLAGS=-count=1
+# A gate must not pass with every integration test skipped: with Docker down,
+# `go test` prints `ok` for a package whose tests all skipped. So test-cold
+# refuses to start without Docker, and STRATA_REQUIRE_DOCKER=1 makes testutil
+# fail rather than skip (as CI already does), in case Docker goes away
+# mid-run. `make test`, the inner loop, still skips (SPEC-002 11a).
+test-cold: ## Run every test with the Go test cache off (the gate: /verify and CI); needs Docker
+	@docker info >/dev/null 2>&1 || { echo "Docker is not running: start Docker Desktop (test-cold is a gate and won't skip the integration tests)" >&2; exit 1; }
+	@STRATA_REQUIRE_DOCKER=1 $(MAKE) --no-print-directory test GO_TEST_FLAGS=-count=1
 
 # Baseline for P6, ADR-119's evidence (SPEC-002/8b-ii) and the before/after
 # for SPEC-002/10a-ii. Never under -race, not in CI (runners are too noisy).
@@ -119,6 +125,20 @@ dev-down: ## Stop the local stack (keeps the pgdata volume)
 
 dev-logs: ## Follow the local stack's logs (Ctrl-C to stop)
 	$(COMPOSE) logs -f
+
+# Dev-only accounts for `make chaos` (infra/compose/seed.sql). Idempotent.
+# Needs the stack's PostgreSQL up and migrated.
+dev-seed: ## Insert the dev-only chaos accounts into the make dev database
+	$(COMPOSE) exec -T postgres psql -X -q -v ON_ERROR_STOP=1 -U strata -d strata < infra/compose/seed.sql
+
+# SPEC-002 11: crash-safety (AC4) against the running stack on the fake PSP.
+# It migrates before starting the gateway, kills the gateway mid-settlement,
+# restarts it and checks every payment resolves; it finishes with a plain
+# `make dev`, so the stack is left on the internal rail. Uses the make dev
+# database, scoped to the payments it creates.
+chaos: ## Kill the gateway mid-settlement and check recovery (AC4; fake PSP); needs Docker
+	@docker info >/dev/null 2>&1 || { echo "Docker is not running: start Docker Desktop" >&2; exit 1; }
+	python3 scripts/chaos/chaos.py
 
 # Runs on the host with the pinned Go, not in the gateway image. The DSN is
 # passed through the environment (exported for this target only), so it never

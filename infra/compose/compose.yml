@@ -45,6 +45,10 @@ services:
       LOG_LEVEL: info
       DATABASE_URL: "postgres://strata:strata@postgres:5432/strata?sslmode=disable"  # dev-only
       REDIS_ADDR: "redis:6379"
+      # Empty (off) unless the caller sets it: `make chaos` starts the stack
+      # with GATEWAY_ALLOW_FAKE_RAIL=1 to settle on the fake PSP. Config
+      # treats empty as unset and refuses any value other than "1".
+      GATEWAY_ALLOW_FAKE_RAIL: "${GATEWAY_ALLOW_FAKE_RAIL:-}"
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:

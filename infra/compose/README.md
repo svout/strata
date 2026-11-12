@@ -31,6 +31,10 @@ It only moves forward (`up`). Running it when nothing is pending is a no-op, and
 
 If `make dev` reports that the gateway is not ready, `make dev-logs` shows why.
 
+## Chaos run
+
+`make chaos` (SPEC-002 11) kills the gateway mid-settlement on this stack and checks that every payment it was settling resolves after the restart (AC4). It migrates first, applies `seed.sql` (two dev-only accounts, through `make dev-seed`), restarts the gateway on the fake PSP (`GATEWAY_ALLOW_FAKE_RAIL=1`, passed through `compose.yml`; empty means off), and finishes with a plain `make dev`, so the stack is left on the internal rail. It uses this database and checks only the payments it created. Takes about 30 s locally.
+
 ## Reset the data
 
 ```sh

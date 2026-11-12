@@ -109,3 +109,26 @@ jobs:
               if [ -f "$f" ]; then echo "- $f: tested"; else echo "- $f: not scaffolded yet (skipped)"; fi
             done
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # SPEC-002 11: crash safety (AC4) on the full `make dev` stack with the fake
+  # PSP. Its own job, beside test, so it can't slow the unit tests' feedback;
+  # on every PR. Setup Go is for `make migrate` (`go run` on the runner). The
+  # script prints the gateway's logs itself when it fails.
+  chaos:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: gateway/go.mod # the single Go version (ADR-116)
+          cache-dependency-path: gateway/go.sum
+
+      - name: Chaos (make chaos)
+        run: make chaos
+
+      - name: Stop the stack
+        if: always()
+        run: make dev-down
