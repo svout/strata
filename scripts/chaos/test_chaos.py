@@ -114,6 +114,112 @@ class ExpectationsTest(unittest.TestCase):
         self.assertTrue(any("want settled" in b for b in bad), bad)
 
 
+class RailRecordsMovesTest(unittest.TestCase):
+    def test_a_declined_record_moves_nothing(self):
+        self.assertEqual(chaos.check_rail_records(3, 2, want=3, want_moves=2), [])
+
+    def test_a_decline_that_moved_money(self):
+        bad = chaos.check_rail_records(3, 3, want=3, want_moves=2)
+        self.assertTrue(any("moved money 3 times" in b for b in bad), bad)
+
+
+class SequenceTest(unittest.TestCase):
+    def test_forward_and_repeats_pass(self):
+        self.assertEqual(chaos.sequence_problems("x", ["settling", "settling", "settled", "settled"]), [])
+        self.assertEqual(chaos.sequence_problems("x", ["settling", "failed", "failed"]), [])
+
+    def test_backwards(self):
+        self.assertTrue(chaos.sequence_problems("x", ["settled", "settling"]))
+        self.assertTrue(chaos.sequence_problems("x", ["settling", "created"]))
+
+    def test_final_to_other_final(self):
+        # Same rank, so only the "final is final" rule catches it.
+        self.assertTrue(chaos.sequence_problems("x", ["settling", "settled", "failed"]))
+        self.assertTrue(chaos.sequence_problems("x", ["failed", "settled"]))
+
+    def test_unknown_state(self):
+        self.assertTrue(chaos.sequence_problems("x", ["settled", "refunded"]))
+
+
+class HintTest(unittest.TestCase):
+    def test_accepted_with_shedding(self):
+        self.assertEqual(chaos.hint_problems("r", [503, 429, 204, 503]), [])
+
+    def test_none_accepted(self):
+        self.assertTrue(any("no hint was accepted" in b for b in chaos.hint_problems("r", [503, 503])))
+
+    def test_unexpected_status(self):
+        # A 200 would say something about the payment; ADR-124 says 204 always.
+        self.assertTrue(any("HTTP 200" in b for b in chaos.hint_problems("r", [204, 200])))
+        self.assertTrue(any("HTTP 500" in b for b in chaos.hint_problems("r", [204, 500])))
+
+
+PS_ID = "44444444-4444-4444-8444-444444444444"
+PD_ID = "55555555-5555-4555-8555-555555555555"
+AC5_IDS = chaos.AC5Ids(ID, PS_ID, PD_ID)
+AC5_ROWS = [SETTLED, replace(SETTLED, id=PS_ID, rail_ref="pay_" + PS_ID),
+            replace(FAILED, id=PD_ID, rail_ref="pay_" + PD_ID)]
+
+
+class ExpectAC5Test(unittest.TestCase):
+    def test_good(self):
+        self.assertEqual(chaos.expect_ac5(AC5_ROWS, AC5_IDS, "declined", 4.0, 5.0), [])
+
+    def test_declined_payment_settled(self):
+        rows = AC5_ROWS[:2] + [replace(SETTLED, id=PD_ID, rail_ref="pay_" + PD_ID)]
+        self.assertTrue(any(PD_ID in b and "want failed" in b for b in chaos.expect_ac5(rows, AC5_IDS, "", 4.0, 5.0)))
+
+    def test_pending_payment_never_settled(self):
+        rows = [AC5_ROWS[0], replace(FAILED, id=PS_ID, rail_ref="pay_" + PS_ID), AC5_ROWS[2]]
+        self.assertTrue(any(PS_ID in b and "want settled" in b for b in chaos.expect_ac5(rows, AC5_IDS, "declined", 4.0, 5.0)))
+
+    def test_wrong_failure_reason(self):
+        bad = chaos.expect_ac5(AC5_ROWS, AC5_IDS, "invalid_request", 4.0, 5.0)
+        self.assertTrue(any("failure reason" in b for b in bad), bad)
+
+    def test_settled_after_the_grace(self):
+        bad = chaos.expect_ac5(AC5_ROWS, AC5_IDS, "declined", 16.0, 5.0)
+        self.assertTrue(any("Recover may have done it" in b for b in bad), bad)
+
+    def test_declined_after_the_grace(self):
+        bad = chaos.expect_ac5(AC5_ROWS, AC5_IDS, "declined", 4.0, 16.0)
+        self.assertTrue(any(PD_ID in b and "Recover may have done it" in b for b in bad), bad)
+
+
+class SendHintsTest(unittest.TestCase):
+    """send_hints with post_webhook replaced: no gateway needed."""
+
+    def run_with(self, answers):
+        it = iter(answers)
+        orig = chaos.post_webhook
+        chaos.post_webhook = lambda ref, extra=None: next(it)
+        try:
+            chaos.send_hints("pay_x", 3, concurrent=True)
+        finally:
+            chaos.post_webhook = orig
+
+    def test_a_dropped_request_fails_the_batch(self):
+        with self.assertRaises(chaos.ChaosError):
+            self.run_with([(204, 0.0), (0, 0.0), (503, 1.0)])
+
+    def test_a_raising_request_still_counts(self):
+        def boom():
+            yield (204, 0.0)
+            yield (204, 0.0)
+            raise RuntimeError("thread blew up")
+        orig = chaos.post_webhook
+        gen = boom()
+        chaos.post_webhook = lambda ref, extra=None: next(gen)
+        try:
+            with self.assertRaises(chaos.ChaosError):
+                chaos.send_hints("pay_x", 3, concurrent=True)
+        finally:
+            chaos.post_webhook = orig
+
+    def test_shed_and_accepted(self):
+        self.run_with([(204, 0.0), (503, 1.0), (429, 1.0)])
+
+
 class ParseTest(unittest.TestCase):
     def test_parse_rows(self):
         rows = chaos.parse_rows([[ID, "settled", "fake", "pay_" + ID, "2", "0", "0", "1"]])
