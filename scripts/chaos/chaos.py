@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Chaos run against the `make dev` stack on the fake PSP (SPEC-002 11a, AC4).
+"""Chaos run against the `make dev` stack on the fake PSP (SPEC-002 11, AC4 and AC5).
 
-Kills the gateway mid-settlement, restarts it, and checks that every payment
-it was settling ends terminal, settled once, with balanced postings. Run it
-through `make chaos`. Standard library only (no new dependency); Docker and
-psql are driven through subprocess, HTTP through urllib.
+AC4 (11a): kills the gateway mid-settlement, restarts it, and checks that
+every payment it was settling ends terminal, settled once, with balanced
+postings. AC5 (11b): sends duplicate and out-of-order webhooks around the
+fake PSP's own answers (`make fakepsp`) and checks that no payment posts
+twice or moves backwards. Run it through `make chaos`. Standard library
+only (no new dependency); Docker and psql are driven through subprocess,
+HTTP through urllib.
 
 How a payment is held mid-settlement without changing the gateway: a psql
 session takes a table lock, so the gateway's next statement on that table
@@ -24,7 +27,8 @@ also bounded inside the gateway by its 3 s settle timeout
 after the gateway gave up, not mid-settlement, and the run is rejected.
 
 ADR-117: the script reads payments, ledger_entries and fake_rail_operations
-to check them, as a black-box test driver, and writes none of them. It also
+to check them, as a black-box test driver, and writes none of them (the
+fake's records are written by `make fakepsp`, through package rail). It also
 reads goose_db_version (the schema check before the gateway starts) and
 pg_stat_activity (who is waiting on a lock). Its two accounts come from
 infra/compose/seed.sql (`make dev-seed`).
@@ -61,6 +65,9 @@ KILL_WITHIN_S = 2.5
 # Recovery: payments.defaultRecoverGrace (15 s) plus wire.go's recoverEvery
 # (15 s) plus one pass, with room for a slow CI runner.
 RECOVERY_DEADLINE_S = 90.0
+# payments.defaultRecoverGrace: a settling payment younger than this is left
+# to its request (or a webhook); Recover takes it after.
+RECOVER_GRACE_S = 15.0
 # Extra creates held behind the fake-table lock, besides A. Each held request
 # holds one gateway pool connection while it waits, and the pool is pgx's
 # default (store.OpenPool): max(4, NumCPU), so 4 on a 4-vCPU CI runner. B, A
@@ -225,19 +232,21 @@ def check(rows: list[PaymentRow], *, final: bool) -> list[str]:
     return bad
 
 
-def check_rail_records(records: int, moves: int, want: int) -> list[str]:
-    """The fake PSP's records made during the run, against what AC4 allows.
+def check_rail_records(records: int, moves: int, want: int, want_moves: int | None = None) -> list[str]:
+    """The fake PSP's records made during a scenario, against what it allows.
 
     check() joins on each payment's own reference, so it can't see a second
     operation under another reference (recovery paying again with a fresh
-    one, say). This counts every record the run made: want of them, each
-    having moved the money once.
+    one, say). This counts every record the scenario made: want of them,
+    having moved the money want_moves times in all (default: once each; a
+    declined record moved nothing).
     """
+    want_moves = want if want_moves is None else want_moves
     bad = []
     if records != want:
         bad.append(f"the fake PSP has {records} records from this run, want {want}")
-    if moves != want:
-        bad.append(f"the fake PSP moved money {moves} times in this run, want {want}")
+    if moves != want_moves:
+        bad.append(f"the fake PSP moved money {moves} times in this run, want {want_moves}")
     return bad
 
 
@@ -259,6 +268,64 @@ def expect_after_recovery(rows: list[PaymentRow]) -> list[str]:
     bad = check(rows, final=True)
     bad += [f"payment {r.id}: {r.state} after recovery, want settled (the fake PSP settles every retry)"
             for r in rows if r.state != "settled"]
+    return bad
+
+
+# How far along its lifecycle a state is; settled and failed are both final.
+RANK = {"created": 0, "settling": 1, "settled": 2, "failed": 2}
+
+
+def sequence_problems(name: str, states: list[str]) -> list[str]:
+    """A payment's states, as polled between steps, must never move backwards.
+
+    Final is final: after settled or failed, the state may not change at all
+    (both rank 2, so a rank check alone would let settled become failed).
+    """
+    for prev, cur in zip(states, states[1:]):
+        if RANK.get(cur, -1) < RANK.get(prev, -1) or (RANK.get(prev) == 2 and cur != prev):
+            return [f"payment {name} moved backwards: {' -> '.join(states)}"]
+    return []
+
+
+def hint_problems(ref: str, statuses: list[int]) -> list[str]:
+    """Webhook answers for one batch of duplicate hints.
+
+    Every accepted hint is a 204 (ADR-124: the same answer whatever
+    happened). 503 is the webhook bound shedding (one slot on a 4-connection
+    pool, ADR-127) and 429 the per-source rate limit; both are a PSP's cue
+    to retry, so they are allowed, but at least one hint must get through.
+    """
+    bad = [f"webhook for {ref}: HTTP {s}, want 204, 503 or 429" for s in statuses if s not in (204, 503, 429)]
+    if 204 not in statuses:
+        bad.append(f"webhook for {ref}: no hint was accepted (answers {statuses})")
+    return bad
+
+
+@dataclass(frozen=True)
+class AC5Ids:
+    d: str   # settled at once, then duplicated
+    ps: str  # pending, then settled, hinted before and after
+    pd: str  # pending, then declined, then a late conflicting resolve
+
+
+def expect_ac5(rows: list[PaymentRow], ids: AC5Ids, pd_reason: str,
+               ps_settled_after_s: float, pd_failed_after_s: float) -> list[str]:
+    """The end of the AC5 scenarios: duplicates and reordering changed nothing they shouldn't."""
+    bad = check(rows, final=True)
+    want = {ids.d: ("settled", 2, 1), ids.ps: ("settled", 2, 1), ids.pd: ("failed", 0, 0)}
+    for r in rows:
+        if r.id in want and (r.state, r.payer_legs, max(r.moves, 0)) != want[r.id]:
+            st, legs, moves = want[r.id]
+            bad.append(f"payment {r.id}: {r.state}, {r.payer_legs} payer legs, moves {r.moves}; "
+                       f"want {st}, {legs}, {moves}")
+    if pd_reason != "declined":
+        bad.append(f"payment {ids.pd}: failure reason {pd_reason!r}, want 'declined'")
+    # Finished by the webhook, not by Recover: Recover doesn't look at a
+    # payment until it has been settling for the grace period.
+    for pid, verb, after in ((ids.ps, "settled", ps_settled_after_s), (ids.pd, "failed", pd_failed_after_s)):
+        if after >= RECOVER_GRACE_S:
+            bad.append(f"payment {pid}: {verb} {after:.1f} s after it was created, "
+                       f"past the {RECOVER_GRACE_S:.0f} s grace, so Recover may have done it, not the webhook")
     return bad
 
 
@@ -294,12 +361,96 @@ def create_payment(key: str, amount: int, timeout: float = 30.0) -> tuple[int, d
         return e.code, {}
 
 
+def post_webhook(ref: str, extra: dict | None = None) -> tuple[int, float]:
+    """One rail webhook hint: the status, and Retry-After in seconds (0 if none).
+
+    Status 0 means no HTTP answer at all (connection refused or reset, a
+    timeout): hint_problems rejects it like any other unexpected answer.
+    """
+    body = json.dumps({"ref": ref, **(extra or {})}).encode()
+    req = urllib.request.Request(GATEWAY + "/v1/rail/webhooks/fake", data=body, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, 0.0
+    except urllib.error.HTTPError as e:
+        return e.code, float(e.headers.get("Retry-After") or 0)
+    except OSError:  # URLError, a reset, a socket timeout
+        return 0, 0.0
+
+
+# Members a webhook body may carry that the gateway must ignore (ADR-124: the
+# body is only a hint naming a reference). Each batch mixes them in.
+FORGED = [None, {"outcome": "declined"}, {"outcome": "settled", "amount": 1}]
+
+
+def send_hints(ref: str, n: int, *, concurrent: bool) -> None:
+    """n duplicate hints for ref (concurrent or one after another), then
+    retries until one is accepted. Raises on any answer hint_problems rejects."""
+    extras = [FORGED[i % len(FORGED)] for i in range(n)]
+    answers: list[tuple[int, float]] = []
+    if concurrent:
+        lock = threading.Lock()
+
+        def send(extra):
+            try:
+                a = post_webhook(ref, extra)
+            except Exception:  # anything else: still one answer, and a wrong one
+                a = (0, 0.0)
+            with lock:
+                answers.append(a)
+        threads = [threading.Thread(target=send, args=(e,)) for e in extras]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(15)
+        with lock:
+            answers = list(answers)
+    else:
+        answers = [post_webhook(ref, e) for e in extras]
+    # Every request must have answered, so a dropped one can't hide behind
+    # another's 204.
+    if len(answers) < n:
+        raise ChaosError(f"webhook for {ref}: {len(answers)} of {n} concurrent hints answered")
+    for _ in range(5):
+        if any(s == 204 for s, _ in answers):
+            break
+        time.sleep(max((ra for _, ra in answers), default=1.0) or 1.0)
+        answers.append(post_webhook(ref))
+    bad = hint_problems(ref, [s for s, _ in answers])
+    if bad:
+        raise ChaosError("\n  ".join(bad))
+
+
+def fakepsp(*args: str) -> tuple[bool, str]:
+    """`make fakepsp ARGS=...`: whether it succeeded, and what it printed.
+
+    The exit code doesn't survive `go run` and make (any failure is make's
+    2), so callers tell failures apart by fakepsp's fixed messages.
+    """
+    # The timeout covers `go run`'s compile (or a toolchain fetch) too,
+    # which fakepsp's own runTimeout can't.
+    try:
+        res = subprocess.run(["make", "--no-print-directory", "fakepsp", "ARGS=" + " ".join(args)],
+                             cwd=ROOT, text=True, capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        raise ChaosError(f"make fakepsp {' '.join(args)} didn't finish in 120 s") from None
+    return res.returncode == 0, res.stdout + res.stderr
+
+
+def must_fakepsp(*args: str) -> None:
+    ok, out = fakepsp(*args)
+    if not ok:
+        raise ChaosError(f"make fakepsp {' '.join(args)} failed:\n{out}")
+
+
 class HeldCreate:
     """A create sent on its own thread, expected to block until the kill."""
 
     def __init__(self, key: str, amount: int) -> None:
         self.key, self.amount = key, amount
         self.status: int | None = None  # set only if a response came back
+        self.body: dict = {}
         self.answered_at: float | None = None
         self.error: Exception | None = None
         self._t = threading.Thread(target=self._send, daemon=True)
@@ -307,7 +458,7 @@ class HeldCreate:
 
     def _send(self) -> None:
         try:
-            self.status, _ = create_payment(self.key, self.amount)
+            self.status, self.body = create_payment(self.key, self.amount)
             self.answered_at = time.monotonic()
         except Exception as e:  # the kill drops the connection: expected
             self.error = e
@@ -316,10 +467,20 @@ class HeldCreate:
         self._t.join(35)
 
 
+# The gateway's backends: those with no application_name. pgx sets none
+# (seen in pg_stat_activity, 2026-11-12), psql sets "psql", `make fakepsp`
+# sets "fakepsp", and an IDE or GUI client sets its own.
+GATEWAY_BACKEND = "backend_type = 'client backend' AND datname = 'strata' AND application_name = ''"
+
+
+def gateway_backends(watch: Session) -> int:
+    return int(watch.value(f"SELECT count(*) FROM pg_stat_activity WHERE {GATEWAY_BACKEND};"))
+
+
 def lock_waiters(watch: Session, table: str) -> int:
     return int(watch.value(
         "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
-        f"AND state = 'active' AND query ILIKE '%{table}%' AND application_name <> 'psql';"))
+        f"AND state = 'active' AND query ILIKE '%{table}%' AND {GATEWAY_BACKEND};"))
 
 
 def wait_for_waiters(watch: Session, table: str, n: int, timeout: float = 10.0) -> float:
@@ -356,9 +517,30 @@ def start_stack(watch_factory=Session) -> None:
         raise ChaosError("the gateway didn't register the fake rail (GATEWAY_ALLOW_FAKE_RAIL=1 not passed through?)")
 
 
+def open_sessions(n: int) -> list[Session]:
+    """n psql sessions; if one fails to start, the others are closed."""
+    out: list[Session] = []
+    try:
+        for _ in range(n):
+            out.append(Session())
+    except BaseException:
+        for s in out:
+            s.close()
+        raise
+    return out
+
+
 def ac4() -> None:
+    sessions = open_sessions(3)
+    try:
+        _ac4(*sessions)
+    finally:
+        for s in sessions:  # close is a no-op on a session already closed
+            s.close()
+
+
+def _ac4(ledger_lock: Session, fake_lock: Session, watch: Session) -> None:
     run_id = uuid.uuid4().hex[:8]
-    ledger_lock, fake_lock, watch = Session(), Session(), Session()
     started = watch.value("SELECT now();")
     try:
         # B: the rail acts, the gateway's payer posting waits.
@@ -371,6 +553,11 @@ def ac4() -> None:
         wait_for_waiters(watch, "fake_rail_operations", len(held))
         # Still mid-settlement: every request is waiting on a lock right now.
         waiting = lock_waiters(watch, "ledger_entries") + lock_waiters(watch, "fake_rail_operations")
+        # The wait after the kill counts GATEWAY_BACKEND down to 0; if the
+        # filter matched nothing while the gateway was alive (its
+        # connections named after all), that wait would prove nothing.
+        if gateway_backends(watch) == 0:
+            raise ChaosError("no gateway connections match GATEWAY_BACKEND before the kill")
         # Timed before the kill command, so the CLI's own start-up doesn't
         # count against the window.
         killed_after = time.monotonic() - blocked_at
@@ -411,8 +598,7 @@ def ac4() -> None:
         resolved_in = time.monotonic() - restarted
         bad = expect_after_recovery(after)
         bad += check_rail_records(*rail_records(watch, started), want=len(ids))
-        total = int(watch.value(
-            "SELECT COALESCE(sum(CASE direction WHEN 'credit' THEN amount ELSE -amount END), 0) FROM ledger_entries;"))
+        total = ledger_total(watch)
         if total != 0:
             bad.append(f"the whole ledger sums to {total}, want 0")
         if bad:
@@ -423,6 +609,121 @@ def ac4() -> None:
     print(f"AC4 ok: killed {killed_after * 1000:.0f} ms after B blocked, with {waiting} requests waiting on locks "
           f"(B after the rail acted, {len(held)} before it did); after the restart all {len(ids)} payments "
           f"settled within {resolved_in:.0f} s, each moved once, every posting balanced, ledger sums to 0.")
+
+
+def ac5() -> None:
+    """Duplicate and out-of-order webhooks around the fake PSP's answers (AC5).
+
+    "Out of order" here (the body is only a reference, ADR-124, so there are
+    no ordered event payloads to shuffle): hints before the PSP's answer is
+    final, hints after it, a late conflicting resolution at the PSP after a
+    decline, and bodies carrying forged outcome members. Three payments:
+    D settles at once and is then hinted and replayed; PS goes pending,
+    then settled; PD goes pending, then declined.
+    """
+    sessions = open_sessions(2)
+    try:
+        _ac5(*sessions)
+    finally:
+        for s in sessions:
+            s.close()
+
+
+def _ac5(fake_lock: Session, watch: Session) -> None:
+    run_id = uuid.uuid4().hex[:8]
+    started = watch.value("SELECT now();")
+    seq: dict[str, list[str]] = {}
+
+    def observe(*ids: str) -> None:
+        for i in ids:
+            seq.setdefault(i, []).append(watch.value(f"SELECT state FROM payments WHERE id = '{i}';"))
+
+    try:
+        # D: settled synchronously, then duplicated, then the create replayed.
+        d_key = f"chaos-{run_id}-d"
+        status, d_body = create_payment(d_key, 2000)
+        if status != 201:
+            raise ChaosError(f"create D: HTTP {status}, want 201")
+        d = d_body["id"]
+        observe(d)
+        send_hints("pay_" + d, 10, concurrent=True)
+        observe(d)
+        status, replay = create_payment(d_key, 2000)
+        if (status, replay) != (201, d_body):
+            raise ChaosError(f"replaying D's create: HTTP {status} {replay}, want the stored 201 {d_body}")
+        observe(d)
+
+        # PS and PD reach settling with no record at the fake: the fake's
+        # first read waits on a lock until the gateway's own settle timeout
+        # gives up, which leaves them settling (an unknown outcome is not a
+        # failure, ADR-120) and answers the create's 201. Then the PSP side
+        # records them as pending, as an asynchronous PSP would.
+        fake_lock.query("BEGIN; LOCK TABLE fake_rail_operations IN ACCESS EXCLUSIVE MODE;")
+        held = [HeldCreate(f"chaos-{run_id}-ps", 2001), HeldCreate(f"chaos-{run_id}-pd", 2002)]
+        wait_for_waiters(watch, "fake_rail_operations", len(held))
+        for h in held:
+            h.join()
+        fake_lock.query("ROLLBACK;")
+        if [h.status for h in held] != [201, 201]:
+            raise ChaosError(f"held creates answered {[h.status for h in held]}, want 201s after the settle timeout")
+        ps, pd = held[0].body["id"], held[1].body["id"]
+        ids = AC5Ids(d, ps, pd)
+        observe(ps, pd)
+        bad = [f"payment {r.id}: {r.state}, moves {r.moves}; want settling with no rail record"
+               for r in rows_for(watch, [ps, pd]) if (r.state, r.moves) != ("settling", -1)]
+        if bad:
+            raise ChaosError("after the settle timeout:\n  " + "\n  ".join(bad))
+        for i in (ps, pd):
+            must_fakepsp("pend", "--ref", "pay_" + i)
+
+        # Early: the PSP hasn't finished, so a hint finds it pending and
+        # leaves the payment settling.
+        for i in (ps, pd):
+            send_hints("pay_" + i, 3, concurrent=False)
+        observe(ps, pd)
+        bad = [f"payment {r.id}: {r.state}, payer legs {r.payer_legs}, moves {r.moves}; want settling, 0, 0 (pending)"
+               for r in rows_for(watch, [ps, pd]) if (r.state, r.payer_legs, r.moves) != ("settling", 0, 0)]
+        if bad:
+            raise ChaosError("after early hints:\n  " + "\n  ".join(bad))
+
+        # PS: settled at the PSP, then concurrent duplicates, then late ones.
+        must_fakepsp("resolve", "--ref", "pay_" + ps, "--outcome", "settled")
+        send_hints("pay_" + ps, 8, concurrent=True)
+        observe(ps)
+        send_hints("pay_" + ps, 3, concurrent=False)
+        observe(ps)
+
+        # PD: declined at the PSP, duplicates, then a late conflicting
+        # resolution the PSP must refuse, then more hints.
+        must_fakepsp("resolve", "--ref", "pay_" + pd, "--outcome", "declined")
+        send_hints("pay_" + pd, 4, concurrent=True)
+        observe(pd)
+        ok, out = fakepsp("resolve", "--ref", "pay_" + pd, "--outcome", "settled")
+        if ok or "is not pending at the fake" not in out:
+            raise ChaosError(f"a late settle after the decline: want refused as not pending, got:\n{out}")
+        send_hints("pay_" + pd, 3, concurrent=False)
+        observe(pd)
+
+        ps_after, pd_after = (float(watch.value(f"SELECT extract(epoch FROM updated_at - created_at) "
+                                                f"FROM payments WHERE id = '{i}';")) for i in (ps, pd))
+        pd_reason = watch.value(f"SELECT COALESCE(failure_reason, '') FROM payments WHERE id = '{pd}';")
+        bad = expect_ac5(rows_for(watch, [d, ps, pd]), ids, pd_reason, ps_after, pd_after)
+        bad += check_rail_records(*rail_records(watch, started), want=3, want_moves=2)
+        for name, i in (("D", d), ("PS", ps), ("PD", pd)):
+            bad += sequence_problems(f"{name} {i}", seq[i])
+        total = ledger_total(watch)
+        if total != 0:
+            bad.append(f"the whole ledger sums to {total}, want 0")
+        if bad:
+            raise ChaosError("AC5:\n  " + "\n  ".join(bad))
+    finally:
+        fake_lock.close()
+        watch.close()
+
+    print(f"AC5 ok: D settled once through 10 duplicate hints and a replayed create; PS pending -> settled "
+          f"by its webhook {ps_after:.1f} s after creation; PD pending -> declined by its webhook "
+          f"{pd_after:.1f} s after creation, a late settle refused; "
+          f"states never moved backwards, the fake has 3 records and moved money twice, ledger sums to 0.")
 
 
 def payment_ids(watch: Session, since: str, amounts: list[int]) -> list[str]:
@@ -444,6 +745,12 @@ def payment_ids(watch: Session, since: str, amounts: list[int]) -> list[str]:
     return ids
 
 
+def ledger_total(watch: Session) -> int:
+    """The whole ledger's signed sum: 0 whenever every posting balances."""
+    return int(watch.value(
+        "SELECT COALESCE(sum(CASE direction WHEN 'credit' THEN amount ELSE -amount END), 0) FROM ledger_entries;"))
+
+
 def rail_records(watch: Session, since: str) -> tuple[int, int]:
     """How many records the fake PSP made since the run started, and their moves."""
     (records, moves), = watch.query("SELECT count(*), COALESCE(sum(moves), 0) FROM fake_rail_operations "
@@ -459,11 +766,11 @@ def rows_for(watch: Session, ids: list[str]) -> list[PaymentRow]:
 
 
 def wait_for_gateway_backends_gone(watch: Session, timeout: float = 15.0) -> None:
-    """Wait until PostgreSQL has noticed the dead gateway's connections."""
+    """Wait until PostgreSQL has noticed the dead gateway's connections
+    (GATEWAY_BACKEND, so an open database tool doesn't hold the run up)."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        n = int(watch.value("SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend' "
-                            "AND datname = 'strata' AND application_name <> 'psql';"))
+        n = gateway_backends(watch)
         if n == 0:
             return
         time.sleep(0.2)
@@ -491,6 +798,7 @@ def main() -> int:
     try:
         start_stack()
         ac4()
+        ac5()
         ok = True
     except ChaosError as e:
         print(f"chaos: FAILED: {e}", file=sys.stderr)

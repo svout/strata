@@ -26,7 +26,7 @@ COMPOSE := docker compose -f infra/compose/compose.yml
 # must never echo it: it can hold a real password.
 DATABASE_URL ?= postgres://strata:strata@127.0.0.1:5432/strata?sslmode=disable
 
-.PHONY: help install-lint lint test test-cold bench dev dev-down dev-logs dev-seed migrate chaos export-docs check-docs
+.PHONY: help install-lint lint test test-cold bench dev dev-down dev-logs dev-seed migrate fakepsp chaos export-docs check-docs
 
 help: ## List the make targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-13s %s\n", $$1, $$2}'
@@ -131,12 +131,13 @@ dev-logs: ## Follow the local stack's logs (Ctrl-C to stop)
 dev-seed: ## Insert the dev-only chaos accounts into the make dev database
 	$(COMPOSE) exec -T postgres psql -X -q -v ON_ERROR_STOP=1 -U strata -d strata < infra/compose/seed.sql
 
-# SPEC-002 11: crash-safety (AC4) against the running stack on the fake PSP.
-# It migrates before starting the gateway, kills the gateway mid-settlement,
-# restarts it and checks every payment resolves; it finishes with a plain
-# `make dev`, so the stack is left on the internal rail. Uses the make dev
-# database, scoped to the payments it creates.
-chaos: ## Kill the gateway mid-settlement and check recovery (AC4; fake PSP); needs Docker
+# SPEC-002 11: crash safety (AC4) and webhook duplicates/reordering (AC5)
+# against the running stack on the fake PSP. It migrates before starting the
+# gateway, kills the gateway mid-settlement, restarts it and checks every
+# payment resolves, then plays the PSP's side with `make fakepsp`; it
+# finishes with a plain `make dev`, so the stack is left on the internal
+# rail. Uses the make dev database, scoped to the payments it creates.
+chaos: ## Kill, restart, duplicate and reorder webhooks; check every payment (AC4, AC5; fake PSP); needs Docker
 	@docker info >/dev/null 2>&1 || { echo "Docker is not running: start Docker Desktop" >&2; exit 1; }
 	python3 scripts/chaos/chaos.py
 
@@ -148,6 +149,15 @@ chaos: ## Kill the gateway mid-settlement and check recovery (AC4; fake PSP); ne
 migrate: export DATABASE_URL := $(value DATABASE_URL)
 migrate: ## Apply pending schema migrations to DATABASE_URL (default: the make dev database)
 	cd gateway && GOTOOLCHAIN=$(GO_TOOLCHAIN) go run ./cmd/migrate up
+
+# Dev only (SPEC-002 11b): the fake PSP's side of an asynchronous payment,
+# e.g. `make fakepsp ARGS="resolve --ref pay_<uuid> --outcome settled"`. The
+# DSN is passed as for migrate. PGAPPNAME names its connections, so the
+# chaos run can tell them from the gateway's. It refuses
+# STRATA_ENV=production and applies no migration.
+fakepsp: export DATABASE_URL := $(value DATABASE_URL)
+fakepsp: ## Pend or resolve a reference at the fake PSP (dev only; ARGS="pend --ref pay_<uuid>")
+	cd gateway && PGAPPNAME=fakepsp GOTOOLCHAIN=$(GO_TOOLCHAIN) go run ./cmd/fakepsp $(ARGS)
 
 export-docs: ## Export vault specs into docs/specs (one-way, ADR-107; needs STRATA_VAULT)
 	@python3 scripts/export_docs.py export
