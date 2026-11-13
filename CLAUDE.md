@@ -54,3 +54,4 @@ Acceptance criteria are unclear; the change touches a Registry interface, crypto
 
 ## Commits
 Conventional Commits, one per step, with the spec ID: `feat(gateway): verify cart mandate against intent [SPEC-004]`.
+`main` is protected: every change goes through a PR with green `lint`, `test` and `chaos`, merged with a merge commit (never squash or rebase); never push to `main`.

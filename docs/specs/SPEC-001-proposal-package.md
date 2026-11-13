@@ -13,7 +13,7 @@ adr:
   - ADR-113
 created: 2026-09-26
 ---
-<!-- DO NOT EDIT: exported from vault "Specs/SPEC-001 Proposal Package.md" by make export-docs | source-sha256: 6230c2daf587aaf4f0a5a85dff790a4f773bd1a2db6410d299a83e6d4dbe414f | content-sha256: bcd26ac4d18d59929d3e127cea84992d7deaba36c1bc96f1ab7107a331d459e3 -->
+<!-- DO NOT EDIT: exported from vault "Specs/SPEC-001 Proposal Package.md" by make export-docs | source-sha256: 028563f86e808cff4222dcbab575825102a792a96d32b013a5de8e6f857f688e | content-sha256: e48d0c9b8a77405b81031e2de9afa73ee7787c01e647544ae8abca46222cefb9 -->
 
 # SPEC-001 Proposal Package
 
@@ -119,7 +119,7 @@ Each ≤ 1 day, one session. "Green" here means every note it touches is consist
   - Progress report deadline: S1 week 12 (handbook) or week 13 (lecture)?
   - Ethics form: E1 alone, or E1 + E2?
   - Is a simulated evaluation acceptable (deterministic agents, ADR-111; sandbox rail)?
-  - Repo: keep it private, or make it public (and when)?
+  - Repo: keep it private, or make it public (and when)? → **Made public by Ivan, 2026-11-13** (SPEC-002 14b, so branch protection is enforced); still to tell Sam.
   - Claude records the answers in Supervisor Log. Settled already (ADR-113, 2026-10-02): AI use across the project with full declaration, the scaffolding in 7 and 7c stands, the vault phase plan is the Gantt source, and drafting is permitted with Ivan editing, owning and able to explain all submitted text.
 - [ ] 14. **[Claude drafts → Ivan edits and owns] Proposal to the handbook.** *Claude's draft done 2026-10-02 (1,413 words; rev 1 in Proposal rev1 (notes)); waiting for Ivan's edit.*
   - Cut and restructure Proposal into the handbook's seven sections at 1,000–1,500 words.
