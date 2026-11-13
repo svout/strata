@@ -3,6 +3,9 @@ package config
 import (
 	"errors"
 	"log/slog"
+	"net/netip"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -49,6 +52,11 @@ func TestLoad_DefaultsAndOverrides(t *testing.T) {
 		// burst/rate = 60 s exactly is allowed.
 		{"overflow window at the cap", map[string]string{"GATEWAY_WEBHOOK_RATE": "1", "GATEWAY_WEBHOOK_BURST": "60"},
 			with(func(c *Config) { c.WebhookRate, c.WebhookBurst = 1, 60 })},
+		{"trusted proxies", map[string]string{"GATEWAY_TRUSTED_PROXIES": "10.0.0.0/8, 192.0.2.7/32,2001:db8::/48"},
+			with(func(c *Config) {
+				c.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8"),
+					netip.MustParsePrefix("192.0.2.7/32"), netip.MustParsePrefix("2001:db8::/48")}
+			})},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -56,7 +64,7 @@ func TestLoad_DefaultsAndOverrides(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Load() error = %v", err)
 			}
-			if got != tt.want {
+			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("Load() = %+v, want %+v", got, tt.want)
 			}
 		})
@@ -146,5 +154,55 @@ func TestErrWebhookOverflowWindow_NamesTheRelationship(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error text %q doesn't say %q", msg, want)
 		}
+	}
+}
+
+// The cap is inclusive: exactly maxTrustedProxies entries load (the
+// "too many" case below is one over).
+func TestLoad_TrustedProxiesAtCap(t *testing.T) {
+	cfg, err := Load(env(map[string]string{"GATEWAY_TRUSTED_PROXIES": strings.TrimSuffix(strings.Repeat("10.0.0.0/8,", maxTrustedProxies), ",")}))
+	if err != nil {
+		t.Fatalf("Load() with %d entries: %v, want it accepted", maxTrustedProxies, err)
+	}
+	if len(cfg.TrustedProxies) != maxTrustedProxies {
+		t.Fatalf("got %d prefixes, want %d", len(cfg.TrustedProxies), maxTrustedProxies)
+	}
+}
+
+// A bad trusted-proxy list fails Load with the sentinel and, at most, the
+// entry's position: never the value, which run logs verbatim.
+func TestLoad_InvalidTrustedProxies(t *testing.T) {
+	tests := []struct {
+		name, v string
+		entry   int // 0: no position (the list as a whole)
+	}{
+		{"bare IPv4", "10.0.0.1", 1},
+		{"bare IPv6", "2001:db8::1", 1},
+		{"host bits set", "10.0.0.1/8", 1},
+		{"IPv4 /0", "0.0.0.0/0", 1},
+		{"IPv6 /0", "::/0", 1},
+		{"zone", "fe80::%eth0/64", 1},
+		{"IPv4-mapped", "::ffff:10.0.0.0/104", 1},
+		{"trailing comma", "10.0.0.0/8,", 2},
+		{"empty middle entry", "10.0.0.0/8,,192.0.2.0/24", 2},
+		{"only whitespace", " ", 1},
+		{"third entry bad", "10.0.0.0/8,192.0.2.0/24,leaksecret-192.0.2.9", 3},
+		{"bits out of range", "10.0.0.0/33", 1},
+		{"too many", strings.Repeat("10.0.0.0/8,", 32) + "10.0.0.0/8", 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Load(env(map[string]string{"GATEWAY_TRUSTED_PROXIES": tt.v}))
+			if !errors.Is(err, ErrInvalidTrustedProxies) {
+				t.Fatalf("Load() error = %v, want ErrInvalidTrustedProxies", err)
+			}
+			want := ErrInvalidTrustedProxies.Error()
+			if tt.entry > 0 {
+				want += " (entry " + strconv.Itoa(tt.entry) + ")"
+			}
+			if err.Error() != want {
+				t.Errorf("error = %q, want %q (fixed text and the position only)", err, want)
+			}
+		})
 	}
 }

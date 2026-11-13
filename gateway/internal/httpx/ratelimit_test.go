@@ -8,11 +8,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"pgregory.net/rapid"
 )
 
 // SPEC-002 10b-ii-a: the per-source limiter for the rail webhook (ADR-124).
@@ -41,17 +44,23 @@ func (c *fakeElapsed) advance(d time.Duration) { c.set(c.get() + d) }
 func newTestLimiter(t *testing.T) (*RateLimiter, *fakeElapsed, *bytes.Buffer) {
 	t.Helper()
 	var buf bytes.Buffer
-	l := NewRateLimiter(2, 3, NewLogger(&buf, slog.LevelDebug))
+	l := NewRateLimiter(2, 3, nil, NewLogger(&buf, slog.LevelDebug))
 	clock := &fakeElapsed{}
 	l.elapsed = clock.get
 	return l, clock, &buf
+}
+
+// allowFrom takes a token for a request from remoteAddr (no headers), as
+// the middleware would.
+func allowFrom(l *RateLimiter, remoteAddr string) (bool, int) {
+	return l.allow(clientAddr(&http.Request{RemoteAddr: remoteAddr}, l.trusted))
 }
 
 // allowN reports how many of n requests from addr are allowed.
 func allowN(l *RateLimiter, addr string, n int) int {
 	allowed := 0
 	for range n {
-		if ok, _ := l.allow(addr); ok {
+		if ok, _ := allowFrom(l, addr); ok {
 			allowed++
 		}
 	}
@@ -64,7 +73,7 @@ func TestRateLimiter_BurstThenRefill(t *testing.T) {
 	if got := allowN(l, "192.0.2.1:1000", 5); got != 3 {
 		t.Fatalf("allowed %d of 5 at once, want the burst of 3", got)
 	}
-	if ok, wait := l.allow("192.0.2.1:1000"); ok || wait != 1 {
+	if ok, wait := allowFrom(l, "192.0.2.1:1000"); ok || wait != 1 {
 		t.Fatalf("empty bucket = %v, Retry-After %d; want refused, 1", ok, wait)
 	}
 	clock.advance(500 * time.Millisecond) // one token at 2/s
@@ -81,12 +90,12 @@ func TestRateLimiter_BurstThenRefill(t *testing.T) {
 func TestRateLimiter_RetryAfterRoundsUp(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
-	l := NewRateLimiter(0.25, 1, NewLogger(&buf, slog.LevelDebug)) // one token per 4 s
+	l := NewRateLimiter(0.25, 1, nil, NewLogger(&buf, slog.LevelDebug)) // one token per 4 s
 	clock := &fakeElapsed{}
 	l.elapsed = clock.get
-	l.allow("192.0.2.1:1")
+	allowFrom(l, "192.0.2.1:1")
 	clock.advance(1500 * time.Millisecond) // 0.375 tokens: 2.5 s to go
-	if _, wait := l.allow("192.0.2.1:1"); wait != 3 {
+	if _, wait := allowFrom(l, "192.0.2.1:1"); wait != 3 {
 		t.Fatalf("Retry-After = %d, want 3 (2.5 s rounded up)", wait)
 	}
 }
@@ -121,12 +130,12 @@ func TestRateLimiter_ConcurrentRequestsShareTheBucket(t *testing.T) {
 	t.Parallel()
 	const goroutines, perGoroutine = 8, 2000
 	var buf syncBuffer
-	l := NewRateLimiter(200, 10, NewLogger(&buf, slog.LevelDebug))
+	l := NewRateLimiter(200, 10, nil, NewLogger(&buf, slog.LevelDebug))
 	l.maxSources = 16
 	clock := &lockedClock{l: l}
 	l.elapsed = clock.get
 
-	if l.allow("192.0.2.1:1"); clock.unlocked.Load() != 0 {
+	if allowFrom(l, "192.0.2.1:1"); clock.unlocked.Load() != 0 {
 		t.Fatal("the clock was read outside the lock")
 	}
 	var allowed atomic.Int64
@@ -134,10 +143,10 @@ func TestRateLimiter_ConcurrentRequestsShareTheBucket(t *testing.T) {
 	for g := range goroutines {
 		wg.Go(func() {
 			for i := range perGoroutine {
-				if ok, _ := l.allow("192.0.2.1:1"); ok {
+				if ok, _ := allowFrom(l, "192.0.2.1:1"); ok {
 					allowed.Add(1)
 				}
-				l.allow(fmt.Sprintf("198.51.100.%d:1", (g*perGoroutine+i)%64)) // churns the map
+				allowFrom(l, fmt.Sprintf("198.51.100.%d:1", (g*perGoroutine+i)%64)) // churns the map
 			}
 		})
 	}
@@ -191,7 +200,8 @@ func TestRateLimiter_SourceIdentity(t *testing.T) {
 	}
 }
 
-// X-Forwarded-For is ignored: only RemoteAddr names the source.
+// With no trusted proxies (the default), X-Forwarded-For is ignored: only
+// RemoteAddr names the source.
 func TestRateLimiter_IgnoresForwardedFor(t *testing.T) {
 	t.Parallel()
 	l, _, _ := newTestLimiter(t)
@@ -257,11 +267,11 @@ func TestRateLimiter_FullMapOverflowsThenSweeps(t *testing.T) {
 
 func mustSource(t *testing.T, addr string) netip.Prefix {
 	t.Helper()
-	p, ok := sourceOf(addr)
+	a, ok := clientAddr(&http.Request{RemoteAddr: addr}, nil)
 	if !ok {
-		t.Fatalf("sourceOf(%q) failed", addr)
+		t.Fatalf("clientAddr(%q) failed", addr)
 	}
-	return p
+	return sourceOf(a)
 }
 
 // The middleware answers 429 rate_limited with Retry-After, never calls the
@@ -270,7 +280,7 @@ func mustSource(t *testing.T, addr string) netip.Prefix {
 func TestRateLimiter_Middleware(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
-	l := NewRateLimiter(2, 1, NewLogger(&buf, slog.LevelInfo))
+	l := NewRateLimiter(2, 1, nil, NewLogger(&buf, slog.LevelInfo))
 	called := 0
 	h := l.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		called++
@@ -312,7 +322,221 @@ func TestNewRateLimiter_RejectsBadValues(t *testing.T) {
 					t.Errorf("NewRateLimiter(%v, %d) did not panic", tc.rate, tc.burst)
 				}
 			}()
-			NewRateLimiter(tc.rate, tc.burst, slog.New(slog.DiscardHandler))
+			NewRateLimiter(tc.rate, tc.burst, nil, slog.New(slog.DiscardHandler))
 		}()
+	}
+}
+
+// SPEC-002 14c (ADR-128): the client address behind trusted proxies.
+
+var testTrusted = []netip.Prefix{
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("2001:db8:ffff::/48"),
+}
+
+func TestClientAddr(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		remote string
+		xff    []string // header lines, in order
+		want   string   // "" means false: the overflow bucket
+	}{
+		{"untrusted peer, forged header ignored", "192.0.2.1:1", []string{"198.51.100.9"}, "192.0.2.1"},
+		{"trusted peer, no header", "10.0.0.1:1", nil, "10.0.0.1"},
+		{"one trusted hop", "10.0.0.1:1", []string{"198.51.100.9"}, "198.51.100.9"},
+		{"chain of trusted hops", "10.0.0.1:1", []string{"198.51.100.9, 10.1.0.1, 10.2.0.1"}, "198.51.100.9"},
+		{"forged entries left of the client are never read", "10.0.0.1:1", []string{"garbage, 203.0.113.5,198.51.100.9"}, "198.51.100.9"},
+		{"every hop trusted: the leftmost", "10.0.0.1:1", []string{"10.9.0.1, 10.8.0.1"}, "10.9.0.1"},
+		{"several header lines, walked last line first", "10.0.0.1:1", []string{"203.0.113.5", "198.51.100.9, 10.1.0.1"}, "198.51.100.9"},
+		{"several lines, client in the first", "10.0.0.1:1", []string{"203.0.113.5", "10.1.0.1"}, "203.0.113.5"},
+		{"IPv4-mapped entry as IPv4", "10.0.0.1:1", []string{"::ffff:198.51.100.9"}, "198.51.100.9"},
+		{"IPv4-mapped trusted peer", "[::ffff:10.0.0.1]:1", []string{"198.51.100.9"}, "198.51.100.9"},
+		{"IPv6 trusted peer and client", "[2001:db8:ffff::1]:1", []string{"2001:db8:1::5"}, "2001:db8:1::5"},
+		{"zone in an entry", "10.0.0.1:1", []string{"fe80::1%eth0"}, ""},
+		{"malformed entry right of the client", "10.0.0.1:1", []string{"198.51.100.9, nope"}, ""},
+		{"empty entry", "10.0.0.1:1", []string{"198.51.100.9,"}, ""},
+		{"empty header line", "10.0.0.1:1", []string{""}, ""},
+		{"port in entry", "10.0.0.1:1", []string{"198.51.100.9:443"}, ""},
+		{"brackets in entry", "10.0.0.1:1", []string{"[2001:db8:1::5]"}, ""},
+		{"unparseable RemoteAddr", "nope", []string{"198.51.100.9"}, ""},
+		{"16 trusted hops: still the leftmost", "10.0.0.1:1", []string{strings.TrimSuffix(strings.Repeat("10.0.0.2,", 16), ",")}, "10.0.0.2"},
+		{"17 hops: over the cap", "10.0.0.1:1", []string{strings.TrimSuffix(strings.Repeat("10.0.0.2,", 17), ",")}, ""},
+	} {
+		r := &http.Request{RemoteAddr: tc.remote, Header: http.Header{}}
+		for _, v := range tc.xff {
+			r.Header.Add("X-Forwarded-For", v)
+		}
+		got, ok := clientAddr(r, testTrusted)
+		switch {
+		case tc.want == "" && ok:
+			t.Errorf("%s: = %v, want the overflow bucket (false)", tc.name, got)
+		case tc.want != "" && (!ok || got != netip.MustParseAddr(tc.want)):
+			t.Errorf("%s: = %v, %v; want %s", tc.name, got, ok, tc.want)
+		}
+	}
+}
+
+// Through the middleware: behind a trusted proxy two clients get a bucket
+// each, and a caller connecting directly can't pick its bucket with the
+// header. The default limiter (no trusted proxies) is
+// TestRateLimiter_IgnoresForwardedFor.
+func TestRateLimiter_TrustedProxy(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	l := NewRateLimiter(2, 3, testTrusted, NewLogger(&buf, slog.LevelDebug))
+	l.elapsed = (&fakeElapsed{}).get
+	h := l.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	allowed := func(remote, xff string, n int) int {
+		got := 0
+		for range n {
+			req := httptest.NewRequest(http.MethodPost, "/", nil)
+			req.RemoteAddr = remote
+			req.Header.Set("X-Forwarded-For", xff)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code == http.StatusNoContent {
+				got++
+			}
+		}
+		return got
+	}
+	if a, b := allowed("10.0.0.1:1", "198.51.100.1", 5), allowed("10.0.0.1:2", "198.51.100.2", 5); a != 3 || b != 3 {
+		t.Fatalf("two clients behind the proxy allowed %d and %d of 5, want a burst of 3 each", a, b)
+	}
+	// A direct caller rotating the header still has one bucket.
+	got := 0
+	for i := range 5 {
+		got += allowed("192.0.2.1:1", "203.0.113."+strconv.Itoa(i+1), 1)
+	}
+	if got != 3 {
+		t.Fatalf("direct caller with a rotating header allowed %d of 5, want 3 (one bucket)", got)
+	}
+	// Nothing about either address reaches the log, even at Debug (Data
+	// Management Plan §1). The log isn't empty: the limited lines are there.
+	if !strings.Contains(buf.String(), "request rate limited") {
+		t.Fatalf("no limited line logged, so the check below would prove nothing:\n%s", &buf)
+	}
+	for _, s := range []string{"198.51.100", "203.0.113", "192.0.2.1", "10.0.0.1"} {
+		if strings.Contains(buf.String(), s) {
+			t.Fatalf("log contains %q:\n%s", s, &buf)
+		}
+	}
+}
+
+// Properties of clientAddr over drawn peers and X-Forwarded-For chains
+// (addresses drawn from a small pool, so trusted and untrusted mix often).
+func TestClientAddr_Properties(t *testing.T) {
+	t.Parallel()
+	pool := []string{"10.0.0.1", "10.2.3.4", "2001:db8:ffff::9", "::ffff:10.0.0.7", // trusted
+		"192.0.2.1", "198.51.100.9", "2001:db8:1::5", "::ffff:203.0.113.5"} // not
+	addr := rapid.SampledFrom(pool)
+	chain := rapid.SliceOfN(addr, 0, 20)
+	join := func(c []string) string { return strings.Join(c, ", ") }
+	req := func(peer string, xff []string) *http.Request {
+		r := &http.Request{RemoteAddr: netip.AddrPortFrom(netip.MustParseAddr(peer), 1).String(), Header: http.Header{}}
+		if len(xff) > 0 {
+			r.Header.Set("X-Forwarded-For", join(xff))
+		}
+		return r
+	}
+
+	// An untrusted peer is the client, whatever the header says.
+	t.Run("untrusted peer ignores the header", func(t *testing.T) {
+		rapid.Check(t, func(rt *rapid.T) {
+			peer := rapid.SampledFrom(pool[4:]).Draw(rt, "peer")
+			got, ok := clientAddr(req(peer, chain.Draw(rt, "xff")), testTrusted)
+			if !ok || got != normalise(netip.MustParseAddr(peer)) {
+				rt.Fatalf("= %v, %v; want the peer %s", got, ok, peer)
+			}
+		})
+	})
+	// Once an untrusted hop is in the chain, anything prepended to the left
+	// (what a caller controls) changes nothing. The untrusted entry comes
+	// first and trusted hops follow it, so the walk crosses those hops
+	// before it reaches the client.
+	t.Run("prepended entries can't move the result", func(t *testing.T) {
+		rapid.Check(t, func(rt *rapid.T) {
+			peer := rapid.SampledFrom(pool[:4]).Draw(rt, "peer")
+			hops := rapid.SliceOfN(rapid.SampledFrom(pool[:4]), 0, maxForwardedHops-1).Draw(rt, "trusted hops")
+			right := append([]string{rapid.SampledFrom(pool[4:]).Draw(rt, "untrusted")}, hops...)
+			want, wok := clientAddr(req(peer, right), testTrusted)
+			left := rapid.SliceOfN(rapid.SampledFrom(append(pool, "junk", "")), 1, 10).Draw(rt, "left")
+			got, ok := clientAddr(req(peer, append(left, right...)), testTrusted)
+			if got != want || ok != wok {
+				rt.Fatalf("= %v, %v with entries prepended; %v, %v without", got, ok, want, wok)
+			}
+		})
+	})
+	// clientAddr agrees with a direct model of the rule: walk the peer and
+	// then the chain nearest first; the first untrusted address is the
+	// client, otherwise the leftmost; a client past maxForwardedHops (or an
+	// all-trusted chain longer than that) is the overflow bucket.
+	t.Run("matches the model", func(t *testing.T) {
+		rapid.Check(t, func(rt *rapid.T) {
+			peer := addr.Draw(rt, "peer")
+			xff := chain.Draw(rt, "xff")
+			got, ok := clientAddr(req(peer, xff), testTrusted)
+
+			hops := append([]string{peer}, slicesReversed(xff)...) // nearest first
+			want, wok := netip.Addr{}, false
+			for i, h := range hops {
+				if i > maxForwardedHops { // hops[0] is the peer, not counted
+					break
+				}
+				a := normalise(netip.MustParseAddr(h))
+				want, wok = a, true
+				if !isTrusted(a, testTrusted) {
+					break
+				}
+				if i == len(hops)-1 {
+					break // all trusted: the leftmost
+				}
+				if i == maxForwardedHops {
+					want, wok = netip.Addr{}, false // the walk would go on past the cap
+				}
+			}
+			if got != want || ok != wok {
+				rt.Fatalf("clientAddr = %v, %v; model says %v, %v", got, ok, want, wok)
+			}
+		})
+	})
+}
+
+func slicesReversed(s []string) []string {
+	out := make([]string, len(s))
+	for i, v := range s {
+		out[len(s)-1-i] = v
+	}
+	return out
+}
+
+// BenchmarkClientAddr is the per-request cost behind a trusted proxy: a
+// three-hop chain, the worst common case.
+func BenchmarkClientAddr(b *testing.B) {
+	r := &http.Request{RemoteAddr: "10.0.0.1:443", Header: http.Header{}}
+	r.Header.Set("X-Forwarded-For", "198.51.100.9, 10.1.0.1, 10.2.0.1")
+	b.ReportAllocs()
+	for b.Loop() {
+		clientAddr(r, testTrusted)
+	}
+}
+
+// Requests with no usable client address are counted, allowed or not; a
+// request with an address isn't (ADR-128: how a proxy writing ip:port
+// shows up).
+func TestRateLimiter_Unattributed(t *testing.T) {
+	t.Parallel()
+	l := NewRateLimiter(2, 3, testTrusted, slog.New(slog.DiscardHandler))
+	l.elapsed = (&fakeElapsed{}).get
+	h := l.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	for _, xff := range []string{"198.51.100.9:443", "198.51.100.9:443", "198.51.100.9:443", "198.51.100.9:443", "198.51.100.9"} {
+		req := httptest.NewRequest(http.MethodPost, "/", nil)
+		req.RemoteAddr = "10.0.0.1:1"
+		req.Header.Set("X-Forwarded-For", xff)
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	if got := l.Unattributed(); got != 4 {
+		t.Fatalf("Unattributed() = %d, want 4 (the ip:port entries, the limited one included)", got)
 	}
 }

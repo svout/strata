@@ -153,7 +153,7 @@ func compose(cfg config.Config, pool *pgxpool.Pool, log *slog.Logger, checks ...
 	// behind both gates is fully built before either opens. The order isn't
 	// pinned by a test (Ivan, 2026-10-31).
 	gw := gateway{wired: wired, pay: newGate(payGateTitle), hooks: newGate(hookGateTitle),
-		limiter: httpx.NewRateLimiter(cfg.WebhookRate, cfg.WebhookBurst, log)}
+		limiter: httpx.NewRateLimiter(cfg.WebhookRate, cfg.WebhookBurst, cfg.TrustedProxies, log)}
 	r := httpx.NewRouter(log, append(checks, gw.pay.readyCheck())...)
 	mountAPIs(r, gw.pay, gw.hooks, gw.limiter)
 	gw.router = r
