@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -453,7 +454,7 @@ func TestWireSettlement_SkewNotReadyThenMigrated(t *testing.T) {
 
 	g, hooks := newGate(payGateTitle), newGate(hookGateTitle)
 	router := httpx.NewRouter(log, g.readyCheck())
-	mountAPIs(router, g, hooks, httpx.NewRateLimiter(config.DefaultWebhookRate, config.DefaultWebhookBurst, log))
+	mountAPIs(router, g, hooks, httpx.NewRateLimiter(config.DefaultWebhookRate, config.DefaultWebhookBurst, nil, log))
 
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -925,6 +926,51 @@ func TestMountedAPIs_LimiterBeforeGate(t *testing.T) {
 		rec := serveFrom(m.router, http.MethodPost, "/v1/payments", `{}`, "198.51.100.1:1")
 		if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), payGateTitle) {
 			t.Fatalf("payments request %d = %d %s, want 503 %q (no limiter)", i, rec.Code, rec.Body, payGateTitle)
+		}
+	}
+}
+
+// SPEC-002 14c (ADR-128): compose hands GATEWAY_TRUSTED_PROXIES to the
+// webhook's limiter. Behind the trusted proxy two clients get a bucket
+// each; a caller connecting directly can't choose its bucket with the
+// header; and no address, peer or forwarded, reaches the log (AC8, Data
+// Management Plan §1). Gates closed and a lazy pool, as in
+// TestMountedAPIs_LimiterBeforeGate, so it never skips without Docker.
+func TestMountedAPIs_LimiterTrustsConfiguredProxy(t *testing.T) {
+	t.Parallel()
+	const burst = 2
+	log, logs := testLogger()
+	cfg := config.Config{WebhookRate: 1, WebhookBurst: burst, TrustedProxies: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}}
+	m, err := compose(cfg, lazyPool(t, "8"), log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limited := func(remote, xff string, n int) int {
+		got := 0
+		for range n {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/rail/webhooks/fake", strings.NewReader(`{"ref":"x"}`))
+			req.RemoteAddr = remote
+			req.Header.Set("X-Forwarded-For", xff)
+			m.router.ServeHTTP(rec, req)
+			if rec.Code == http.StatusTooManyRequests {
+				got++
+			}
+		}
+		return got
+	}
+	if a, b := limited("10.0.0.1:1", "198.51.100.1", burst+1), limited("10.0.0.1:2", "198.51.100.2", burst+1); a != 1 || b != 1 {
+		t.Fatalf("clients behind the proxy: %d and %d of %d limited, want 1 each (a bucket each)", a, b, burst+1)
+	}
+	if got := limited("192.0.2.1:1", "203.0.113.1", burst) + limited("192.0.2.1:1", "203.0.113.2", 1); got != 1 {
+		t.Fatalf("direct caller rotating the header: %d limited, want 1 (one bucket)", got)
+	}
+	if !strings.Contains(logs.String(), `"status":429`) {
+		t.Fatalf("no 429 in the request log, so the check below would prove nothing:\n%s", logs)
+	}
+	for _, s := range []string{"198.51.100", "203.0.113", "192.0.2.1", "10.0.0.1"} {
+		if strings.Contains(logs.String(), s) {
+			t.Fatalf("log contains %q:\n%s", s, logs)
 		}
 	}
 }
