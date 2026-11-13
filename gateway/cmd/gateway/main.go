@@ -36,6 +36,10 @@ func run() error {
 		return err
 	}
 	log := httpx.NewLogger(os.Stdout, cfg.LogLevel)
+	// Computed here, before anything serves, so a build defect in the
+	// embedded migrations (see store.LatestVersion) stops the process at
+	// once rather than panicking later in the wiring goroutine.
+	store.LatestVersion()
 
 	// Both clients connect lazily: the gateway starts even if PostgreSQL or
 	// Redis is down, and /readyz reports it until they are up. Setup errors

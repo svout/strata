@@ -166,12 +166,10 @@ func TestRecover_FakeRestartAfterLostResponse(t *testing.T) {
 	assertBalances(t, pool, map[uuid.UUID]int64{payer: -1250, uuid.UUID(clearingFor(t, pool, rail.FakeName)): 1250})
 }
 
-// wire.go, option (a) (Ivan, 2026-10-25): a fake gateway on a database at
-// version 5 starts, but fake_rail_operations isn't there. Every fake Settle
-// is then rail.ErrFakeStore, an unknown outcome: the payment stays settling
-// with nothing posted, recovery retries it, and once 00006 is applied the
-// next pass settles it, once. Renaming the table away stands for "not
-// migrated yet", and renaming it back for `make migrate`.
+// A fake Settle whose store write fails (rail.ErrFakeStore, an unknown
+// outcome) leaves the payment settling with nothing posted; recovery retries
+// it, and once the fake's store works again the next pass settles it, once.
+// Renaming fake_rail_operations away is how the test makes the store fail.
 func TestRecover_FakeTableMissingThenMigrated(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)

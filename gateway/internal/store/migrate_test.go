@@ -51,8 +51,8 @@ func TestUpAppliesSchema(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT max(version_id) FROM goose_db_version").Scan(&version); err != nil {
 		t.Fatalf("read goose version: %v", err)
 	}
-	if version != 7 {
-		t.Errorf("schema version = %d, want 7", version)
+	if version != store.LatestVersion() {
+		t.Errorf("schema version = %d, want %d", version, store.LatestVersion())
 	}
 	// 00007: keyed by the hash, and the CHECK that ties the hash to the key.
 	for name, want := range map[string]string{
@@ -113,10 +113,32 @@ func TestDownRemovesSchemaAndUpRestoresIt(t *testing.T) {
 	}
 }
 
+// TestLatestVersion: the version derived from the embedded file names is
+// the one goose itself would migrate to (its own list of sources), and the
+// one a database migrated by store.Up reports.
+func TestLatestVersion(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	p, err := goose.NewProvider(goose.DialectPostgres, sqlDB(t, pool), os.DirFS("migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want int64
+	for _, src := range p.ListSources() {
+		want = max(want, src.Version)
+	}
+	if got := store.LatestVersion(); got != want || want < 7 {
+		t.Errorf("LatestVersion = %d, want %d (goose's sources, at least 7)", got, want)
+	}
+	if got, err := store.SchemaVersion(testContext(t), sqlDB(t, pool)); err != nil || got != want {
+		t.Errorf("a migrated database's SchemaVersion = %d, %v; want %d", got, err, want)
+	}
+}
+
 // SchemaVersion reads goose's version without migrating anything: the
-// highest version recorded (7 after Up, 4 once the rows above it are gone), and 0
-// with no version table, which it must not create (the gateway calls it and
-// never migrates).
+// highest version recorded (store.LatestVersion after Up, 4 once the rows
+// above it are gone), and 0 with no version table, which it must not create
+// (the gateway calls it and never migrates).
 func TestSchemaVersion(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
@@ -129,7 +151,7 @@ func TestSchemaVersion(t *testing.T) {
 			t.Errorf("SchemaVersion = %d, %v; want %d", got, err, want)
 		}
 	}
-	read(7)
+	read(store.LatestVersion())
 	// A database migrated to 4 only, as the gateway's startup sees it before
 	// 00005: the version is the highest row.
 	mustExec(ctx, t, pool, "DELETE FROM goose_db_version WHERE version_id >= 5")

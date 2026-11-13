@@ -1,10 +1,11 @@
 package main
 
 // Settlement wiring (SPEC-002 10a-ii-b). The gateway starts serving at once;
-// the rail is wired in the background once its clearing account is known,
-// and until then /readyz is not ready and /v1/payments answers 503.
+// the rail is wired in the background once the schema is at the version
+// this binary needs (SPEC-002 14a) and its clearing account is known, and
+// until then /readyz is not ready and /v1/payments answers 503.
 // This file is the one place that maps the startup lookup's errors to
-// "retry" or "exit" (ADR-125 §3).
+// "retry" or "exit" (ADR-125 §3, as amended).
 
 import (
 	"context"
@@ -168,16 +169,8 @@ func wireSettlement(ctx context.Context, pool *pgxpool.Pool, w wiring, locker id
 	var adapter rail.Adapter
 	if w.allowFake {
 		// The fake keeps its records in fake_rail_operations (migration
-		// 00006). Startup only checks the version that seeds the clearing
-		// accounts (clearingSchemaVersion, 5), so a fake gateway on a
-		// database at version 5 wires and serves, and the table isn't there
-		// yet. Left that way on purpose (Ivan, 2026-10-25, option a): every
-		// fake Settle then fails with rail.ErrFakeStore, an unknown outcome,
-		// so the payment stays settling, nothing is posted, and Recover
-		// retries it every pass; once `make migrate` applies 00006 the next
-		// pass settles it, once. Nothing fails closed or double-pays, and
-		// the fake never runs in production, so a second startup gate just
-		// for the fake's table isn't worth its code.
+		// 00006). Wiring needs the latest schema (14a), so the table is
+		// always there by now.
 		adapter = rail.NewFake(pool, w.fakeSteps...)
 		log.LogAttrs(ctx, slog.LevelWarn, "fake rail registered: payments settle without moving real money (GATEWAY_ALLOW_FAKE_RAIL=1)")
 	} else {
@@ -193,10 +186,11 @@ func wireSettlement(ctx context.Context, pool *pgxpool.Pool, w wiring, locker id
 	return nil
 }
 
-// clearingSchemaVersion is the migration that seeds the clearing accounts
-// (00005_clearing_accounts.sql). Below it, a missing clearing account means
-// "not migrated yet"; at or above it, a misconfigured database.
-const clearingSchemaVersion = 5
+// errSchemaBehind means the database's schema is older than this binary
+// needs (store.LatestVersion): not migrated yet, so retry. Wiring there
+// would serve 500s once a request reached a column or table the code
+// expects (SPEC-002 14a, ADR-126's version skew).
+var errSchemaBehind = errors.New("schema older than this binary needs")
 
 // backoff is a capped exponential retry delay: first, then doubling up to
 // max. The zero value is not usable; see defaultTimings.
@@ -236,36 +230,53 @@ var errConfig = errors.New("configuration error")
 // resolveClearing looks up railName's clearing account, retrying until it
 // can tell the answer is final:
 //
-//   - found: return it.
-//   - the version or the account couldn't be read (database unreachable,
-//     accounts table missing): transient; retry.
-//   - no account: the schema version decides. Below clearingSchemaVersion
-//     the seed hasn't run: transient, retry. At or above it the row was
-//     removed: errConfig, the gateway exits.
+//   - found: return it. A schema newer than this binary knows is accepted
+//     (the gate is a minimum, ADR-125 §3's second amendment) with one Warn.
+//   - the version couldn't be read (database unreachable): transient; retry.
+//   - the schema is behind store.LatestVersion: not migrated yet; retry.
+//   - no account at the latest schema: the seed row was removed: errConfig,
+//     the gateway exits.
+//   - the account couldn't be read: transient; retry.
 //
-// Every retry logs one fixed line naming `make migrate`, the usual cause on
-// a fresh `make dev` stack. The underlying error is never logged: a driver
+// Every retry logs one fixed line; the schema-behind one names `make
+// migrate`, the usual cause on a fresh `make dev` stack, and the other names
+// no remedy, since an unreachable database has several. The underlying error
+// is never logged: a driver
 // error on the first connection names host, user and database. It returns
 // ctx's error if ctx ends first.
 func resolveClearing(ctx context.Context, pool *pgxpool.Pool, db *sql.DB, railName string, log *slog.Logger, wait backoff, timeout time.Duration) (ledger.ClearingAccountID, error) {
 	for {
 		id, version, err := lookupClearing(ctx, pool, db, railName, timeout)
-		var reason string
+		required := store.LatestVersion()
 		switch {
 		case err == nil:
+			if version > required {
+				// Not an error: migrate-then-deploy means a schema briefly
+				// ahead of an old binary. Still worth a line, since a
+				// binary older than its schema is ADR-126's known break.
+				log.LogAttrs(ctx, slog.LevelWarn, "schema is newer than this binary knows; deploy the binary that matches it",
+					slog.Int64("schema_version", version), slog.Int64("binary_version", required))
+			}
 			return id, nil
-		case errors.Is(err, ledger.ErrNoClearingAccount) && version >= clearingSchemaVersion:
-			return ledger.ClearingAccountID{}, fmt.Errorf("%w: %w at schema version %d", errConfig, err, version)
+		case errors.Is(err, errSchemaBehind):
+			d := wait.next()
+			log.LogAttrs(ctx, slog.LevelWarn, "rail not wired yet: schema older than this binary needs; retrying (run `make migrate`)",
+				slog.String("rail", railName), slog.Int64("schema_version", version),
+				slog.Int64("required_version", required), slog.Int64("retry_in_ms", d.Milliseconds()))
+			if !sleep(ctx, d) {
+				return ledger.ClearingAccountID{}, ctx.Err()
+			}
+			continue
 		case errors.Is(err, ledger.ErrNoClearingAccount):
-			reason = "clearing accounts not seeded yet"
-		default:
-			// ErrSchemaVersion or ErrClearingLookup: either read failed, so
-			// all we know is that the database didn't answer as expected.
-			reason = "database unreachable or not migrated"
+			// lookupClearing only reads the account at the latest schema,
+			// where 00005 has seeded it, so the row was removed.
+			return ledger.ClearingAccountID{}, fmt.Errorf("%w: %w at schema version %d", errConfig, err, version)
 		}
+		// ErrSchemaVersion or ErrClearingLookup: a read failed, so all we
+		// know is that the database didn't answer as expected.
 		d := wait.next()
-		log.LogAttrs(ctx, slog.LevelWarn, "rail not wired yet: clearing account unavailable; retrying (run `make migrate` if this database is new)",
-			slog.String("rail", railName), slog.String("reason", reason), slog.Int64("retry_in_ms", d.Milliseconds()))
+		log.LogAttrs(ctx, slog.LevelWarn, "rail not wired yet: clearing account unavailable; retrying",
+			slog.String("rail", railName), slog.String("reason", "database unreachable or not answering as expected"), slog.Int64("retry_in_ms", d.Milliseconds()))
 		if !sleep(ctx, d) {
 			return ledger.ClearingAccountID{}, ctx.Err()
 		}
@@ -273,25 +284,27 @@ func resolveClearing(ctx context.Context, pool *pgxpool.Pool, db *sql.DB, railNa
 }
 
 // lookupClearing is one attempt, under its own deadline: the schema
-// version, then the clearing account.
+// version, then (only at the latest schema) the clearing account. A schema
+// behind store.LatestVersion returns errSchemaBehind with the version read.
 //
 // The order matters; don't swap it. The two reads are separate statements,
 // each seeing the database as it is when it runs, and `make migrate` may
-// commit 00005 between them (the usual way: migrating a running `make dev`
-// stack). 00005 commits the seeds and the version-5 row in one
-// transaction, so:
+// commit between them (the usual way: migrating a running `make dev`
+// stack). Each of today's migrations commits with its version row (a future
+// `-- +goose NO TRANSACTION` one would not), and 00005 seeds the clearing
+// accounts, so:
 //
-//   - Version first: a 5 means the seeds are already visible, so "no
-//     account" after it really is a configuration error. A 4 followed by a
-//     found account (00005 landed in between) is just a success. No
-//     interleaving ends in a wrong exit.
-//   - Account first: "no account", then 00005 commits, then version 5,
-//     and a correctly migrated gateway exits. That is the case ADR-125 §3
-//     says must retry.
+//   - Version first: at least the latest version means the seeds are
+//     already visible, so "no account" after it really is a configuration
+//     error.
+//     An older version is a retry, whatever lands after the read.
+//   - Account first: "no account", then the migrations commit, then the
+//     latest version, and a correctly migrated gateway exits. That is the
+//     case ADR-125 §3 says must retry.
 //
 // The version read is on every attempt's path, which is one more reason
-// store.SchemaVersion must not take goose's migration lock: each attempt
-// would wait behind a running `make migrate`.
+// store.SchemaVersion must not go through a goose Provider with a session
+// locker: each attempt would wait behind a running `make migrate`.
 func lookupClearing(ctx context.Context, pool *pgxpool.Pool, db *sql.DB, railName string, timeout time.Duration) (ledger.ClearingAccountID, int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -302,12 +315,16 @@ func lookupClearing(ctx context.Context, pool *pgxpool.Pool, db *sql.DB, railNam
 	if testHookBetweenReads != nil {
 		testHookBetweenReads()
 	}
+	if v < store.LatestVersion() {
+		return ledger.ClearingAccountID{}, v, errSchemaBehind
+	}
 	id, err := ledger.ClearingAccount(ctx, pool, railName)
 	return id, v, err
 }
 
-// testHookBetweenReads, if set, runs between lookupClearing's two reads, so
-// a test can land a migration in the window. Always nil outside tests.
+// testHookBetweenReads, if set, runs right after lookupClearing's first read
+// (before the version is judged), so a test can land a migration in the
+// window. Always nil outside tests.
 var testHookBetweenReads func()
 
 // checkClearing is the non-zero assertion (SPEC-002 10a-ii-b, a2 review
