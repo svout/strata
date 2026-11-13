@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/svout/strata/gateway/internal/store"
 	"github.com/svout/strata/gateway/internal/testutil"
 )
 
@@ -47,7 +48,7 @@ func TestRedisDatabaseIsEmptyOnEntry(t *testing.T) {
 }
 
 // Two pools from Postgres(t) are on different databases, each migrated to
-// the latest schema version (7).
+// the latest schema version (store.LatestVersion).
 func TestPostgresDatabasesAreSeparateAndMigrated(t *testing.T) {
 	t.Parallel()
 	ctx := testContext(t)
@@ -61,8 +62,8 @@ func TestPostgresDatabasesAreSeparateAndMigrated(t *testing.T) {
 		if err := pool.QueryRow(ctx, "SELECT max(version_id) FROM goose_db_version").Scan(&version); err != nil {
 			t.Fatalf("read goose version: %v", err)
 		}
-		if version != 7 {
-			t.Errorf("schema version = %d, want 7", version)
+		if version != store.LatestVersion() {
+			t.Errorf("schema version = %d, want %d", version, store.LatestVersion())
 		}
 	}
 }

@@ -5,10 +5,8 @@ the invariant checker, which decides whether a run passes: each test breaks
 one invariant in otherwise good rows and expects it to be reported.
 """
 
-import tempfile
 import unittest
 from dataclasses import replace
-from pathlib import Path
 
 from chaos import chaos
 
@@ -228,22 +226,6 @@ class ParseTest(unittest.TestCase):
     def test_parse_rejects_a_short_row(self):
         with self.assertRaises(chaos.ChaosError):
             chaos.parse_rows([[ID, "settled"]])
-
-
-class LatestMigrationTest(unittest.TestCase):
-    def test_highest_numbered_sql_file(self):
-        with tempfile.TemporaryDirectory() as d:
-            for name in ("00001_a.sql", "00007_b.sql", "00010_c.sql", "README.md", "00099_x.sql.bak"):
-                (Path(d) / name).write_text("")
-            self.assertEqual(chaos.latest_migration(Path(d)), 10)
-
-    def test_no_migrations(self):
-        with tempfile.TemporaryDirectory() as d, self.assertRaises(chaos.ChaosError):
-            chaos.latest_migration(Path(d))
-
-    def test_the_real_directory(self):
-        # Guards the path constant: the scenario's schema check depends on it.
-        self.assertGreaterEqual(chaos.latest_migration(chaos.MIGRATIONS), 7)
 
 
 if __name__ == "__main__":

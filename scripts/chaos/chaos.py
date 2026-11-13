@@ -29,8 +29,7 @@ after the gateway gave up, not mid-settlement, and the run is rejected.
 ADR-117: the script reads payments, ledger_entries and fake_rail_operations
 to check them, as a black-box test driver, and writes none of them (the
 fake's records are written by `make fakepsp`, through package rail). It also
-reads goose_db_version (the schema check before the gateway starts) and
-pg_stat_activity (who is waiting on a lock). Its two accounts come from
+reads pg_stat_activity (who is waiting on a lock). Its two accounts come from
 infra/compose/seed.sql (`make dev-seed`).
 """
 
@@ -52,7 +51,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 COMPOSE = ["docker", "compose", "-f", "infra/compose/compose.yml"]
 GATEWAY = "http://127.0.0.1:8080"
-MIGRATIONS = ROOT / "gateway/internal/store/migrations"
 
 # The accounts in infra/compose/seed.sql.
 PAYER = "00000000-0000-4000-8000-00000000c4a1"
@@ -136,14 +134,6 @@ class Session:
                 self._p.wait(5)
             except subprocess.TimeoutExpired:
                 self._p.kill()
-
-
-def latest_migration(directory: Path) -> int:
-    """The highest version among NNNNN_name.sql files in directory."""
-    versions = [int(m.group(1)) for f in directory.iterdir() if (m := re.fullmatch(r"(\d+)_.+\.sql", f.name))]
-    if not versions:
-        raise ChaosError(f"no migrations in {directory}")
-    return max(versions)
 
 
 # --- invariants ------------------------------------------------------------
@@ -495,22 +485,14 @@ def wait_for_waiters(watch: Session, table: str, n: int, timeout: float = 10.0) 
 # --- the scenario ----------------------------------------------------------
 
 
-def start_stack(watch_factory=Session) -> None:
+def start_stack() -> None:
     run([*COMPOSE, "up", "-d", "--wait", "--wait-timeout", "120", "postgres", "redis"])
     # Migrate before the gateway starts, and never between the kill and the
     # restart: the restarted gateway must be the same binary on the same
-    # schema. Until the minimum-schema-version readiness gate exists (the
-    # step after 11), a gateway on an old schema reports ready and then 500s,
-    # so check the version here rather than trust /readyz.
+    # schema. No schema check here: since SPEC-002 14a a gateway on a schema
+    # older than its code needs stays not-ready, so `make dev` (which waits
+    # for /readyz) fails with the gateway's own line naming `make migrate`.
     make("migrate")
-    s = watch_factory()
-    try:
-        have = int(s.value("SELECT COALESCE(max(version_id), 0) FROM goose_db_version WHERE is_applied;"))
-    finally:
-        s.close()
-    want = latest_migration(MIGRATIONS)
-    if have != want:
-        raise ChaosError(f"database is at schema version {have}, the code's latest migration is {want}")
     make("dev-seed")
     make("dev", GATEWAY_ALLOW_FAKE_RAIL="1")
     if "fake rail registered" not in gateway_logs():

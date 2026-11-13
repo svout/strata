@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"path"
+	"sync"
 
 	"github.com/pressly/goose/v3"
 	"github.com/pressly/goose/v3/database"
@@ -60,8 +62,9 @@ var ErrSchemaVersion = errors.New("store: could not read the schema version")
 // (ADR-125 §3).
 //
 // It only reads. goose's Provider.GetDBVersion would be the obvious call, but
-// it creates the version table if it is missing and takes the migration lock,
-// so a gateway that called it would write to a database it must never
+// it creates the version table if it is missing and, on a Provider built with
+// a session locker (as newProvider builds it), takes the migration lock, so a
+// gateway that called it would write to a database it must never
 // migrate (`make dev` doesn't migrate; `make migrate` does). goose's
 // database.Store runs the same queries without either side effect.
 func SchemaVersion(ctx context.Context, db *sql.DB) (int64, error) {
@@ -91,6 +94,36 @@ func SchemaVersion(ctx context.Context, db *sql.DB) (int64, error) {
 	}
 	return v, nil
 }
+
+// LatestVersion is the highest migration compiled into this binary: the
+// schema version its code needs (SPEC-002 14a). It is derived from the
+// embedded file names, so it can't go stale when a migration is added. It
+// reads only the embedded files: no database, and no goose Provider, which
+// is capable of migrating (root CLAUDE.md: startup only reads the version).
+func LatestVersion() int64 { return latestVersion() }
+
+// latestVersion computes LatestVersion once. The files are fixed at compile
+// time, so a name goose can't number is a build defect, not a runtime
+// condition, and it panics on the first call (the gateway makes that call
+// before serving). goose itself would skip such a file without an error
+// (its Provider collects files non-strictly), so `make migrate` would
+// succeed and never apply it; the panic is what makes the misname visible.
+// TestLatestVersion checks the result against goose's own list.
+var latestVersion = sync.OnceValue(func() int64 {
+	names, err := fs.Glob(embedded, "migrations/*.sql")
+	if err != nil || len(names) == 0 {
+		panic("store: no embedded migrations")
+	}
+	var latest int64
+	for _, name := range names {
+		v, err := goose.NumericComponent(path.Base(name))
+		if err != nil {
+			panic("store: embedded migration without a version number: " + name)
+		}
+		latest = max(latest, v)
+	}
+	return latest
+})
 
 // Lock retry policy for concurrent migration runs. goose's default polls every
 // 5 s for up to 5 min; polling every second (goose's minimum) for the same

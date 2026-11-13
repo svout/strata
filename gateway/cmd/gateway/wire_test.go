@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +19,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/lock"
 
 	"github.com/svout/strata/gateway/internal/config"
 	"github.com/svout/strata/gateway/internal/httpx"
@@ -68,27 +72,46 @@ func exec(t *testing.T, pool *pgxpool.Pool, sql string) {
 	}
 }
 
-// atSchemaV4 makes a migrated test database look like one migrated to 4
-// only, as far as startup can tell: no clearing accounts, no row for
-// version 5 or anything after it (startup reads the highest version).
-func atSchemaV4(t *testing.T, pool *pgxpool.Pool) {
-	exec(t, pool, "DELETE FROM accounts WHERE kind = 'clearing'")
-	exec(t, pool, "DELETE FROM goose_db_version WHERE version_id >= 5")
+// atVersion makes a migrated test database look like one migrated to v
+// only, as far as startup can tell: no version row above v (startup reads
+// the highest), and below 5 no clearing accounts (00005 seeds them). The
+// tables stay; TestWireSettlement_SkewNotReadyThenMigrated rolls a real
+// migration back instead.
+func atVersion(t *testing.T, pool *pgxpool.Pool, v int64) {
+	if v < 5 {
+		exec(t, pool, "DELETE FROM accounts WHERE kind = 'clearing'")
+	}
+	exec(t, pool, "DELETE FROM goose_db_version WHERE version_id > "+strconv.FormatInt(v, 10))
 }
 
-// migrateToV5 is `make migrate` for a database atSchemaV4 left behind. The
-// clearing accounts are inserted by hand, not with testutil.NewAccount: they
-// need the exact owner 00005 seeds ('rail:<name>'), which the factory
-// doesn't set.
-func migrateToV5(t *testing.T, pool *pgxpool.Pool) {
-	exec(t, pool, "INSERT INTO accounts (owner, kind, currency) VALUES ('rail:internal', 'clearing', 'GBP'), ('rail:fake', 'clearing', 'GBP')")
-	exec(t, pool, "INSERT INTO goose_db_version (version_id, is_applied) VALUES (5, true)")
+// migrateToLatest is `make migrate` for a database atVersion left behind:
+// the version rows back up to store.LatestVersion, and the clearing
+// accounts if they are missing. Those are inserted by hand, not with
+// testutil.NewAccount: they need the exact owner 00005 seeds
+// ('rail:<name>'), which the factory doesn't set. It needs at least one
+// version row: on an empty table max() is NULL and the series is empty.
+func migrateToLatest(t *testing.T, pool *pgxpool.Pool) {
+	for _, name := range []string{rail.InternalName, rail.FakeName} {
+		exec(t, pool, "INSERT INTO accounts (owner, kind, currency) SELECT 'rail:"+name+"', 'clearing', 'GBP' "+
+			"WHERE NOT EXISTS (SELECT 1 FROM accounts WHERE kind = 'clearing' AND owner = 'rail:"+name+"')")
+	}
+	exec(t, pool, "INSERT INTO goose_db_version (version_id, is_applied) SELECT v, true "+
+		"FROM generate_series((SELECT max(version_id) FROM goose_db_version) + 1, "+strconv.FormatInt(store.LatestVersion(), 10)+") v")
 }
 
 func resolve(ctx context.Context, t *testing.T, pool *pgxpool.Pool, log *slog.Logger) (ledger.ClearingAccountID, error) {
 	db := stdlib.OpenDBFromPool(pool)
 	t.Cleanup(func() { _ = db.Close() })
 	return resolveClearing(ctx, pool, db, rail.InternalName, log, fastTimings.lookupRetry, fastTimings.lookupTimeout)
+}
+
+// within is a test context with a deadline, for a resolve expected to
+// succeed: a regression that retries instead fails at the deadline rather
+// than hanging until go test's own timeout.
+func within(t *testing.T) context.Context {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	return ctx
 }
 
 func TestResolveClearing_Found(t *testing.T) {
@@ -99,19 +122,19 @@ func TestResolveClearing_Found(t *testing.T) {
 		t.Fatal(err)
 	}
 	log, _ := testLogger()
-	if got, err := resolve(t.Context(), t, pool, log); err != nil || got != want {
+	if got, err := resolve(within(t), t, pool, log); err != nil || got != want {
 		t.Fatalf("resolveClearing = %v, %v; want %v", got, err, want)
 	}
 }
 
-// Schema version 4: the database answers that there is no clearing account,
-// but 00005 hasn't run. That is "not migrated yet": keep retrying, with a
-// line naming `make migrate`, never exit (ADR-125 §3 as amended). Once the
-// migration lands, the next attempt finds the account.
+// Schema version 4: below the version this binary needs, so "not migrated
+// yet": keep retrying, with a line naming `make migrate`, never exit
+// (ADR-125 §3 as amended). Once the migrations land, the next attempt
+// finds the account.
 func TestResolveClearing_SchemaV4RetriesUntilMigrated(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
-	atSchemaV4(t, pool)
+	atVersion(t, pool, 4)
 	log, logs := testLogger()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
@@ -122,27 +145,29 @@ func TestResolveClearing_SchemaV4RetriesUntilMigrated(t *testing.T) {
 	if n := strings.Count(logs.String(), "make migrate"); n < 2 {
 		t.Errorf("%d retry lines naming make migrate, want at least 2; logs:\n%s", n, logs)
 	}
-	if !strings.Contains(logs.String(), "clearing accounts not seeded yet") {
+	if !strings.Contains(logs.String(), "schema older than this binary needs") ||
+		!strings.Contains(logs.String(), `"schema_version":4`) {
 		t.Errorf("retry line doesn't say why; logs:\n%s", logs)
 	}
 
-	migrateToV5(t, pool)
-	if _, err := resolve(t.Context(), t, pool, log); err != nil {
+	migrateToLatest(t, pool)
+	if _, err := resolve(within(t), t, pool, log); err != nil {
 		t.Fatalf("resolveClearing after migrating = %v, want the id", err)
 	}
 }
 
-// 00005 committing between the two reads must not make a migrated gateway
-// exit (review should 1). lookupClearing reads the version first, so a 4
-// followed by a found account is a success. Read the other way round, this
-// interleaving is "no account" then "version 5": a wrong configuration
-// error. Not parallel: it sets a package-level hook, and parallel tests
-// only start once the sequential ones have finished.
+// Migrations committing between the two reads must not make a migrated
+// gateway exit (10a-ii-b review should 1). lookupClearing reads the version
+// first, so a 4 is a retry and the next attempt finds the account. Read
+// the other way round, this interleaving is "no account" then the latest
+// version: a wrong configuration error. Not parallel: it sets a
+// package-level hook, and parallel tests only start once the sequential
+// ones have finished.
 func TestResolveClearing_MigrationBetweenReadsDoesNotExit(t *testing.T) {
 	pool := testutil.Postgres(t)
-	atSchemaV4(t, pool)
+	atVersion(t, pool, 4)
 	var once sync.Once
-	testHookBetweenReads = func() { once.Do(func() { migrateToV5(t, pool) }) }
+	testHookBetweenReads = func() { once.Do(func() { migrateToLatest(t, pool) }) }
 	t.Cleanup(func() { testHookBetweenReads = nil })
 	log, _ := testLogger()
 
@@ -153,14 +178,11 @@ func TestResolveClearing_MigrationBetweenReadsDoesNotExit(t *testing.T) {
 	}
 }
 
-// Schema version 5 with the seed row deleted: the database is migrated and
-// misconfigured, so startup exits at once with an error naming the rail.
-func TestResolveClearing_SchemaV5MissingSeedExits(t *testing.T) {
+// The latest schema with the seed row deleted: the database is migrated
+// and misconfigured, so startup exits at once with an error naming the rail.
+func TestResolveClearing_LatestMissingSeedExits(t *testing.T) {
 	t.Parallel()
-	pool := testutil.Postgres(t)
-	// Exactly version 5, the boundary (clearingSchemaVersion): the test
-	// database is migrated to the latest, so drop the rows above it.
-	exec(t, pool, "DELETE FROM goose_db_version WHERE version_id > 5")
+	pool := testutil.Postgres(t) // migrated to store.LatestVersion, the boundary
 	exec(t, pool, "DELETE FROM accounts WHERE owner = 'rail:internal'")
 	log, logs := testLogger()
 
@@ -171,7 +193,7 @@ func TestResolveClearing_SchemaV5MissingSeedExits(t *testing.T) {
 	if !errors.Is(err, errConfig) || !errors.Is(err, ledger.ErrNoClearingAccount) {
 		t.Fatalf("resolveClearing = %v, want errConfig wrapping ErrNoClearingAccount", err)
 	}
-	for _, s := range []string{`"internal"`, "schema version 5"} {
+	for _, s := range []string{`"internal"`, "schema version " + strconv.FormatInt(store.LatestVersion(), 10)} {
 		if !strings.Contains(err.Error(), s) {
 			t.Errorf("error %q doesn't contain %s", err, s)
 		}
@@ -179,6 +201,94 @@ func TestResolveClearing_SchemaV5MissingSeedExits(t *testing.T) {
 	if strings.Contains(logs.String(), "retrying") {
 		t.Errorf("a configuration error was retried; logs:\n%s", logs)
 	}
+}
+
+// One version behind (the skew ADR-126 is about), with the seed deleted as
+// well: still "not migrated yet", never an exit. The account isn't read
+// below the latest version, so a missing seed there can't decide anything.
+// The retry line carries only fixed text and integers (AC8).
+func TestResolveClearing_BehindRetries(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	behind := store.LatestVersion() - 1
+	atVersion(t, pool, behind)
+	exec(t, pool, "DELETE FROM accounts WHERE owner = 'rail:internal'")
+	log, logs := testLogger()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := resolve(ctx, t, pool, log); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("resolveClearing one version behind = %v, want it still retrying at the deadline", err)
+	}
+	want := `"schema_version":` + strconv.FormatInt(behind, 10) + `,"required_version":` + strconv.FormatInt(store.LatestVersion(), 10)
+	if n := strings.Count(logs.String(), want); n < 2 {
+		t.Errorf("%d retry lines with %s, want at least 2; logs:\n%s", n, want, logs)
+	}
+	if strings.Contains(logs.String(), "configuration error") {
+		t.Errorf("a schema behind the binary was treated as a configuration error; logs:\n%s", logs)
+	}
+}
+
+// A schema newer than this binary knows wires (the gate is a minimum,
+// ADR-125 §3's second amendment), with one Warn saying so.
+func TestResolveClearing_NewerSchemaWires(t *testing.T) {
+	t.Parallel()
+	pool := testutil.Postgres(t)
+	exec(t, pool, "INSERT INTO goose_db_version (version_id, is_applied) VALUES ("+strconv.FormatInt(store.LatestVersion()+1, 10)+", true)")
+	log, logs := testLogger()
+	if _, err := resolve(within(t), t, pool, log); err != nil {
+		t.Fatalf("resolveClearing on a newer schema = %v, want the id", err)
+	}
+	if n := strings.Count(logs.String(), "schema is newer than this binary knows"); n != 1 {
+		t.Errorf("%d newer-schema lines, want 1; logs:\n%s", n, logs)
+	}
+}
+
+// The gate only reads (root CLAUDE.md: no startup path may call anything
+// capable of applying a migration). goose's Provider.GetDBVersion would
+// create a missing version table and, on a Provider with a session locker
+// (store's), wait on the migration lock; here the
+// table stays absent, and an attempt with that lock held by another
+// session (a running `make migrate`) still answers within its deadline.
+func TestResolveClearing_NoMigrationSideEffects(t *testing.T) {
+	t.Parallel()
+	t.Run("version table stays absent", func(t *testing.T) {
+		t.Parallel()
+		pool := testutil.Postgres(t)
+		exec(t, pool, "DROP TABLE goose_db_version")
+		log, _ := testLogger()
+		ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+		defer cancel()
+		_, _ = resolve(ctx, t, pool, log)
+		var exists bool
+		if err := pool.QueryRow(t.Context(), "SELECT to_regclass('goose_db_version') IS NOT NULL").Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if exists {
+			t.Error("resolveClearing created goose_db_version; startup must only read the version")
+		}
+	})
+	t.Run("migration lock held", func(t *testing.T) {
+		t.Parallel()
+		pool := testutil.Postgres(t)
+		conn, err := pool.Acquire(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Release()
+		if _, err := conn.Exec(t.Context(), "SELECT pg_advisory_lock($1)", lock.DefaultLockID); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _, _ = conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", lock.DefaultLockID) }()
+		log, _ := testLogger()
+		start := time.Now()
+		if _, err := resolve(within(t), t, pool, log); err != nil {
+			t.Fatalf("resolveClearing with the migration lock held = %v, want the id", err)
+		}
+		if d := time.Since(start); d > fastTimings.lookupTimeout {
+			t.Errorf("resolveClearing took %v with the migration lock held, want under %v (it must not wait on it)", d, fastTimings.lookupTimeout)
+		}
+	})
 }
 
 // An unreachable database is transient: retry, never exit. Nothing from the
@@ -198,8 +308,11 @@ func TestResolveClearing_UnreachableRetriesWithoutLeakingDSN(t *testing.T) {
 	if _, err := resolve(ctx, t, pool, log); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("resolveClearing on an unreachable database = %v, want it still retrying at the deadline", err)
 	}
-	if !strings.Contains(logs.String(), "database unreachable or not migrated") {
+	if !strings.Contains(logs.String(), "database unreachable or not answering as expected") {
 		t.Errorf("no retry line giving the read-failure reason; logs:\n%s", logs)
+	}
+	if strings.Contains(logs.String(), "make migrate") {
+		t.Errorf("a read failure was blamed on migrations; logs:\n%s", logs)
 	}
 	for _, s := range []string{"leakuser", "leakpass", "leakdb", "127.0.0.1"} {
 		if strings.Contains(logs.String(), s) {
@@ -209,9 +322,8 @@ func TestResolveClearing_UnreachableRetriesWithoutLeakingDSN(t *testing.T) {
 }
 
 // A reachable database that was never migrated (a fresh `make dev` stack):
-// no version table, so version 0, and no accounts table, so the account read
-// fails with ErrClearingLookup rather than "no account". Still transient:
-// retry with the read-failure reason, never exit.
+// no version table, so version 0, which is behind: retry with the schema
+// reason, never exit, and never read the (missing) accounts table.
 func TestResolveClearing_NeverMigratedRetries(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
@@ -224,8 +336,8 @@ func TestResolveClearing_NeverMigratedRetries(t *testing.T) {
 	if _, err := resolve(ctx, t, pool, log); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("resolveClearing on an unmigrated database = %v, want it still retrying at the deadline", err)
 	}
-	if n := strings.Count(logs.String(), "database unreachable or not migrated"); n < 2 {
-		t.Errorf("%d retry lines giving the read-failure reason, want at least 2; logs:\n%s", n, logs)
+	if n := strings.Count(logs.String(), `"schema_version":0`); n < 2 {
+		t.Errorf("%d retry lines giving schema version 0, want at least 2; logs:\n%s", n, logs)
 	}
 }
 
@@ -317,15 +429,26 @@ func TestBackoff_DoublesToCapAndResets(t *testing.T) {
 	}
 }
 
-// AC7, end to end through the router: on a database at version 4 the
-// gateway serves at once, /readyz answers not ready (the wiring doesn't
-// block it) and payments get 503 try_again_later. After `make migrate`,
-// the rail is wired, /readyz is ready and a payment settles through
-// the internal rail. Cancelling stops the background work.
-func TestWireSettlement_NotReadyUntilMigratedThenSettles(t *testing.T) {
+// AC10 (and AC7), end to end through the router, on a real schema one
+// migration behind this binary: 00007 rolled back, so no key_hash, which
+// every create needs. Before 14a this gateway reported ready and answered
+// 500 to every create. Now it serves at once, /readyz answers not ready
+// (the wiring doesn't block it) and payments get 503 try_again_later.
+// After `make migrate` (store.Up), the rail is wired, /readyz is ready and
+// a payment settles through the internal rail. Cancelling stops the
+// background work.
+func TestWireSettlement_SkewNotReadyThenMigrated(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
-	atSchemaV4(t, pool)
+	db := stdlib.OpenDBFromPool(pool)
+	t.Cleanup(func() { _ = db.Close() })
+	p, err := goose.NewProvider(goose.DialectPostgres, db, os.DirFS("../../internal/store/migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.DownTo(t.Context(), store.LatestVersion()-1); err != nil {
+		t.Fatalf("roll back one migration: %v", err)
+	}
 	log, logs := testLogger()
 
 	g, hooks := newGate(payGateTitle), newGate(hookGateTitle)
@@ -336,15 +459,27 @@ func TestWireSettlement_NotReadyUntilMigratedThenSettles(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- wireSettlement(ctx, pool, wiring{webhookBound: 2}, nil, log, g, hooks, fastTimings) }()
 
+	// Let the gate decide, and retry once, before asserting: checked straight
+	// after the goroutine starts, the 503s would only show the wiring hadn't
+	// run yet, and a gateway without the gate (one that wires at once on
+	// this schema) would pass (14a review B1).
+	waitFor(t, func() bool { return strings.Count(logs.String(), "schema older than this binary needs") >= 2 })
+	if g.ready() || hooks.ready() {
+		t.Fatalf("rail wired on a schema one migration behind (payments ready %v, webhooks ready %v)", g.ready(), hooks.ready())
+	}
 	if code := serve(router, http.MethodGet, "/readyz", "").Code; code != http.StatusServiceUnavailable {
 		t.Fatalf("/readyz before migrating = %d, want 503", code)
 	}
-	rec := serve(router, http.MethodPost, "/v1/payments", `{}`)
-	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != "1" || !strings.Contains(rec.Body.String(), "try_again_later") {
-		t.Fatalf("POST before wiring = %d %q (Retry-After %q), want 503 try_again_later", rec.Code, rec.Body, rec.Header().Get("Retry-After"))
+	for _, path := range []string{"/v1/payments", "/v1/rail/webhooks/internal"} {
+		rec := serve(router, http.MethodPost, path, `{}`)
+		if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != "1" || !strings.Contains(rec.Body.String(), "try_again_later") {
+			t.Fatalf("POST %s before migrating = %d %q (Retry-After %q), want 503 try_again_later", path, rec.Code, rec.Body, rec.Header().Get("Retry-After"))
+		}
 	}
 
-	migrateToV5(t, pool)
+	if err := store.Up(t.Context(), db); err != nil {
+		t.Fatalf("store.Up: %v", err)
+	}
 	waitFor(t, g.ready)
 	// /readyz caches a result for up to a second.
 	waitFor(t, func() bool { return serve(router, http.MethodGet, "/readyz", "").Code == http.StatusOK })
@@ -355,7 +490,7 @@ func TestWireSettlement_NotReadyUntilMigratedThenSettles(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/payments", strings.NewReader(body))
 	req.Header.Set("Idempotency-Key", "wire-test-1")
 	req.Header.Set("Content-Type", "application/json")
-	rec = httptest.NewRecorder()
+	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("POST after wiring = %d %s, want 201", rec.Code, rec.Body)

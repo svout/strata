@@ -201,13 +201,12 @@ type ClearingAccountID uuid.UUID
 // differently (SPEC-002/10a-ii-b):
 //
 //   - ErrNoClearingAccount: the database answered and the rail has no
-//     clearing account. The schema version decides what it means (ADR-125
-//     §3 as amended): below 5, migration 00005 hasn't seeded the accounts
-//     yet, so it is transient; at 5 or above it is a configuration error and
-//     the gateway exits. cmd/gateway makes that call.
+//     clearing account. cmd/gateway only looks once the schema is at the
+//     version its code needs, where migration 00005 has seeded the accounts,
+//     so there it is a configuration error and the gateway exits (ADR-125
+//     §3 as amended; SPEC-002 14a).
 //   - ErrClearingLookup: the lookup itself failed (database unreachable,
-//     accounts table not there yet, any other database error). Usually
-//     transient, e.g. a fresh stack before `make migrate`: retry.
+//     any other database error). Usually transient: retry.
 var (
 	ErrNoClearingAccount = errors.New("ledger: no clearing account for rail")
 	ErrClearingLookup    = errors.New("ledger: clearing account lookup failed")
