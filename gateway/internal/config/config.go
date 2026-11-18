@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/netip"
 	"strconv"
 	"strings"
 )
@@ -48,6 +49,14 @@ var (
 	// the error goes away should know what they are satisfying.
 	ErrWebhookOverflowWindow = errors.New("GATEWAY_WEBHOOK_BURST divided by GATEWAY_WEBHOOK_RATE is the rate limiter's overflow window in seconds " +
 		"(how long a new source can wait for room once the source table is full) and must be at most 60: lower the burst or raise the rate")
+
+	// ErrInvalidTrustedProxies is returned when GATEWAY_TRUSTED_PROXIES is
+	// not a comma-separated list of CIDRs (SPEC-002 14c, ADR-128). Load
+	// wraps it with the 1-based position of the first bad entry, never the
+	// entry itself: run logs the error verbatim, and the value is whatever
+	// an operator pasted.
+	ErrInvalidTrustedProxies = errors.New("GATEWAY_TRUSTED_PROXIES must be a comma-separated list of at most 32 CIDRs " +
+		"(an address needs /32 or /128, no host bits set, no zones, IPv4 ranges in IPv4 form rather than ::ffff:); /0 is refused as a likely mistake")
 )
 
 // Webhook limiter defaults and limits (Ivan, SPEC-002 10b-ii).
@@ -73,6 +82,10 @@ const (
 	// overflow bucket for that long (ADR-124 second addendum). Burst 1000
 	// at 1/s would make it about 17 minutes.
 	maxOverflowWindow = 60
+	// maxTrustedProxies bounds GATEWAY_TRUSTED_PROXIES. assumed: 32 ranges
+	// cover any proxy layout this gateway will sit behind (not measured);
+	// the limiter checks each hop against every range.
+	maxTrustedProxies = 32
 )
 
 // Production is the STRATA_ENV value that marks a production deployment.
@@ -97,6 +110,12 @@ type Config struct {
 	// per-source rate limit, from GATEWAY_WEBHOOK_RATE and _BURST.
 	WebhookRate  float64
 	WebhookBurst int
+	// TrustedProxies are the peers whose X-Forwarded-For the webhook rate
+	// limiter believes, from GATEWAY_TRUSTED_PROXIES (SPEC-002 14c,
+	// ADR-128). Empty (the default) trusts nobody: the source is the
+	// connection's peer. Empty is allowed in production too, since a
+	// gateway exposed directly is a valid layout.
+	TrustedProxies []netip.Prefix
 }
 
 // Load reads the configuration through getenv (os.Getenv in production),
@@ -140,7 +159,36 @@ func Load(getenv func(string) string) (Config, error) {
 	if err := loadWebhook(getenv, &cfg); err != nil {
 		return Config{}, err
 	}
+	trusted, err := parseTrustedProxies(getenv("GATEWAY_TRUSTED_PROXIES"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.TrustedProxies = trusted
 	return cfg, nil
+}
+
+// parseTrustedProxies reads a comma-separated CIDR list. It accepts one
+// form only, so a mistake fails startup instead of trusting more than
+// meant: "10.0.0.1/8" (host bits set) would otherwise quietly trust a /8,
+// and a bare address is refused rather than guessed at. Unset is nil.
+func parseTrustedProxies(v string) ([]netip.Prefix, error) {
+	if v == "" {
+		return nil, nil
+	}
+	entries := strings.Split(v, ",")
+	if len(entries) > maxTrustedProxies {
+		return nil, ErrInvalidTrustedProxies
+	}
+	out := make([]netip.Prefix, 0, len(entries))
+	for i, e := range entries {
+		// ParsePrefix refuses zones and bare addresses; the rest is ours.
+		p, err := netip.ParsePrefix(strings.TrimSpace(e))
+		if err != nil || p != p.Masked() || p.Bits() == 0 || p.Addr().Is4In6() {
+			return nil, fmt.Errorf("%w (entry %d)", ErrInvalidTrustedProxies, i+1)
+		}
+		out = append(out, p)
+	}
+	return out, nil
 }
 
 // loadWebhook reads the rail webhook's bound and rate limit into cfg.
