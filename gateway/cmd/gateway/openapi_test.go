@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"slices"
 	"strings"
@@ -75,6 +76,130 @@ func TestOpenAPI_RoutesMatchMounted(t *testing.T) {
 	want := specOperations(t)
 	if missing, extra := diffKeys(got, want), diffKeys(want, got); len(missing) > 0 || len(extra) > 0 {
 		t.Fatalf("served but not in %s: %v\nin the spec but not served: %v", specPath, missing, extra)
+	}
+}
+
+// TestOpenAPI_UnmatchedGetProblems pins the spec's claim about requests it
+// doesn't document (SPEC-002 15a), on the gateway as compose builds it,
+// with the gates closed, then open:
+//   - a method outside GET, HEAD and POST is a 501 not_implemented on every
+//     path, documented or not, gates open or closed, with no Allow;
+//   - while a gate is closed, GET, HEAD or POST under its mount is a 503
+//     try_again_later with Retry-After;
+//   - once open, GET, HEAD or POST on a documented path that doesn't take
+//     it is a 405 method_not_allowed whose Allow is exactly the spec's
+//     methods there (also with a trailing slash on /v1/payments, which
+//     chi's Mount routes to the same handler);
+//   - GET, HEAD or POST on an undocumented path is a 404 not_found.
+//
+// served repeats httpx's fixed list on purpose: it is the contract, and a
+// change to it must change the spec's wording and this test together. The
+// spec's own methods must be in it too, or they could never be reached.
+func TestOpenAPI_UnmatchedGetProblems(t *testing.T) {
+	t.Parallel()
+	log := slog.New(slog.DiscardHandler)
+	cfg := config.Config{WebhookRate: config.DefaultWebhookRate, WebhookBurst: config.DefaultWebhookBurst}
+	pool := lazyPool(t, "8")
+	gw, err := compose(cfg, pool, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := []string{http.MethodGet, http.MethodHead, http.MethodPost}
+	byPath := map[string][]string{}
+	for op := range specOperations(t) {
+		method, path, _ := strings.Cut(op, " ")
+		if !slices.Contains(served, method) {
+			t.Errorf("%s documents %s, which the gateway answers with 501", specPath, op)
+		}
+		byPath[path] = append(byPath[path], method)
+	}
+	// Two unrecognised methods, then every standard one outside served.
+	unserved := []string{"PROPFIND", "FOO", http.MethodConnect}
+	for _, m := range httpMethods {
+		if m := strings.ToUpper(m); !slices.Contains(served, m) {
+			unserved = append(unserved, m)
+		}
+	}
+	fill := strings.NewReplacer("{id}", "0b9a3c1e-4f2d-4a7b-9c8e-1d2f3a4b5c6d", "{rail}", "fake")
+
+	check := func(t *testing.T, method, path string, status int, code, allow string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		gw.router.ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+		var body struct {
+			Status int    `json:"status"`
+			Code   string `json:"code"`
+		}
+		if rec.Code != status || rec.Header().Get("Content-Type") != "application/problem+json" ||
+			json.Unmarshal(rec.Body.Bytes(), &body) != nil || body.Code != code || body.Status != status {
+			t.Errorf("%s %s: got %d %s %s, want %d %s", method, path, rec.Code,
+				rec.Header().Get("Content-Type"), rec.Body, status, code)
+		}
+		if got := rec.Header().Get("Allow"); got != allow {
+			t.Errorf("%s %s: Allow = %q, want %q", method, path, got, allow)
+		}
+		if rec.Header().Get("X-Request-Id") == "" || rec.Header().Get("X-Content-Type-Options") != "nosniff" ||
+			rec.Header().Get("Cache-Control") != "no-store" {
+			t.Errorf("%s %s: missing X-Request-Id or a safety header: %v", method, path, rec.Header())
+		}
+		return rec
+	}
+
+	undocumented := []string{"/", "/v1", "/healthzx", "/v1/payments/a/b", "/v1/rail/webhooks", "/v1/rail/webhooks/fake/x"}
+	all := slices.Clone(undocumented)
+	for path := range byPath {
+		all = append(all, fill.Replace(path))
+	}
+	// The 501 comes before the gates, so it holds while they are closed too.
+	for _, path := range all {
+		for _, m := range unserved {
+			check(t, m, path, http.StatusNotImplemented, "not_implemented", "")
+		}
+	}
+	// A closed gate answers before its API's router, so no 404 or 405 yet.
+	for _, path := range all {
+		if !strings.HasPrefix(path, "/v1/payments") && !strings.HasPrefix(path, "/v1/rail/webhooks") {
+			continue
+		}
+		for _, m := range served {
+			if rec := check(t, m, path, http.StatusServiceUnavailable, "try_again_later", ""); rec.Header().Get("Retry-After") == "" {
+				t.Errorf("%s %s: 503 without Retry-After", m, path)
+			}
+		}
+	}
+
+	// No request here reaches a handler, so the lazy pool is never dialled.
+	svc := payments.New(pool)
+	gw.pay.set(svc.Handler(log))
+	gw.hooks.set(svc.Webhook(log))
+	for _, path := range undocumented {
+		for _, m := range served {
+			check(t, m, path, http.StatusNotFound, "not_found", "")
+		}
+	}
+	for path, methods := range byPath {
+		var allow []string
+		for _, m := range served {
+			if slices.Contains(methods, m) {
+				allow = append(allow, m)
+			}
+		}
+		paths := []string{fill.Replace(path)}
+		if path == "/v1/payments" {
+			paths = append(paths, path+"/")
+		}
+		for _, p := range paths {
+			for _, m := range served {
+				if !slices.Contains(methods, m) {
+					check(t, m, p, http.StatusMethodNotAllowed, "method_not_allowed", strings.Join(allow, ", "))
+				}
+			}
+		}
+	}
+	for _, path := range all {
+		for _, m := range unserved {
+			check(t, m, path, http.StatusNotImplemented, "not_implemented", "")
+		}
 	}
 }
 

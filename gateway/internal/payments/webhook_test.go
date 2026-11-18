@@ -397,7 +397,8 @@ func TestWebhook_HungRailCantHoldTheBound(t *testing.T) {
 	a := newWebhookAPIOn(t, pool, hung, WithWebhookBound(bound))
 	a.fake = fake
 	a.svc.webhookStatusTimeout = timeout
-	// The lookup's own 300 ms is pinned by TestHint_LookupBounded; here a
+	// The lookup deadline is pinned by TestHint_LookupBounded and its 300 ms
+	// default by TestWebhook_BoundDefaultAndOption; here a
 	// loaded runner's slow connection must not turn a hung call into a 503.
 	a.svc.webhookLookupTimeout = 5 * time.Second
 	ids := []uuid.UUID{a.create("1"), a.create("2"), a.create("3")}
@@ -649,7 +650,8 @@ func TestWebhook_RacesCreatesSettle(t *testing.T) {
 func TestHint_SlotFreedBeforeWrite(t *testing.T) {
 	t.Parallel()
 	a := newWebhookAPI(t, []rail.Step{{Outcome: rail.Pending}, {Outcome: rail.Pending}}, WithWebhookBound(1))
-	// The lookups' own 300 ms is pinned by TestHint_LookupBounded. Here it
+	// The lookup deadline is pinned by TestHint_LookupBounded and its 300 ms
+	// default by TestWebhook_BoundDefaultAndOption. Here it
 	// only has to outlast getting a connection, which on a loaded runner it
 	// didn't: A's lookup timed out, A never reached the write, and the wait
 	// below failed (SPEC-002 15b).

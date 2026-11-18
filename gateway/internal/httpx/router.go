@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"regexp"
 	"runtime/debug"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -35,17 +37,99 @@ const requestTimeout = 5 * time.Second
 
 // newRouter is NewRouter with the timeout as a parameter, for tests.
 func newRouter(log *slog.Logger, timeout time.Duration, checks ...ReadyCheck) *chi.Mux {
-	r := chi.NewRouter()
+	r := NewSubRouter()
 	r.Use(requestID)
 	r.Use(requestLog(log))
 	r.Use(recoverer(log))
 	r.Use(withTimeout(timeout))
+	r.Use(knownMethods)
 
 	r.Get("/healthz", healthz)
 	if len(checks) > 0 {
 		r.Get("/readyz", readyz(log, checks))
 	}
 	return r
+}
+
+// NewSubRouter returns a router for an API mounted on NewRouter's (as
+// payments.Handler is), and is what NewRouter itself starts from. It
+// answers an unmatched path with 404 not_found and an unserved method with
+// 405 method_not_allowed, both problems, instead of chi's plain-text 404
+// and empty 405 (SPEC-002 15a). Each API's router must be built with it,
+// not with chi.NewRouter: chi hands a parent's handlers down to a mounted
+// router only when the mounted handler is itself a *chi.Mux, and the
+// gateway's mounts are wrapped (the gates, the rate limiter). Even a
+// directly mounted *chi.Mux would get the parent's 405 handler, which
+// looks up the parent's routes, not its own.
+func NewSubRouter() *chi.Mux {
+	r := chi.NewRouter()
+	r.NotFound(notFound)
+	r.MethodNotAllowed(methodNotAllowed(r))
+	return r
+}
+
+func notFound(w http.ResponseWriter, _ *http.Request) {
+	WriteProblem(w, http.StatusNotFound, "not_found", "Not Found")
+}
+
+// servedMethods are the methods the gateway knows: the ones it routes (GET,
+// POST) and HEAD, which RFC 9110 §9.1 requires a general-purpose server to
+// support. It is a fixed list, not inferred from the routes (SPEC-002 15a):
+// a route for any other method would never be reached, and
+// TestOpenAPI_UnmatchedGetProblems fails if the spec documents one.
+// OPTIONS is left out on purpose: the API is server to server, so there is
+// no browser preflight to answer.
+var servedMethods = []string{http.MethodGet, http.MethodHead, http.MethodPost}
+
+// knownMethods answers any method outside servedMethods with 501
+// not_implemented, before any route lookup, so the answer is the same on
+// every path (RFC 9110 §15.6.2: the server doesn't support the method for
+// any resource). A 405 would be wrong for these: it means the method is
+// known but not supported by this resource, and it must carry an Allow that
+// the root can't compute through a wrapped mount (chi sends a method it
+// doesn't route, like PROPFIND, to the root's 405 handler, where a mount's
+// catch-all matches every method).
+func knownMethods(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !slices.Contains(servedMethods, r.Method) {
+			WriteProblem(w, http.StatusNotImplemented, "not_implemented", "Not Implemented")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// methodNotAllowed answers 405 with Allow listing the servedMethods mx
+// serves on the request's path. chi computes that list for its own 405 but
+// doesn't pass it to a custom handler, so it is found again here, one Find
+// per method; that runs only on a 405. The path is the one chi routed on:
+// RoutePath inside a mount, else the URL's, as in chi's routeHTTP. An
+// empty Allow is legal (RFC 9110 §10.2.1) but tells the client nothing, and
+// SPEC-002 15a rules it out, so if none is found (a route registered for a
+// method outside servedMethods, which knownMethods makes unreachable) the
+// answer is a 404.
+func methodNotAllowed(mx *chi.Mux) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if r.URL.RawPath != "" {
+			path = r.URL.RawPath
+		}
+		if rctx := chi.RouteContext(r.Context()); rctx != nil && rctx.RoutePath != "" {
+			path = rctx.RoutePath
+		}
+		var allow []string
+		for _, m := range servedMethods {
+			if mx.Find(chi.NewRouteContext(), m, path) != "" {
+				allow = append(allow, m)
+			}
+		}
+		if len(allow) == 0 {
+			notFound(w, r)
+			return
+		}
+		w.Header().Set("Allow", strings.Join(allow, ", "))
+		WriteProblem(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method Not Allowed")
+	}
 }
 
 func healthz(w http.ResponseWriter, _ *http.Request) {

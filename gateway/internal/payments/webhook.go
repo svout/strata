@@ -154,7 +154,7 @@ func (s *Service) ignore(ctx context.Context, id uuid.UUID, why string) hintResu
 // router, behind httpx.RateLimiter (10b-ii-b).
 func (s *Service) Webhook(log *slog.Logger) http.Handler {
 	h := handler{svc: s, log: log}
-	r := chi.NewRouter()
+	r := httpx.NewSubRouter()
 	r.Post("/{rail}", h.webhook)
 	return r
 }
