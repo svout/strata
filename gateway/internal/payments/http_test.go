@@ -409,13 +409,28 @@ func concurrentSameKey(t *testing.T, a *testAPI, n int) {
 
 // A request whose key is locked waits for the holder and then runs; one whose
 // wait outlasts its deadline gets 503 request_timeout and creates nothing.
+//
+// The locker fails open (ADR-119): a Redis call over its 50 ms budget means
+// no lock, not an error. On a loaded runner a cold connection's first call
+// can take that long, and then nothing was locked and the timed request
+// got 201 (SPEC-002 15b, inferred: the CI log didn't say which call). So
+// Redis is pinged first, which opens the connection the calls reuse, and
+// Degraded is checked after each Lock, so a slow Redis fails here by name
+// instead of as a puzzling 201.
 func TestHTTP_LockWaitAndTimeout(t *testing.T) {
 	t.Parallel()
-	a, locker := newTestAPIWith(t, testutil.Redis(t))
+	rdb := testutil.Redis(t)
+	if err := rdb.Ping(t.Context()).Err(); err != nil {
+		t.Fatal(err)
+	}
+	a, locker := newTestAPIWith(t, rdb)
 	key := idem.Key{Scope: idem.AnonymousCaller, Value: "k-locked"}
 	release, err := locker.Lock(t.Context(), key)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if n := locker.Degraded(); n != 0 {
+		t.Fatalf("the setup Lock failed open (Degraded = %d): Redis was over its 50 ms budget, so nothing is locked", n)
 	}
 
 	short, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
@@ -424,6 +439,9 @@ func TestHTTP_LockWaitAndTimeout(t *testing.T) {
 	req.Header.Set(idem.Header, key.Value)
 	timedOut := httptest.NewRecorder()
 	a.router.ServeHTTP(timedOut, req)
+	if n := locker.Degraded(); n != 0 {
+		t.Fatalf("the timed request's Lock failed open (Degraded = %d): Redis was over its 50 ms budget", n)
+	}
 	assertProblem(t, timedOut, http.StatusServiceUnavailable, "request_timeout")
 	if timedOut.Header().Get("Retry-After") != "1" {
 		t.Fatalf("Retry-After = %q, want 1", timedOut.Header().Get("Retry-After"))

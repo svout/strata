@@ -349,50 +349,66 @@ func TestWebhook_NoRailIsUnknownRail(t *testing.T) {
 	wantCode(t, rec, http.StatusNotFound)
 }
 
-// hangingRail accepts a Status call and, while hang is set, never answers:
-// it returns only when the caller's context ends, as a rail that took the
-// connection and went quiet would.
+// hangingRail accepts a Status call and, while hang is set, doesn't answer
+// until the test closes release, then returns when the caller's context
+// ends, as a rail that took the connection and went quiet would. release
+// is what keeps the slots held for as long as the test needs them: without
+// it a hung call gave its slot back once the Status timeout ran out, which
+// on a loaded runner could be before the test's next request (SPEC-002
+// 15b). Each hung call records how long its context had left, so the test
+// can check the deadline the code set rather than a wall-clock duration.
 type hangingRail struct {
 	*hookRail
-	hang atomic.Bool
+	hang      atomic.Bool
+	release   chan struct{}
+	remaining chan time.Duration // buffered by the test
 }
 
 func (h *hangingRail) Status(ctx context.Context, ref string) (rail.Result, error) {
 	if !h.hang.Load() {
 		return h.hookRail.Status(ctx, ref)
 	}
+	left := time.Duration(-1) // no deadline at all
+	if dl, ok := ctx.Deadline(); ok {
+		left = time.Until(dl)
+	}
+	h.remaining <- left
 	h.statuses.Add(1)
+	<-h.release
 	<-ctx.Done()
 	return rail.Result{}, ctx.Err()
 }
 
 // The Status bound and its timeout together (Ivan, 2026-10-29). While a
 // hung rail holds every slot, the next webhook is shed at once with 503 and
-// Retry-After, and counted in WebhookShed. The hung calls give their slots
-// back after webhookStatusTimeout, not the router's 5 s deadline, and later
-// webhooks are handled again. A budget nothing exercises is one we don't
-// have.
+// Retry-After, and counted in WebhookShed. Each hung call's context ends
+// after webhookStatusTimeout, not the router's 5 s deadline, and once the
+// calls return later webhooks are handled again. A budget nothing
+// exercises is one we don't have.
 func TestWebhook_HungRailCantHoldTheBound(t *testing.T) {
 	t.Parallel()
 	const bound, timeout = 2, 200 * time.Millisecond
 	pool := testutil.Postgres(t)
 	fake := rail.NewFake(pool, rail.Step{Outcome: rail.Pending}, rail.Step{Outcome: rail.Pending}, rail.Step{Outcome: rail.Pending})
-	hung := &hangingRail{hookRail: &hookRail{Adapter: fake}}
+	hung := &hangingRail{hookRail: &hookRail{Adapter: fake}, release: make(chan struct{}), remaining: make(chan time.Duration, bound)}
+	var once sync.Once
+	releaseAll := func() { once.Do(func() { close(hung.release) }) }
+	t.Cleanup(releaseAll) // a failed assertion mustn't leave the calls parked
 	a := newWebhookAPIOn(t, pool, hung, WithWebhookBound(bound))
 	a.fake = fake
 	a.svc.webhookStatusTimeout = timeout
+	// The lookup's own 300 ms is pinned by TestHint_LookupBounded; here a
+	// loaded runner's slow connection must not turn a hung call into a 503.
+	a.svc.webhookLookupTimeout = 5 * time.Second
 	ids := []uuid.UUID{a.create("1"), a.create("2"), a.create("3")}
 
 	hung.hang.Store(true)
 	var wg sync.WaitGroup
-	elapsed := make([]time.Duration, bound)
 	for i := range bound {
 		wg.Go(func() {
-			start := time.Now()
 			if rec := a.post(rail.FakeName, hint(ids[i])); rec.Code != http.StatusNoContent {
 				t.Errorf("hung webhook %d = %d, want 204", i, rec.Code)
 			}
-			elapsed[i] = time.Since(start)
 		})
 	}
 	waitFor(t, func() bool { return hung.statuses.Load() == bound })
@@ -414,12 +430,13 @@ func TestWebhook_HungRailCantHoldTheBound(t *testing.T) {
 		t.Fatalf("shed request not logged at Debug only:\n%s", out)
 	}
 
+	releaseAll()
 	wg.Wait()
-	for i, d := range elapsed {
-		// Well under the router's 5 s deadline: the slot is held for the
-		// Status timeout, plus the lookup.
-		if d < timeout || d > 2*time.Second {
-			t.Errorf("hung webhook %d took %v, want about %v", i, d, timeout)
+	for i := range bound {
+		// The Status call's own deadline, not the router's 5 s: at most the
+		// timeout, and some of it left when the call began.
+		if left := <-hung.remaining; left <= 0 || left > timeout {
+			t.Errorf("hung Status %d had %v left on its context, want (0, %v]", i, left, timeout)
 		}
 	}
 	assertState(t, a.svc, ids[0], Settling, nil)
@@ -632,6 +649,11 @@ func TestWebhook_RacesCreatesSettle(t *testing.T) {
 func TestHint_SlotFreedBeforeWrite(t *testing.T) {
 	t.Parallel()
 	a := newWebhookAPI(t, []rail.Step{{Outcome: rail.Pending}, {Outcome: rail.Pending}}, WithWebhookBound(1))
+	// The lookups' own 300 ms is pinned by TestHint_LookupBounded. Here it
+	// only has to outlast getting a connection, which on a loaded runner it
+	// didn't: A's lookup timed out, A never reached the write, and the wait
+	// below failed (SPEC-002 15b).
+	a.svc.webhookLookupTimeout = 5 * time.Second
 	idA, idB := a.create("a"), a.create("b")
 	a.resolve(idA, rail.Settled)
 

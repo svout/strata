@@ -320,20 +320,26 @@ func TestFake_StoreErrorHidesDSN(t *testing.T) {
 // A delay shorter than the deadline settles; a longer one returns the
 // context's error and applies nothing, so a retry with the same reference
 // settles once.
+//
+// The two calls have different deadlines on purpose (SPEC-002 15b). The
+// short call's 5 s only has to outlast the 5 ms delay plus the pool's
+// first connection, a read and an insert; with a shared 100 ms deadline a
+// loaded runner spent it all before the fake answered. The long call keeps
+// 100 ms against its 1 s delay, which is the timeout this test is about.
 func TestFake_DelayAndTimeout(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
 	f := rail.NewFake(pool, rail.Step{Delay: 5 * time.Millisecond}, rail.Step{Delay: time.Second})
-	ctx := func() context.Context {
-		c, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	ctx := func(d time.Duration) context.Context {
+		c, cancel := context.WithTimeout(t.Context(), d)
 		t.Cleanup(cancel)
 		return c
 	}
-	if res, err := f.Settle(ctx(), fakeRequest()); err != nil || res.Outcome != rail.Settled {
+	if res, err := f.Settle(ctx(5*time.Second), fakeRequest()); err != nil || res.Outcome != rail.Settled {
 		t.Fatalf("short delay = %+v, %v; want Settled", res, err)
 	}
 	slow := fakeRequest()
-	if _, err := f.Settle(ctx(), slow); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := f.Settle(ctx(100*time.Millisecond), slow); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("long delay = %v, want DeadlineExceeded", err)
 	}
 	if _, err := f.Status(t.Context(), slow.Ref); !errors.Is(err, rail.ErrUnknownRef) {
