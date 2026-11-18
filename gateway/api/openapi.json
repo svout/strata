@@ -1,0 +1,212 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "AgentGate gateway",
+    "version": "0.1.0",
+    "description": "The gateway's HTTP API (P1: payment core and ledger). Hand-written; TestOpenAPI_RoutesMatchMounted and TestOpenAPI_PaymentSchemaMatchesStruct keep its routes and payment schemas in step with the code (ADR-129). Problem codes and statuses are documented here but not drift-tested. Every error documented here is an RFC 9457 problem with a stable machine-readable `code`; clients branch on `code`, never on `title`. An unknown path or method gets the router's plain-text 404 or empty 405, which are not part of this contract. Every response carries X-Request-Id; every response with a body is also marked X-Content-Type-Options: nosniff and Cache-Control: no-store."
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "operationId": "healthz",
+        "summary": "Liveness",
+        "description": "Answers whenever the process is serving. It checks no dependency; use /readyz for that.",
+        "responses": {
+          "200": {
+            "description": "The process is alive.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["status"],
+                  "properties": {"status": {"const": "ok"}}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "operationId": "readyz",
+        "summary": "Readiness",
+        "description": "Runs each readiness check (PostgreSQL, Redis, and \"rail\", which fails until the rail is wired). Results are cached for about a second. Check errors are never shown, only a status per check.",
+        "responses": {
+          "200": {
+            "description": "Every check passed.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Readiness"}}}
+          },
+          "503": {
+            "description": "At least one check failed or timed out.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Readiness"}}}
+          }
+        }
+      }
+    },
+    "/v1/payments": {
+      "post": {
+        "operationId": "createPayment",
+        "summary": "Create a payment",
+        "description": "Creates a payment and starts settling it on the rail. Idempotent: a retry with the same Idempotency-Key and the same body, within 24 h, returns the stored response byte for byte and creates nothing (ADR-118).",
+        "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}],
+        "requestBody": {
+          "required": true,
+          "description": "At most 64 KiB, exactly one JSON object, no unknown members.",
+          "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreatePaymentRequest"}}}
+        },
+        "responses": {
+          "201": {
+            "description": "The payment was created. The body is a point-in-time snapshot taken at creation, usually in state `settling`; it is never updated, and a replay returns the same bytes even after the payment has settled or failed. `settling` here does not mean stuck: GET the Location URL for the current state.",
+            "headers": {
+              "Location": {
+                "description": "The payment's URL, /v1/payments/{id}: GET it for the current state.",
+                "schema": {"type": "string", "format": "uri-reference"}
+              }
+            },
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Payment"}}}
+          },
+          "400": {"$ref": "#/components/responses/Problem", "description": "`idempotency_key_required`: the header is missing or not 1-255 bytes. `invalid_request`: the body is not a valid payment (malformed JSON, a wrong type, unknown members, trailing data, or a missing or zero payer/payee account ID; a missing `amount` or `currency` is a 422 instead)."},
+          "409": {"$ref": "#/components/responses/Problem", "description": "`idempotency_key_mismatch`: the key was already used for a different request."},
+          "413": {"$ref": "#/components/responses/Problem", "description": "`request_too_large`: the body is over 64 KiB."},
+          "422": {"$ref": "#/components/responses/Problem", "description": "`invalid_amount`, `unsupported_currency`, `same_account` or `account_not_found`."},
+          "500": {"$ref": "#/components/responses/Problem", "description": "`internal_error`."},
+          "503": {"$ref": "#/components/responses/RetryLater"}
+        }
+      }
+    },
+    "/v1/payments/{id}": {
+      "get": {
+        "operationId": "getPayment",
+        "summary": "Get a payment's current state",
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
+        ],
+        "responses": {
+          "200": {
+            "description": "The payment as it is now.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Payment"}}}
+          },
+          "400": {"$ref": "#/components/responses/Problem", "description": "`invalid_payment_id`: the id is not a UUID."},
+          "404": {"$ref": "#/components/responses/Problem", "description": "`payment_not_found`."},
+          "500": {"$ref": "#/components/responses/Problem", "description": "`internal_error`."},
+          "503": {"$ref": "#/components/responses/RetryLater"}
+        }
+      }
+    },
+    "/v1/rail/webhooks/{rail}": {
+      "post": {
+        "operationId": "railWebhook",
+        "summary": "Rail webhook (a hint)",
+        "description": "Unauthenticated. The body is only a hint: the gateway asks the rail for the payment's status and acts on that answer, never on the body (ADR-124). The answer is the same 204 whether or not the payment exists, so the status code doesn't reveal which payments exist (response timing still differs; accepted in ADR-124). Rate-limited per source (behind GATEWAY_TRUSTED_PROXIES, the client address from X-Forwarded-For; ADR-128).",
+        "parameters": [
+          {"name": "rail", "in": "path", "required": true, "description": "The rail's name, e.g. `fake`.", "schema": {"type": "string"}}
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "The gateway reads at most 1 KiB. Members other than `ref`, and anything after the JSON value, are ignored (unlike createPayment, which refuses trailing data; deliberate, ADR-124).",
+          "content": {"application/json": {"schema": {"$ref": "#/components/schemas/WebhookHint"}}}
+        },
+        "responses": {
+          "204": {"description": "The hint was taken. Says nothing about whether the payment exists or what happened to it."},
+          "400": {"$ref": "#/components/responses/Problem", "description": "`invalid_ref`: the body is not {\"ref\":\"pay_<uuid>\"}."},
+          "404": {"$ref": "#/components/responses/Problem", "description": "`unknown_rail`: the gateway has no rail by that name."},
+          "413": {"$ref": "#/components/responses/Problem", "description": "`request_too_large`: the JSON value does not end within the first 1 KiB."},
+          "429": {
+            "description": "`rate_limited`: too many requests from this source.",
+            "headers": {"Retry-After": {"$ref": "#/components/headers/RetryAfter"}},
+            "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/Problem"}}}
+          },
+          "500": {"$ref": "#/components/responses/Problem", "description": "`internal_error`."},
+          "503": {"$ref": "#/components/responses/RetryLater"}
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": true,
+        "description": "1-255 bytes (maxLength counts characters; the limit is in bytes), chosen by the caller and unique per intended payment. Kept for 24 h.",
+        "schema": {"type": "string", "minLength": 1, "maxLength": 255}
+      }
+    },
+    "headers": {
+      "RetryAfter": {
+        "description": "Seconds to wait before retrying.",
+        "schema": {"type": "integer", "minimum": 1}
+      }
+    },
+    "responses": {
+      "Problem": {
+        "description": "An RFC 9457 problem.",
+        "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/Problem"}}}
+      },
+      "RetryLater": {
+        "description": "Temporarily unavailable; retry after Retry-After (with the same Idempotency-Key, a retry is safe). `try_again_later`: the API is not wired yet (the rail isn't ready), too many concurrent transactions, or every webhook slot is taken. `request_timeout`: the request's deadline ran out.",
+        "headers": {"Retry-After": {"$ref": "#/components/headers/RetryAfter"}},
+        "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/Problem"}}}
+      }
+    },
+    "schemas": {
+      "CreatePaymentRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["amount", "currency", "payer_account_id", "payee_account_id"],
+        "properties": {
+          "amount": {"type": "integer", "minimum": 1, "description": "Minor units (pence)."},
+          "currency": {"const": "GBP"},
+          "payer_account_id": {"type": "string", "format": "uuid"},
+          "payee_account_id": {"type": "string", "format": "uuid", "description": "Must differ from payer_account_id."},
+          "mandate_id": {"type": ["string", "null"], "format": "uuid"}
+        }
+      },
+      "Payment": {
+        "type": "object",
+        "required": ["id", "state", "amount", "currency", "payer_account_id", "payee_account_id", "mandate_id", "rail", "rail_ref", "failure_reason", "created_at", "updated_at"],
+        "properties": {
+          "id": {"type": "string", "format": "uuid"},
+          "state": {"enum": ["created", "settling", "settled", "failed"]},
+          "amount": {"type": "integer", "minimum": 1, "description": "Minor units (pence)."},
+          "currency": {"const": "GBP"},
+          "payer_account_id": {"type": "string", "format": "uuid"},
+          "payee_account_id": {"type": "string", "format": "uuid"},
+          "mandate_id": {"type": ["string", "null"], "format": "uuid"},
+          "rail": {"type": "string", "description": "The rail that settles it, e.g. `internal` or `fake`."},
+          "rail_ref": {"type": ["string", "null"], "description": "pay_<id>, generated by the gateway when settling starts; null if the payment never reached `settling` (it is `created`, or failed from `created`)."},
+          "failure_reason": {"enum": ["declined", "invalid_request", null], "description": "Set exactly when state is `failed`."},
+          "created_at": {"type": "string", "format": "date-time"},
+          "updated_at": {"type": "string", "format": "date-time"}
+        }
+      },
+      "WebhookHint": {
+        "type": "object",
+        "required": ["ref"],
+        "properties": {"ref": {"type": "string", "pattern": "^pay_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "description": "pay_ and the payment ID as a lower-case hyphenated UUID; the nil UUID is refused."}}
+      },
+      "Problem": {
+        "type": "object",
+        "required": ["type", "title", "status", "code"],
+        "properties": {
+          "type": {"const": "about:blank"},
+          "title": {"type": "string", "description": "A short fixed summary for people; not for branching."},
+          "status": {"type": "integer"},
+          "code": {"type": "string", "description": "Stable, machine-readable; see each response for its values."}
+        }
+      },
+      "Readiness": {
+        "type": "object",
+        "required": ["status", "checks"],
+        "properties": {
+          "status": {"enum": ["ready", "not_ready"]},
+          "checks": {
+            "type": "object",
+            "additionalProperties": {"enum": ["ok", "fail", "timeout"]}
+          }
+        }
+      }
+    }
+  }
+}

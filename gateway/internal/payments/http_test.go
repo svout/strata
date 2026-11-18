@@ -7,8 +7,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -613,4 +617,88 @@ func assertProblem(t *testing.T, rec *httptest.ResponseRecorder, status int, cod
 		json.Unmarshal(rec.Body.Bytes(), &body) != nil || body.Code != code || body.Status != status {
 		t.Fatalf("got %d %s %s, want %d %s", rec.Code, rec.Header().Get("Content-Type"), rec.Body, status, code)
 	}
+}
+
+// TestOpenAPI_PaymentSchemaMatchesStruct requires the spec's Payment and
+// CreatePaymentRequest properties to be exactly the JSON members the code
+// writes and accepts (ADR-129), and Payment's required list to be exactly
+// the members encoding/json always writes. The request schema must also
+// refuse unknown members, as create's decoder does (DisallowUnknownFields).
+// The route set is checked in cmd/gateway (TestOpenAPI_RoutesMatchMounted).
+func TestOpenAPI_PaymentSchemaMatchesStruct(t *testing.T) {
+	t.Parallel()
+	raw, err := os.ReadFile("../../api/openapi.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec struct {
+		Components struct {
+			Schemas map[string]struct {
+				Properties           map[string]json.RawMessage `json:"properties"`
+				Required             []string                   `json:"required"`
+				AdditionalProperties *bool                      `json:"additionalProperties"`
+			} `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		schema string
+		of     any
+		// checkRequired is false for the request: create's decoder doesn't
+		// require any member, so its required list is documentation (the
+		// service's validation is what refuses a missing one).
+		checkRequired bool
+	}{
+		{"Payment", Payment{}, true},
+		{"CreatePaymentRequest", createRequest{}, false},
+	} {
+		s, ok := spec.Components.Schemas[tc.schema]
+		if !ok {
+			t.Fatalf("spec has no %s schema", tc.schema)
+		}
+		names, always := jsonMembers(t, reflect.TypeOf(tc.of))
+		if got := slices.Sorted(maps.Keys(s.Properties)); !slices.Equal(got, names) {
+			t.Errorf("%s properties = %v, want %v (the %T JSON members)", tc.schema, got, names, tc.of)
+		}
+		if got := slices.Sorted(slices.Values(s.Required)); tc.checkRequired && !slices.Equal(got, always) {
+			t.Errorf("%s required = %v, want %v (the %T members without omitempty or omitzero)", tc.schema, got, always, tc.of)
+		}
+	}
+	if ap := spec.Components.Schemas["CreatePaymentRequest"].AdditionalProperties; ap == nil || *ap {
+		t.Error("CreatePaymentRequest must set additionalProperties: false: create rejects unknown members")
+	}
+}
+
+// jsonMembers returns the member names encoding/json uses for struct type
+// typ, and those it always writes (no omitempty or omitzero), both sorted.
+// It follows encoding/json's rules for the cases these structs can hit: an
+// unexported field is skipped, an untagged one is named after the field, and
+// "-" drops it. An embedded struct would promote its fields, which this
+// doesn't follow, so it fails the test instead of passing without them.
+func jsonMembers(t *testing.T, typ reflect.Type) (names, always []string) {
+	t.Helper()
+	for f := range typ.Fields() {
+		if f.Anonymous {
+			t.Fatalf("%s embeds %s: jsonMembers doesn't follow promoted fields", typ, f.Name)
+		}
+		if !f.IsExported() {
+			continue
+		}
+		name, opts, _ := strings.Cut(f.Tag.Get("json"), ",")
+		if name == "-" && opts == "" {
+			continue
+		}
+		if name == "" {
+			name = f.Name
+		}
+		names = append(names, name)
+		if o := strings.Split(opts, ","); !slices.Contains(o, "omitempty") && !slices.Contains(o, "omitzero") {
+			always = append(always, name)
+		}
+	}
+	slices.Sort(names)
+	slices.Sort(always)
+	return names, always
 }
