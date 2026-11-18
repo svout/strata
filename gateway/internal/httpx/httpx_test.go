@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -367,6 +368,80 @@ func TestNewRouter_MountedSubrouterGetsMiddleware(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), `"status":500`) {
 		t.Fatalf("recovered panic not logged as 500:\n%s", buf.String())
+	}
+}
+
+// SPEC-002 15a: an unmatched path is a 404 not_found problem and a served
+// method the path doesn't take a 405 method_not_allowed problem with Allow,
+// on NewRouter's own routes and on a NewSubRouter mounted behind a wrapper
+// that isn't a *chi.Mux (as the gates are), where chi wouldn't hand the
+// handlers down. Allow must name the methods plain chi's own 405 would. Any
+// other method is a 501 not_implemented problem, whatever the path.
+func TestNewRouter_UnmatchedGetProblems(t *testing.T) {
+	var buf bytes.Buffer
+	r := NewRouter(NewLogger(&buf, slog.LevelInfo))
+	routes := func(m chi.Router) {
+		ok := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }
+		m.Post("/", ok)
+		m.Get("/{id}", ok)
+	}
+	sub := NewSubRouter()
+	routes(sub)
+	r.Mount("/v1/things", http.HandlerFunc(sub.ServeHTTP)) // a wrapper, not a *chi.Mux
+	plain := chi.NewRouter()
+	routes(plain)
+
+	// A method outside servedMethods is a 501 on every path, routed or not,
+	// with no Allow: PROPFIND and FOO are unrecognised, DELETE, OPTIONS and
+	// TRACE are standard but served nowhere.
+	for _, tc := range []struct {
+		method, path string
+		status       int
+		allow        string // for a 405; plainPath gives chi's own answer to compare
+		plainPath    string
+	}{
+		{http.MethodGet, "/nope", http.StatusNotFound, "", ""},
+		{http.MethodGet, "/v1/things/a/b", http.StatusNotFound, "", ""},
+		{http.MethodPost, "/healthz", http.StatusMethodNotAllowed, "GET", ""},
+		{http.MethodHead, "/healthz", http.StatusMethodNotAllowed, "GET", ""},
+		{http.MethodPost, "/v1/things/abc", http.StatusMethodNotAllowed, "GET", "/abc"},
+		{http.MethodGet, "/v1/things/", http.StatusMethodNotAllowed, "POST", "/"},
+		{"PROPFIND", "/nope", http.StatusNotImplemented, "", ""},
+		{"PROPFIND", "/v1/things/abc", http.StatusNotImplemented, "", ""},
+		{"FOO", "/healthz", http.StatusNotImplemented, "", ""},
+		{http.MethodDelete, "/v1/things/abc", http.StatusNotImplemented, "", ""},
+		{http.MethodOptions, "/healthz", http.StatusNotImplemented, "", ""},
+		{http.MethodTrace, "/", http.StatusNotImplemented, "", ""},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			buf.Reset()
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+			code := map[int]string{http.StatusNotFound: "not_found", http.StatusMethodNotAllowed: "method_not_allowed",
+				http.StatusNotImplemented: "not_implemented"}[tc.status]
+			var body struct {
+				Status int    `json:"status"`
+				Code   string `json:"code"`
+			}
+			if rec.Code != tc.status || rec.Header().Get("Content-Type") != "application/problem+json" ||
+				json.Unmarshal(rec.Body.Bytes(), &body) != nil || body.Code != code || body.Status != tc.status {
+				t.Fatalf("got %d %s %s, want %d %s", rec.Code, rec.Header().Get("Content-Type"), rec.Body, tc.status, code)
+			}
+			assertSafetyHeaders(t, rec)
+			if got := rec.Header().Get("Allow"); got != tc.allow {
+				t.Errorf("Allow = %q, want %q", got, tc.allow)
+			}
+			if tc.plainPath != "" {
+				prec := httptest.NewRecorder()
+				plain.ServeHTTP(prec, httptest.NewRequest(tc.method, tc.plainPath, nil))
+				if want := strings.Join(prec.Header().Values("Allow"), ", "); prec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != want {
+					t.Errorf("Allow = %q; plain chi answers %d with %q", rec.Header().Get("Allow"), prec.Code, want)
+				}
+			}
+			if !strings.Contains(buf.String(), fmt.Sprintf(`"status":%d`, tc.status)) {
+				t.Errorf("request log doesn't record %d:\n%s", tc.status, buf.String())
+			}
+		})
 	}
 }
 

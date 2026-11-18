@@ -30,7 +30,7 @@ const maxBodyBytes = 64 << 10
 // Transitions have no endpoints: rail webhooks drive them (subtasks 9–10).
 func (s *Service) Handler(log *slog.Logger) http.Handler {
 	h := handler{svc: s, log: log}
-	r := chi.NewRouter()
+	r := httpx.NewSubRouter()
 	r.Post("/", h.create)
 	r.Get("/{id}", h.get)
 	return r
