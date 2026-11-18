@@ -466,8 +466,8 @@ func waitFor(t *testing.T, cond func() bool) {
 }
 
 // AC8: nothing a webhook caller sends reaches the log or a response, in a
-// malformed reference or in members the handler ignores. The payment id is
-// logged as text.
+// malformed reference, in members the handler ignores, or in a body over
+// the cap. The payment id is logged as text.
 func TestWebhook_LogsNoBodyContent(t *testing.T) {
 	t.Parallel()
 	const secret = "sk_live_webhook_4242"
@@ -477,11 +477,23 @@ func TestWebhook_LogsNoBodyContent(t *testing.T) {
 
 	bad := a.post(rail.FakeName, `{"ref":"pay_`+secret+`"}`)
 	wantCode(t, bad, http.StatusBadRequest)
-	wantCode(t, a.post(rail.FakeName, `{"ref":"`+rail.Ref(id)+`","signature":"`+secret+`"}`), http.StatusNoContent)
+	// A valid ref, but the JSON value is still open at maxWebhookBodyBytes
+	// (ADR-124: a value that ends inside the cap is accepted), so the decoder
+	// rejects it before any lookup or Status call.
+	big := a.post(rail.FakeName, `{"ref":"`+rail.Ref(id)+`","note":"`+secret+strings.Repeat("x", maxWebhookBodyBytes)+`"}`)
+	wantCode(t, big, http.StatusRequestEntityTooLarge)
+	if got := a.hook.statuses.Load(); got != 0 {
+		t.Fatalf("Status calls after the 413 = %d, want 0", got)
+	}
+	// "signature" is a key the redactor masks anyway; "note" is not, so it
+	// catches a handler that logs the decoded body or its ignored members.
+	wantCode(t, a.post(rail.FakeName, `{"ref":"`+rail.Ref(id)+`","signature":"`+secret+`","note":"`+secret+`"}`), http.StatusNoContent)
 
 	out := a.log.String()
-	if strings.Contains(out, secret) || strings.Contains(bad.Body.String(), secret) {
-		t.Fatalf("secret leaked:\nlog: %s\nbody: %s", out, bad.Body)
+	for _, s := range []string{out, bad.Body.String(), big.Body.String()} {
+		if strings.Contains(s, secret) {
+			t.Fatalf("secret leaked:\nlog: %s\n400 body: %s\n413 body: %s", out, bad.Body, big.Body)
+		}
 	}
 	if want := `"msg":"payment settled","payment_id":"` + id.String() + `"`; !strings.Contains(out, want) {
 		t.Fatalf("log missing %s:\n%s", want, out)
