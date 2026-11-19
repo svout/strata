@@ -127,7 +127,7 @@ function MembersTab() {
           }}
         >
           <label htmlFor="inv-email" className="sr-only">Invite by email</label>
-          <input id="inv-email" type="email" className="field min-w-[220px] flex-1" placeholder="name@company.com" value={email} disabled={!allowed} aria-invalid={!!error} onChange={(e) => setEmail(e.target.value)} />
+          <input id="inv-email" type="email" className="field min-w-[220px] flex-1" placeholder="name@example.com" value={email} disabled={!allowed} aria-invalid={!!error} onChange={(e) => setEmail(e.target.value)} />
           <label htmlFor="inv-role" className="sr-only">Role</label>
           <select id="inv-role" className="field !w-auto" value={role} disabled={!allowed} onChange={(e) => setRole(e.target.value as Invite["role"])}>
             {(["admin", "member", "viewer"] as const).map((r) => <option key={r} value={r}>{ROLE_INFO[r].label}</option>)}

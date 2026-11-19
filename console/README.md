@@ -14,7 +14,7 @@ npm run dev
 
 Then open http://localhost:3001.
 
-`npm run lint` (ESLint + `tsc --noEmit`), `npm test` (Vitest), `npm run build`. The root `make lint` and `make test` pick the console up automatically now that `package.json` exists, and CI does the same.
+`npm run lint` (ESLint + `tsc --noEmit`), `npm test` (Vitest), `npm run build`. The root `make lint` and `make test` run `npm ci` and then the first two, and CI calls the same targets; nothing runs `npm run build` yet, so a build-only break isn't caught there. Node is pinned in `.nvmrc` (22), which CI reads; locally it holds only if your version manager uses it. The package manager is npm (Technology Choices, amended 2026-11-19): `package-lock.json` is the lock the tests pass against, so add dependencies with `npm install`, never a different tool.
 
 ## Sample data, for now
 
@@ -28,6 +28,19 @@ Until the gateway (P2–P5) and the control-plane API exist, the console talks t
 Everything resets on reload, or from the user menu → Reset sample data. The sidebar's "Live agent traffic" switch adds a new payment every few seconds.
 
 **This mock is not the dissertation's implementation.** It exists so the console has the same shapes and the same kinds of reasons the real gateway will return. Nothing it produces is a measured result: the timing bars say "sample".
+
+### The honesty rule (hard rule, SPEC-002 18 and P7)
+
+Any public or assessed use of the console (screenshots, demo video, slides, poster, report figures, social posts) must state that **the data is simulated and the decision engine is a prototype**. In the Go gateway only payment creation and the double-entry ledger exist, so an unlabelled demo claims a system that doesn't exist.
+
+The console says so itself: a notice at the top of every screen (`src/components/shell/PrototypeNotice.tsx`, mounted once in `Providers`). Today it reads:
+
+> Prototype. The data shown is simulated. In the gateway, only payment creation and the double-entry ledger exist. Everything else on these screens is simulated, including mandate, signature, policy, risk and audit-chain behaviour.
+
+- The engine sentence is generated from `GATEWAY_IMPLEMENTED` (`src/config/prototype.ts`), a **positive list of what exists**. Everything not on it is declared simulated, so the list can only be wrong by claiming too little. Add an entry in the step that ships a behaviour; never write a list of what's missing, because that is only true if it is complete (the first version of this notice left out signatures and the audit chain).
+- "The data shown is simulated" has its own condition, `IS_SAMPLE_DATA` (the mock is in use), because it stops being true at a different time.
+
+`PrototypeNotice.test.tsx` pins today's exact text, the generated forms (including an empty list), the separate data condition, and one notice on two different pages rendered inside `Providers`. The notice is in the page flow, so a screenshot includes it, but it is not a substitute for a caption: captions still say it. It also doesn't reach everywhere: there is no `error.tsx` or `global-error.tsx` yet, and on a phone an open drawer or modal covers it, so a screenshot of either needs the caption.
 
 ## How it's put together
 
@@ -76,7 +89,14 @@ Four roles for people (agents never have one; their limits come from mandates an
 
 ## Not done yet
 
+Prototype gaps against `console/CLAUDE.md` (its rules are P7's target, so they stay as written):
+
+- It writes reviews, mandates, agents, keys and members, not only policy edits, and only to the in-browser mock.
+- `src/api/types.ts` is hand-written, not the generated client.
+- No Playwright flow yet (a new dependency, so it needs its own step).
+
+Also:
+
 - Real sign-in (Google / GitHub OAuth) and the generated API client.
-- One Playwright flow for the demo path (console/CLAUDE.md asks for it).
 - Provider marks on the sign-in buttons (from the Google and GitHub brand kits).
 - Webhook editing, review expiry (the P5 board leaves it to the owner), notifications.

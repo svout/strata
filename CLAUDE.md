@@ -1,4 +1,4 @@
-# AgentGate
+# Strata
 
 A mandate enforcement and risk gateway for AI agent payments. Final year project; the dissertation argues that enforcement at this layer catches what the agentic payment protocols leave open, and measures what it costs.
 
@@ -24,7 +24,7 @@ Procedure: `VAULT/Workflow/Step Loop.md`. Principles: `VAULT/Workflow/Developmen
 
 ## Commands
 `make dev` · `make test` · `make lint` · `make bench` (k6) · `make attack` (scenario suite) · `make demo` · `make export-docs` · `make migrate`
-Scoped while building: `go test ./internal/<pkg> -run <Test>` · `uv run pytest <path>::<test>` · `npm --prefix console exec vitest related <file>`
+Scoped while building: `go test ./internal/<pkg> -run <Test>` · `uv run pytest <path>::<test>` · `npm --prefix console exec -- vitest related --run --root console src/<file>` (without `--run --root console` it runs 0 tests and exits 0)
 
 ## AI use on this module (read this first)
 This is an assessed university project. The supervisor has agreed that AI tools may be used across the project **on condition that every use is declared** (ADR-113 in `VAULT/Project/Decisions (ADRs).md`).
