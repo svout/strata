@@ -375,8 +375,9 @@ func TestNewRouter_MountedSubrouterGetsMiddleware(t *testing.T) {
 // method the path doesn't take a 405 method_not_allowed problem with Allow,
 // on NewRouter's own routes and on a NewSubRouter mounted behind a wrapper
 // that isn't a *chi.Mux (as the gates are), where chi wouldn't hand the
-// handlers down. Allow must name the methods plain chi's own 405 would. Any
-// other method is a 501 not_implemented problem, whatever the path.
+// handlers down. Allow must name the methods plain chi's own 405 would, plus
+// HEAD wherever GET is (SPEC-002 17: HEAD is answered as GET). Any other
+// method is a 501 not_implemented problem, whatever the path.
 func TestNewRouter_UnmatchedGetProblems(t *testing.T) {
 	var buf bytes.Buffer
 	r := NewRouter(NewLogger(&buf, slog.LevelInfo))
@@ -402,9 +403,10 @@ func TestNewRouter_UnmatchedGetProblems(t *testing.T) {
 	}{
 		{http.MethodGet, "/nope", http.StatusNotFound, "", ""},
 		{http.MethodGet, "/v1/things/a/b", http.StatusNotFound, "", ""},
-		{http.MethodPost, "/healthz", http.StatusMethodNotAllowed, "GET", ""},
-		{http.MethodHead, "/healthz", http.StatusMethodNotAllowed, "GET", ""},
-		{http.MethodPost, "/v1/things/abc", http.StatusMethodNotAllowed, "GET", "/abc"},
+		{http.MethodPost, "/healthz", http.StatusMethodNotAllowed, "GET, HEAD", ""},
+		{http.MethodHead, "/nope", http.StatusNotFound, "", ""},
+		{http.MethodHead, "/v1/things/", http.StatusMethodNotAllowed, "POST", "/"},
+		{http.MethodPost, "/v1/things/abc", http.StatusMethodNotAllowed, "GET, HEAD", "/abc"},
 		{http.MethodGet, "/v1/things/", http.StatusMethodNotAllowed, "POST", "/"},
 		{"PROPFIND", "/nope", http.StatusNotImplemented, "", ""},
 		{"PROPFIND", "/v1/things/abc", http.StatusNotImplemented, "", ""},
@@ -434,7 +436,9 @@ func TestNewRouter_UnmatchedGetProblems(t *testing.T) {
 			if tc.plainPath != "" {
 				prec := httptest.NewRecorder()
 				plain.ServeHTTP(prec, httptest.NewRequest(tc.method, tc.plainPath, nil))
-				if want := strings.Join(prec.Header().Values("Allow"), ", "); prec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != want {
+				want := strings.Join(prec.Header().Values("Allow"), ", ")
+				want = strings.Replace(want, "GET", "GET, HEAD", 1) // plain chi doesn't list HEAD
+				if prec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != want {
 					t.Errorf("Allow = %q; plain chi answers %d with %q", rec.Header().Get("Allow"), prec.Code, want)
 				}
 			}
@@ -442,6 +446,75 @@ func TestNewRouter_UnmatchedGetProblems(t *testing.T) {
 				t.Errorf("request log doesn't record %d:\n%s", tc.status, buf.String())
 			}
 		})
+	}
+}
+
+// SPEC-002 17: HEAD on a path with a GET route is answered as GET without a
+// body, on NewRouter's own routes and on a NewSubRouter behind a wrapper (as
+// the gates are). chi's middleware.GetHead looks up the root's routes at
+// every level: on the root alone it leaves HEAD under a mount a 405, and in
+// a sub-router it ignores that router's own HEAD routes, which the /own
+// case catches. A real server is used because
+// httptest.ResponseRecorder keeps a HEAD body; net/http drops it and sets
+// GET's Content-Length (the bodies here fit its buffer). A HEAD route of its
+// own still wins, and a path without GET keeps its 405.
+func TestNewRouter_HeadServedAsGet(t *testing.T) {
+	r := NewRouter(NewLogger(io.Discard, slog.LevelInfo))
+	sub := NewSubRouter()
+	sub.Get("/{id}", func(w http.ResponseWriter, r *http.Request) {
+		WriteJSON(w, http.StatusOK, map[string]string{"id": chi.URLParam(r, "id")})
+	})
+	sub.Get("/missing", func(w http.ResponseWriter, _ *http.Request) {
+		WriteProblem(w, http.StatusNotFound, "thing_not_found", "Thing not found")
+	})
+	sub.Get("/own", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	sub.Head("/own", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusAccepted) })
+	sub.Post("/", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	r.Mount("/v1/things", http.HandlerFunc(sub.ServeHTTP)) // a wrapper, not a *chi.Mux
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+
+	do := func(method, path string) (int, http.Header, []byte) {
+		t.Helper()
+		req, err := http.NewRequest(method, srv.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = res.Body.Close() }()
+		body, err := io.ReadAll(res.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.StatusCode, res.Header, body
+	}
+
+	for _, path := range []string{"/healthz", "/v1/things/abc", "/v1/things/missing"} {
+		t.Run(path, func(t *testing.T) {
+			getStatus, get, getBody := do(http.MethodGet, path)
+			headStatus, head, headBody := do(http.MethodHead, path)
+			if len(getBody) == 0 || len(headBody) != 0 {
+				t.Fatalf("GET body %q, HEAD body %q; want a GET body and none on HEAD", getBody, headBody)
+			}
+			if headStatus != getStatus {
+				t.Errorf("HEAD status = %d, GET's = %d", headStatus, getStatus)
+			}
+			for _, h := range []string{"Content-Type", "Content-Length", "Cache-Control", "X-Content-Type-Options", "Allow"} {
+				if head.Get(h) != get.Get(h) {
+					t.Errorf("HEAD %s = %q, GET's = %q", h, head.Get(h), get.Get(h))
+				}
+			}
+		})
+	}
+
+	if status, _, _ := do(http.MethodHead, "/v1/things/own"); status != http.StatusAccepted {
+		t.Errorf("HEAD with its own route: status = %d, want 202", status)
+	}
+	if status, h, _ := do(http.MethodHead, "/v1/things/"); status != http.StatusMethodNotAllowed || h.Get("Allow") != "POST" {
+		t.Errorf("HEAD on a POST-only path: %d Allow %q, want 405 Allow POST", status, h.Get("Allow"))
 	}
 }
 

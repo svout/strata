@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -983,5 +985,78 @@ func waitFor(t *testing.T, cond func() bool) {
 			t.Fatal("condition not met within 5 s")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// SPEC-002 17, end to end through compose's wrapped mounts (where chi's
+// middleware.GetHead on the root alone would leave a 405): HEAD on every
+// GET path the spec documents is answered as GET, with GET's status, the
+// headers checked below and no body, for a payment that exists (200) and
+// for one that doesn't (404 payment_not_found). A real server is used
+// because httptest.ResponseRecorder keeps a HEAD body; Content-Length
+// matches GET's because these bodies fit net/http's buffer. Telling getHead
+// apart from chi's GetHead in a sub-router is TestNewRouter_HeadServedAsGet's
+// job (its own-HEAD-route case); this test passes with either.
+func TestMountedAPIs_HeadServedAsGet(t *testing.T) {
+	t.Parallel()
+	m := newMounted(t, defaultWebhookConfig())
+	m.wire(t, rail.Step{Outcome: rail.Pending})
+	id := m.createSettling(t, testutil.NewAccount(t, m.pool, "user"), "head-1")
+	srv := httptest.NewServer(m.router)
+	t.Cleanup(srv.Close)
+
+	do := func(method, path string) (int, http.Header, []byte) {
+		t.Helper()
+		req, err := http.NewRequestWithContext(t.Context(), method, srv.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = res.Body.Close() }()
+		body, err := io.ReadAll(res.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.StatusCode, res.Header, body
+	}
+
+	var paths []string
+	for op := range specOperations(t) {
+		if method, path, _ := strings.Cut(op, " "); method == http.MethodGet {
+			paths = append(paths, path)
+		}
+	}
+	if !slices.Contains(paths, "/v1/payments/{id}") {
+		t.Fatalf("spec GET paths %v lack /v1/payments/{id}", paths)
+	}
+	// Each probe with the status GET must give, so a GET that regressed
+	// can't pass by HEAD regressing with it.
+	probes := map[string]int{}
+	for _, p := range paths {
+		probes[strings.ReplaceAll(p, "{id}", id.String())] = http.StatusOK
+		if strings.Contains(p, "{id}") {
+			probes[strings.ReplaceAll(p, "{id}", uuid.NewString())] = http.StatusNotFound
+		}
+	}
+	for path, want := range probes {
+		getStatus, get, getBody := do(http.MethodGet, path)
+		if getStatus != want || (want == http.StatusNotFound && !strings.Contains(string(getBody), "payment_not_found")) {
+			t.Errorf("%s: GET = %d %s, want %d", path, getStatus, getBody, want)
+		}
+		headStatus, head, headBody := do(http.MethodHead, path)
+		if len(getBody) == 0 || len(headBody) != 0 {
+			t.Errorf("%s: GET body %q, HEAD body %q; want a GET body and none on HEAD", path, getBody, headBody)
+		}
+		if headStatus != getStatus {
+			t.Errorf("%s: HEAD %d, GET %d; want the same", path, headStatus, getStatus)
+		}
+		for _, h := range []string{"Content-Type", "Content-Length", "Cache-Control", "X-Content-Type-Options"} {
+			if head.Get(h) != get.Get(h) {
+				t.Errorf("%s: HEAD %s = %q, GET's = %q", path, h, head.Get(h), get.Get(h))
+			}
+		}
 	}
 }
