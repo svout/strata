@@ -12,7 +12,7 @@ adr:
   - ADR-115
 created: 2026-10-03
 ---
-<!-- DO NOT EDIT: exported from vault "Specs/SPEC-002 Payment Core and Ledger.md" by make export-docs | source-sha256: bd6837c55e22512c8fd938673c4d7fb542b83cd02b6a18779fbb40589c4245a5 | content-sha256: e1eb70af6574eab8ee21720c8f96c51cd6d3cfdeaa50ce4c3bef6526ae955147 -->
+<!-- DO NOT EDIT: exported from vault "Specs/SPEC-002 Payment Core and Ledger.md" by make export-docs | source-sha256: 71ef900df1381eedae4ffb4c33434cbf2478de00e06c75b40f5923b577d9cd25 | content-sha256: 191b375bb876d5c9db84baacd79047d85e6a20ffb983c40869f607cf1ec7d7d6 -->
 
 # SPEC-002 Payment Core and Ledger
 
@@ -36,14 +36,14 @@ Each criterion maps to at least one automated test that runs in CI, unless marke
 - [x] **AC4 Crash safety:** killing the gateway mid-settlement, then restarting it, leaves no payment in an ambiguous state. Every payment is either terminal (`settled`/`failed`) or `settling` with a recovery record that resolves it against the rail's state (chaos script; CI runs it against the fake PSP).
 - [x] **AC5 Webhooks:** a duplicated webhook and out-of-order callbacks from the payment provider never double-post or move a payment backwards (chaos script against the fake PSP).
 - [x] **AC6 Rail contract:** the internal-ledger rail and the fake PSP pass one shared `RailAdapter` contract test suite. *(Reworded at 16 (Ivan, 2026-11-18), on AC1's precedent: the clause "the Stripe test-mode adapter passes it too when test keys are present, and skips cleanly otherwise" is stretch, not demonstrated in P1, and is carried by subtask 12, whose bullet already requires it.)* **✅ 2026-11-18 (16):** `railtest.Run` (`internal/rail/railtest/contract.go`) via `TestFake_Contract` (11/11) and `TestInternal_Contract` (8 pass; decline, pending and lost-response skip by design: the internal rail is synchronous and never declines, ADR-120).
-- [ ] **AC7 Runnable:**
+- [x] **AC7 Runnable:** **✅ 2026-11-19:** PR #48 (16) CI `lint`, `test`, `chaos` green on 64c8bbf; merged as bd6d435.
   - `make dev` starts the stack (gateway, PostgreSQL 16, Redis 7) from `infra/compose/`.
   - `make lint` and `make test` pass locally and in CI, and **CI calls the make targets** (the Reuse Registry's Make-targets note).
   - `/healthz` and `/readyz` (DB + Redis) respond.
-  - *Evidence (16, 2026-11-18), tick once the PR's CI `lint`/`test`/`chaos` are green (Ivan):* `make dev` → gateway, postgres:16-alpine, redis:7-alpine healthy; `/healthz` 200, `/readyz` 200 (`postgres`, `redis` and, since 10a-ii-b, `rail`); `make lint test-cold` green locally (`test-cold` = `make test` with `-count=1`); `ci.yml` calls `make lint`, `make test-cold`, `make chaos`.
+  - *Evidence (16, 2026-11-18), ticked 2026-11-19 after green CI:* `make dev` → gateway, postgres:16-alpine, redis:7-alpine healthy; `/healthz` 200, `/readyz` 200 (`postgres`, `redis` and, since 10a-ii-b, `rail`); `make lint test-cold` green locally (`test-cold` = `make test` with `-count=1`); `ci.yml` calls `make lint`, `make test-cold`, `make chaos`.
 - [x] **AC8 Logs:** structured JSON logs carry IDs and amounts, never secrets, card data or webhook bodies (repo CLAUDE.md). A test asserts that a known secret value never appears in the log output. **✅ 2026-11-18 (16):** `TestLogger_RedactsSecrets` (httpx); `TestHTTP_LogsIDAsTextAndNoSecrets` (payment id as text, `"amount":1250`, secret in `card_number`, `Authorization` and the key); `TestWebhook_LogsNoBodyContent` (secret in a bad ref → 400, beside a valid ref under the non-redacted `note` → 204, and in a body still open at the 1 KiB cap → 413; absent from the log and all three bodies). 16 added the `note` and 413 cases: the old secret sat only under `signature`, which the redactor masks, so a handler logging ignored members by key passed it (mutant caught by the new test, passed by the old).
 - [x] **AC10 Schema readiness:** a gateway on a schema older than its code needs reports not-ready and answers 503, never 500 (CI test on a real database). *(Added at 14a's planning, Ivan, 2026-11-12: AC7 only says `/readyz` responds.)* **✅ 2026-11-13:** `TestWireSettlement_SkewNotReadyThenMigrated` green in the PR's CI `test` job (Ivan); ticked on the branch before merge.
-- [ ] **AC9 Spec export:** `make export-docs` copies this spec into `docs/specs/` with a hash stamp (ADR-107), so PR review can see it. *Evidence (16, 2026-11-18), tick once the PR's CI is green (Ivan):* `make export-docs` stamps `source-sha256`/`content-sha256`; `check-docs` runs inside `make lint`, so CI fails a stale or hand-edited export; exporter tests in `scripts/test_export_docs.py` run in `make test`. Met in substance since subtask 2.
+- [x] **AC9 Spec export:** **✅ 2026-11-19:** PR #48 CI green (`check-docs` in `lint`, exporter tests in `test`). `make export-docs` copies this spec into `docs/specs/` with a hash stamp (ADR-107), so PR review can see it. *Evidence (16, 2026-11-18), ticked 2026-11-19 after green CI:* `make export-docs` stamps `source-sha256`/`content-sha256`; `check-docs` runs inside `make lint`, so CI fails a stale or hand-edited export; exporter tests in `scripts/test_export_docs.py` run in `make test`. Met in substance since subtask 2.
 
 ## Design notes
 **API:**
