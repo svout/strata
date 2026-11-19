@@ -45,7 +45,7 @@ lint: ## Lint every scaffolded service
 	@for s in $(PY_SERVICES); do \
 	  if [ -f $$s/pyproject.toml ]; then echo "== $$s"; (cd $$s && uv run ruff check .); fi; \
 	done
-	@if [ -f console/package.json ]; then echo "== console"; (cd console && pnpm install --frozen-lockfile && pnpm lint); fi
+	@if [ -f console/package.json ]; then echo "== console"; (cd console && npm ci --no-audit --no-fund && npm run lint); fi
 	@echo "== scripts"; python3 -m py_compile scripts/*.py scripts/chaos/*.py
 	@if [ -f infra/compose/compose.yml ]; then \
 	  echo "== compose"; \
@@ -72,7 +72,7 @@ test: ## Run every scaffolded service's tests (Go test cache allowed: inner loop
 	@for s in $(PY_SERVICES); do \
 	  if [ -f $$s/pyproject.toml ]; then echo "== $$s"; (cd $$s && uv run pytest) || [ $$? -eq 5 ]; fi; \
 	done
-	@if [ -f console/package.json ]; then echo "== console"; (cd console && pnpm install --frozen-lockfile && pnpm test); fi
+	@if [ -f console/package.json ]; then echo "== console"; (cd console && npm ci --no-audit --no-fund && npm test); fi
 	@echo "== scripts"; python3 -m unittest discover -s scripts -p 'test_*.py'
 
 # A gate must not pass with every integration test skipped: with Docker down,

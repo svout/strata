@@ -49,18 +49,16 @@ jobs:
         if: hashFiles('control-plane/pyproject.toml', 'harness/pyproject.toml') != ''
         uses: astral-sh/setup-uv@v6
 
-      - name: Set up pnpm
-        if: hashFiles('console/package.json') != ''
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
+      # npm, not pnpm (Technology Choices, amended 2026-11-19): the console's
+      # package-lock.json is the lock its tests passed against. npm ci
+      # installs exactly that lock and fails if package.json disagrees.
       - name: Set up Node
         if: hashFiles('console/package.json') != ''
         uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: console/pnpm-lock.yaml
+          node-version-file: console/.nvmrc # the single Node pin, local and CI (ADR-116)
+          cache: npm
+          cache-dependency-path: console/package-lock.json
 
       - name: Lint (make lint)
         run: make lint
@@ -82,18 +80,16 @@ jobs:
         if: hashFiles('control-plane/pyproject.toml', 'harness/pyproject.toml') != ''
         uses: astral-sh/setup-uv@v6
 
-      - name: Set up pnpm
-        if: hashFiles('console/package.json') != ''
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
+      # npm, not pnpm (Technology Choices, amended 2026-11-19): the console's
+      # package-lock.json is the lock its tests passed against. npm ci
+      # installs exactly that lock and fails if package.json disagrees.
       - name: Set up Node
         if: hashFiles('console/package.json') != ''
         uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: console/pnpm-lock.yaml
+          node-version-file: console/.nvmrc # the single Node pin, local and CI (ADR-116)
+          cache: npm
+          cache-dependency-path: console/package-lock.json
 
       # Explicitly uncached: today's cold runner cache is incidental, and if a
       # cache were ever restored between runs a false green would merge.

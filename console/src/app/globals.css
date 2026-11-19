@@ -1,0 +1,324 @@
+/*
+ * Strata design tokens → Tailwind v4 theme + CSS variables.
+ * Same tokens as strata-marketing/src/app/globals.css (source of truth: vault
+ * "Design/Design Tokens.md"). Change both repos together.
+ *
+ * Layer order: MUI (Emotion) styles go into `mui`, before Tailwind's
+ * utilities, so a className always beats a MUI default without !important.
+ */
+@layer theme, base, mui, components, utilities;
+@import "tailwindcss";
+
+/* Dark mode is a class on <html> (set from the user menu), not the OS. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+@theme {
+  --font-sans: "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Primitives */
+  --color-cobalt-50: #f0f3ff;
+  --color-cobalt-100: #dce4ff;
+  --color-cobalt-200: #b9c8ff;
+  --color-cobalt-300: #8fa6ff;
+  --color-cobalt-400: #5e80ff;
+  --color-cobalt-500: #2b59ff;
+  --color-cobalt-600: #2249e8;
+  --color-cobalt-700: #1a38bf;
+  --color-cobalt-900: #0f1f66;
+  --color-ink: #0b0d12;
+  --color-stone: #e9e7e1;
+  --color-paper: #f7f6f2;
+  --color-graphite: #2a2d35;
+  --color-slate: #55575e;
+  --color-mist: #a3a6ae;
+  --color-amber: #f2c14e;
+  --color-mint: #3ccb9f;
+  --color-pattern-cobalt: #3a63ff;
+
+  /* Semantic, light mode */
+  --color-canvas: #f6f8fa;
+  --color-surface: #f6f8fa;
+  --color-elevated: #ffffff;
+  --color-line: #e3e8ee;
+  --color-line-soft: #ebeef1;
+  --color-fg: #1a1f36;
+  --color-fg-muted: #596171;
+  --color-fg-subtle: #687385;
+  --color-brand: #2b59ff;
+  --color-brand-hover: #2249e8;
+  --color-brand-subtle: #dce4ff;
+  --color-brand-faint: #f3f6ff;
+  --color-brand-on-subtle: #1a38bf;
+  --color-approve: #0e8a6a;
+  --color-review: #e0a100;
+  --color-block: #c4262e;
+  --color-approve-tint: #d7f7e8;
+  --color-approve-fg: #05684d;
+  --color-review-tint: #fcf0c9;
+  --color-review-fg: #8a4b00;
+  --color-block-tint: #ffe7ea;
+  --color-block-fg: #b3093c;
+  --color-recorded-tint: #f0f3ff;
+  --color-recorded-fg: #1a38bf;
+  --color-neutral-tint: #ebeef1;
+  --color-focus: #2b59ff;
+
+  /* Section colours: wayfinding only, never an outcome (src/lib/sections.ts).
+     Text values pass 4.5:1 on their tint and on white. */
+  --color-sec-monitor: #2249e8;
+  --color-sec-monitor-tint: #e6ecff;
+  --color-sec-control: #5b3ee0;
+  --color-sec-control-tint: #ede8ff;
+  --color-sec-record: #066a8c;
+  --color-sec-record-tint: #ddf2f8;
+  --color-sec-admin: #4a4c53;
+  --color-sec-admin-tint: #eeece6;
+  --color-sec-demo: #a3276f;
+  --color-sec-demo-tint: #fbe6f1;
+
+  /* Text styles (Design Tokens → Text styles); console sizes are fixed */
+  --text-h1: 1.5rem; /* page title, 24 */
+  --text-h1--line-height: 1.1;
+  --text-h1--letter-spacing: -0.01em;
+  --text-h1--font-weight: 700;
+  --text-h3: 1.5rem;
+  --text-h3--line-height: 1.2;
+  --text-h3--letter-spacing: -0.02em;
+  --text-body-lg: 1.0625rem;
+  --text-body-lg--line-height: 1.5;
+  --text-body-md: 0.875rem;
+  --text-body-md--line-height: 1.5;
+  --text-label: 0.8125rem;
+  --text-label--line-height: 1.4;
+  --text-overline: 0.6875rem;
+  --text-overline--line-height: 1.4;
+  --text-overline--letter-spacing: 0.06em;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 8px;
+  --radius-2xl: 8px;
+  --shadow-card: 0 1px 2px rgb(26 31 54 / 0.06);
+  --shadow-pop: 0 0 0 1px rgb(26 31 54 / 0.06), 0 8px 24px rgb(26 31 54 / 0.12);
+  --shadow-drawer: -12px 0 30px rgb(11 13 18 / 0.06);
+
+  --animate-fresh: fresh 2.4s ease-out;
+  --animate-pulse-dot: pulse-dot 2s infinite;
+  @keyframes fresh {
+    from { background-color: var(--color-brand-faint); }
+    to { background-color: transparent; }
+  }
+  @keyframes pulse-dot {
+    0% { box-shadow: 0 0 0 0 rgb(14 138 106 / 0.5); }
+    70% { box-shadow: 0 0 0 7px rgb(14 138 106 / 0); }
+    100% { box-shadow: 0 0 0 0 rgb(14 138 106 / 0); }
+  }
+}
+
+@layer base {
+  /* Dark mode: same layout, semantic tokens swap (MoodPlatform board). */
+  [data-theme="dark"] {
+    color-scheme: dark;
+    --color-canvas: #0e1117;
+    --color-surface: #0e1117;
+    --color-elevated: #161a22;
+    --color-line: #2a303c;
+    --color-line-soft: #222733;
+    --color-fg: #ffffff;
+    --color-fg-muted: #a3acb9;
+    --color-fg-subtle: #8b8e96;
+    --color-brand: #5e80ff;
+    --color-brand-hover: #8fa6ff;
+    --color-brand-subtle: #0f1f66;
+    --color-brand-faint: #13204d;
+    --color-brand-on-subtle: #b9c8ff;
+    --color-approve: #3ccb9f;
+    --color-review: #f2c14e;
+    --color-block: #ff7a7e;
+    --color-approve-tint: #10322a;
+    --color-approve-fg: #3ccb9f;
+    --color-review-tint: #3a2e0a;
+    --color-review-fg: #f2c14e;
+    --color-block-tint: #3b1518;
+    --color-block-fg: #ff7a7e;
+    --color-recorded-tint: #13204d;
+    --color-recorded-fg: #8fa6ff;
+    --color-neutral-tint: #23262e;
+    --color-sec-monitor: #8fa6ff;
+    --color-sec-monitor-tint: #16224d;
+    --color-sec-control: #b6a6ff;
+    --color-sec-control-tint: #251c4f;
+    --color-sec-record: #6fd0ee;
+    --color-sec-record-tint: #0c2f3b;
+    --color-sec-admin: #c4c6cc;
+    --color-sec-admin-tint: #2a2d35;
+    --color-sec-demo: #f39acb;
+    --color-sec-demo-tint: #3d1630;
+    --shadow-card: 0 8px 20px rgb(0 0 0 / 0.35);
+    --shadow-pop: 0 16px 40px rgb(0 0 0 / 0.5);
+    --shadow-drawer: -12px 0 30px rgb(0 0 0 / 0.35);
+  }
+
+  html,
+  body {
+    height: 100%;
+  }
+  body {
+    background: var(--color-elevated);
+    font-feature-settings: "tnum";
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-focus);
+    outline-offset: 2px;
+  }
+  .font-mono {
+    font-variant-numeric: tabular-nums;
+  }
+  h1, h2, h3 {
+    text-wrap: balance;
+  }
+}
+
+@layer components {
+  /* MUI surfaces follow the semantic tokens, so dialogs and menus work in dark mode */
+  .MuiPaper-root {
+    background-color: var(--color-elevated);
+    color: var(--color-fg);
+  }
+  .MuiDialog-paper {
+    border-radius: var(--radius-lg);
+  }
+  .MuiBackdrop-root:not(.MuiBackdrop-invisible) {
+    background-color: rgb(11 13 18 / 0.32);
+  }
+  .MuiMenuItem-root:hover {
+    background-color: var(--color-surface);
+  }
+
+  /* Shared field look (UI kit → Input): h40, r8, cobalt focus with halo */
+  .field {
+    height: 34px;
+    width: 100%;
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius-md);
+    box-shadow: 0 1px 1px rgb(26 31 54 / 0.04);
+    background: var(--color-elevated);
+    padding: 0 12px;
+    font-size: 14px;
+    color: var(--color-fg);
+  }
+  .field:focus {
+    outline: none;
+    border-color: var(--color-brand);
+    box-shadow: 0 0 0 3px var(--color-brand-subtle);
+  }
+  .field[aria-invalid="true"] {
+    border-color: var(--color-block);
+  }
+  .field:disabled {
+    opacity: 0.6;
+  }
+  select.field {
+    appearance: none;
+    padding-right: 32px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2355575e' stroke-width='2.5' stroke-linecap='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+  }
+  textarea.field {
+    height: auto;
+    padding: 10px 12px;
+  }
+
+  /* Data tables (UI kit → Table row): 44px rows, mono amounts right-aligned */
+  .data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  .data-table th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--color-elevated);
+    padding: 8px 14px;
+    text-align: left;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--color-fg-muted);
+    border-bottom: 1px solid var(--color-line);
+    white-space: nowrap;
+  }
+  .data-table td {
+    height: 40px;
+    padding: 0 14px;
+    border-bottom: 1px solid var(--color-line-soft);
+    white-space: nowrap;
+  }
+  .data-table tbody tr[data-href] {
+    cursor: pointer;
+  }
+  .data-table tbody tr[data-href]:hover td {
+    background: var(--color-surface);
+  }
+  .data-table tbody tr[aria-selected="true"] td {
+    background: var(--color-brand-faint);
+  }
+  .data-table tbody tr[aria-selected="true"] td:first-child {
+    box-shadow: inset 2px 0 0 var(--color-brand);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/*
+ * Charts (MUI X). Axis text, grid and tooltip follow the semantic tokens,
+ * so charts work in dark mode without per-chart colours.
+ */
+@layer components {
+  .strata-chart .MuiChartsAxis-tickLabel,
+  .strata-chart .MuiChartsAxis-tickLabel tspan {
+    fill: var(--color-fg-muted);
+    font-family: var(--font-sans);
+    font-size: 11px;
+  }
+  .strata-chart .MuiChartsAxis-line,
+  .strata-chart .MuiChartsAxis-tick {
+    stroke: var(--color-line);
+  }
+  .strata-chart .MuiChartsGrid-line {
+    stroke: var(--color-line-soft);
+  }
+  .strata-chart .MuiChartsAxisHighlight-root {
+    fill: var(--color-brand-faint);
+    stroke: var(--color-line);
+  }
+  .MuiChartsTooltip-root .MuiChartsTooltip-paper,
+  .MuiChartsTooltip-paper {
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-pop);
+    font-family: var(--font-sans);
+  }
+  .MuiChartsTooltip-root td,
+  .MuiChartsTooltip-root th,
+  .MuiChartsTooltip-table td,
+  .MuiChartsTooltip-table th {
+    color: var(--color-fg);
+    font-size: 12.5px;
+  }
+}
