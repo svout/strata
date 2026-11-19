@@ -61,8 +61,16 @@ func newRouter(log *slog.Logger, timeout time.Duration, checks ...ReadyCheck) *c
 // gateway's mounts are wrapped (the gates, the rate limiter). Even a
 // directly mounted *chi.Mux would get the parent's 405 handler, which
 // looks up the parent's routes, not its own.
+//
+// It also answers HEAD as GET on a path that has a GET route and no HEAD
+// route (SPEC-002 17, RFC 9110 §9.3.2). getHead is added first, so on
+// NewRouter's own router it runs outside the request ID, the log and the
+// recoverer. It only looks up routes and rewrites the routing method,
+// writing nothing, so nothing it does needs the request ID or the log, and
+// the lookups are the ones chi itself makes on every request.
 func NewSubRouter() *chi.Mux {
 	r := chi.NewRouter()
+	r.Use(getHead(r))
 	r.NotFound(notFound)
 	r.MethodNotAllowed(methodNotAllowed(r))
 	return r
@@ -74,8 +82,9 @@ func notFound(w http.ResponseWriter, _ *http.Request) {
 
 // servedMethods are the methods the gateway knows: the ones it routes (GET,
 // POST) and HEAD, which RFC 9110 §9.1 requires a general-purpose server to
-// support. It is a fixed list, not inferred from the routes (SPEC-002 15a):
-// a route for any other method would never be reached, and
+// support and getHead answers as GET. It is a fixed list, not inferred
+// from the routes (SPEC-002 15a): a route for any other method would never
+// be reached, and
 // TestOpenAPI_UnmatchedGetProblems fails if the spec documents one.
 // OPTIONS is left out on purpose: the API is server to server, so there is
 // no browser preflight to answer.
@@ -99,27 +108,64 @@ func knownMethods(next http.Handler) http.Handler {
 	})
 }
 
+// getHead routes a HEAD request as GET when mx has a GET route for the path
+// and no HEAD route of its own; net/http then drops the body and keeps
+// GET's headers. chi's middleware.GetHead is not used: it looks the path up
+// in rctx.Routes, which chi sets only at the root router and a mount never
+// resets, so it always consults the root's routes. On the root it then
+// leaves HEAD /v1/payments/{id} a 405 (the mount's catch-all matches HEAD);
+// in a sub-router it checks the mount-relative path against the root, so
+// it ignores the sub-router's own HEAD routes and works only while no root
+// route happens to match. Looking up mx itself, as methodNotAllowed does,
+// is right at every level. A path with no GET route is left alone, so it
+// gets its own 404 or 405.
+func getHead(mx *chi.Mux) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodHead {
+				path := routePath(r)
+				if mx.Find(chi.NewRouteContext(), http.MethodHead, path) == "" &&
+					mx.Find(chi.NewRouteContext(), http.MethodGet, path) != "" {
+					// routeHTTP routes on RouteMethod when it is set; a parent
+					// router may already have set it to HEAD, so set it here.
+					chi.RouteContext(r.Context()).RouteMethod = http.MethodGet
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// routePath is the path chi routes on: RoutePath inside a mount, else the
+// URL's, and "/" for an empty one, as in chi's routeHTTP.
+func routePath(r *http.Request) string {
+	if rctx := chi.RouteContext(r.Context()); rctx != nil && rctx.RoutePath != "" {
+		return rctx.RoutePath
+	}
+	if r.URL.RawPath != "" {
+		return r.URL.RawPath
+	}
+	if r.URL.Path == "" {
+		return "/"
+	}
+	return r.URL.Path
+}
+
 // methodNotAllowed answers 405 with Allow listing the servedMethods mx
-// serves on the request's path. chi computes that list for its own 405 but
-// doesn't pass it to a custom handler, so it is found again here, one Find
-// per method; that runs only on a 405. The path is the one chi routed on:
-// RoutePath inside a mount, else the URL's, as in chi's routeHTTP. An
-// empty Allow is legal (RFC 9110 §10.2.1) but tells the client nothing, and
-// SPEC-002 15a rules it out, so if none is found (a route registered for a
-// method outside servedMethods, which knownMethods makes unreachable) the
-// answer is a 404.
+// serves on the request's path, HEAD included wherever GET is (getHead
+// answers it). chi computes that list for its own 405 but doesn't pass it
+// to a custom handler, so it is found again here, one Find per method; that
+// runs only on a 405. An empty Allow is legal (RFC 9110 §10.2.1) but tells
+// the client nothing, and SPEC-002 15a rules it out, so if none is found (a
+// route registered for a method outside servedMethods, which knownMethods
+// makes unreachable) the answer is a 404.
 func methodNotAllowed(mx *chi.Mux) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-		if r.URL.RawPath != "" {
-			path = r.URL.RawPath
-		}
-		if rctx := chi.RouteContext(r.Context()); rctx != nil && rctx.RoutePath != "" {
-			path = rctx.RoutePath
-		}
+		path := routePath(r)
+		served := func(m string) bool { return mx.Find(chi.NewRouteContext(), m, path) != "" }
 		var allow []string
 		for _, m := range servedMethods {
-			if mx.Find(chi.NewRouteContext(), m, path) != "" {
+			if served(m) || (m == http.MethodHead && served(http.MethodGet)) {
 				allow = append(allow, m)
 			}
 		}

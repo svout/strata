@@ -88,8 +88,11 @@ func TestOpenAPI_RoutesMatchMounted(t *testing.T) {
 //     try_again_later with Retry-After;
 //   - once open, GET, HEAD or POST on a documented path that doesn't take
 //     it is a 405 method_not_allowed whose Allow is exactly the spec's
-//     methods there (also with a trailing slash on /v1/payments, which
-//     chi's Mount routes to the same handler);
+//     methods there, plus HEAD wherever GET is (also with a trailing slash
+//     on /v1/payments, which chi's Mount routes to the same handler);
+//   - HEAD on a documented GET path is answered as GET (SPEC-002 17), so it
+//     is not probed here, where it would reach a handler;
+//     TestMountedAPIs_HeadServedAsGet pins it on every such path.
 //   - GET, HEAD or POST on an undocumented path is a 404 not_found.
 //
 // served repeats httpx's fixed list on purpose: it is the contract, and a
@@ -112,6 +115,11 @@ func TestOpenAPI_UnmatchedGetProblems(t *testing.T) {
 			t.Errorf("%s documents %s, which the gateway answers with 501", specPath, op)
 		}
 		byPath[path] = append(byPath[path], method)
+		// HEAD is answered wherever GET is. The spec can't list it:
+		// no route registers HEAD, so TestOpenAPI_RoutesMatchMounted would fail.
+		if method == http.MethodGet {
+			byPath[path] = append(byPath[path], http.MethodHead)
+		}
 	}
 	// Two unrecognised methods, then every standard one outside served.
 	unserved := []string{"PROPFIND", "FOO", http.MethodConnect}
