@@ -48,17 +48,17 @@ var fakeStepChoices = []rail.Step{{}, {Outcome: rail.Declined}, {Outcome: rail.P
 type conservationKind int
 
 const (
-	conservationCreate     conservationKind = iota // a new payment, on a drawn service
-	conservationReplay                             // the same key again; nothing new may happen
-	conservationMarkFailed                         // a created payment fails
-	conservationResolve                            // a pending fake operation finishes
-	conservationHint                               // a rail webhook names a payment (ADR-124)
-	conservationRecover                            // a recovery pass
-	conservationFinish                             // an answer delivered a second time
+	conservationCreate      conservationKind = iota // a new payment, on a drawn service
+	conservationReplay                              // the same key again; nothing new may happen
+	conservationFailCreated                         // failing a created payment is refused
+	conservationResolve                             // a pending fake operation finishes
+	conservationHint                                // a rail webhook names a payment (ADR-124)
+	conservationRecover                             // a recovery pass
+	conservationFinish                              // an answer delivered a second time
 )
 
 func (k conservationKind) String() string {
-	return [...]string{"create", "replay", "mark failed", "resolve", "hint", "recover", "finish"}[k]
+	return [...]string{"create", "replay", "fail created", "resolve", "hint", "recover", "finish"}[k]
 }
 
 // conservationOp is one drawn operation, drawn whole before it is applied so
@@ -76,7 +76,7 @@ type conservationOp struct {
 var conservationOpGen = rapid.Custom(func(t *rapid.T) conservationOp {
 	return conservationOp{
 		kind: rapid.SampledFrom([]conservationKind{
-			conservationCreate, conservationCreate, conservationCreate, conservationReplay, conservationMarkFailed,
+			conservationCreate, conservationCreate, conservationCreate, conservationReplay, conservationFailCreated,
 			conservationResolve, conservationHint, conservationRecover, conservationFinish,
 		}).Draw(t, "kind"),
 		amount:  rapid.Int64Range(1, 1_000_000).Draw(t, "amount"),
@@ -102,7 +102,6 @@ type modelPayment struct {
 	key    string
 	input  CreateInput
 	source string // onInternal, onFake or onNoRail
-	marked bool   // MarkFailed was called on it
 }
 
 // The property runs once per rail, in parallel, each on its own database, to
@@ -246,7 +245,7 @@ func testMoneyConservation(t *testing.T, onRail string) {
 		}
 		anyPayment := func(*modelPayment) bool { return true }
 		onARail := func(p *modelPayment) bool { return p.source != onNoRail }
-		failable := func(p *modelPayment) bool { return p.source == onNoRail && !p.marked }
+		noRail := func(p *modelPayment) bool { return p.source == onNoRail }
 		isFake := func(p *modelPayment) bool { return p.source == onFake }
 
 		submit := func(s *Service, key string, in CreateInput) CreateResult {
@@ -268,8 +267,8 @@ func testMoneyConservation(t *testing.T, onRail string) {
 			switch o.kind {
 			case conservationReplay, conservationHint:
 				p = choose(o.pick, anyPayment)
-			case conservationMarkFailed:
-				p = choose(o.pick, failable)
+			case conservationFailCreated:
+				p = choose(o.pick, noRail)
 			case conservationResolve:
 				p = choose(o.pick, isFake)
 			case conservationFinish:
@@ -302,16 +301,15 @@ func testMoneyConservation(t *testing.T, onRail string) {
 				if !res.Replayed || res.PaymentID != p.id {
 					rt.Fatalf("replay of %s: replayed=%v id=%s, want the stored answer for %s", p.key, res.Replayed, res.PaymentID, p.id)
 				}
-			case conservationMarkFailed:
-				// Created payments only: MarkFailed can also fail a settling
-				// payment without asking the rail, which after the internal
-				// rail's posting would be a failed payment whose money moved.
-				// Nothing in the service does that (finish calls it only on a
-				// rail's answer).
-				if _, err := goodInternal.MarkFailed(ctx, p.id, FailureDeclined); err != nil {
-					rt.Fatalf("MarkFailed: %v", err)
+			case conservationFailCreated:
+				// A payment that never reached a rail can't be failed: the
+				// only path to failed is the rail's answer (SPEC-002 19).
+				// A settling payment isn't drawn here, because failing one
+				// is what a rail's answer does, which the other operations
+				// cover through the rail.
+				if err := goodInternal.markFailedByRail(ctx, p.id, FailureDeclined); !errors.Is(err, ErrInvalidTransition) {
+					rt.Fatalf("markFailedByRail on created payment %s = %v, want ErrInvalidTransition", p.id, err)
 				}
-				p.marked = true
 			case conservationResolve:
 				if err := fake.Resolve(ctx, rail.Ref(p.id), o.outcome, ""); err != nil && !errors.Is(err, rail.ErrNotPending) && !errors.Is(err, rail.ErrUnknownRef) {
 					rt.Fatalf("Resolve: %v", err)
@@ -431,10 +429,10 @@ func testMoneyConservation(t *testing.T, onRail string) {
 				if entries != 0 || moves != 0 {
 					rt.Errorf("%s %s payment %s: %d entries, %d fake moves; want none", got.State, p.source, p.id, entries, moves)
 				}
-				// Only a payment with no rail stays created, and only
-				// MarkFailed fails one.
-				if p.source == onNoRail && (got.State == Failed) != p.marked {
-					rt.Errorf("no-rail payment %s is %s, marked failed = %v", p.id, got.State, p.marked)
+				// Only a payment with no rail stays created, and nothing
+				// fails one: there is no path from created to failed.
+				if p.source == onNoRail && got.State != Created {
+					rt.Errorf("no-rail payment %s is %s, want created", p.id, got.State)
 				}
 				if p.source != onNoRail && got.State == Created {
 					rt.Errorf("%s payment %s is still created", p.source, p.id)
@@ -476,8 +474,9 @@ func testMoneyConservation(t *testing.T, onRail string) {
 		t.Errorf("ran %d operations, want at least %d (AC1)", ops, conservationMinOps)
 	}
 	// Coverage guard: a property that never reaches an outcome proves nothing
-	// about it.
-	for _, k := range []string{onRail + "/settled", onRail + "/failed", "none/created", "none/failed"} {
+	// about it. (No "none/failed": a payment with no rail can't fail, which the
+	// drain check above pins.)
+	for _, k := range []string{onRail + "/settled", onRail + "/failed", "none/created"} {
 		if finals[k] == 0 {
 			t.Errorf("no payment ended as %s; the property isn't exercising it", k)
 		}

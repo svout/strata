@@ -340,21 +340,18 @@ func (s *Service) MarkSettling(ctx context.Context, id uuid.UUID, railRef string
 	return transition(ctx, s.pool, id, Settling, &railRef, nil)
 }
 
-// MarkFailed moves a created or settling payment to failed, recording why.
-// An unknown reason is ErrInvalidFailureReason, checked before the database,
-// so it never surfaces as a raw CHECK violation naming the table.
-func (s *Service) MarkFailed(ctx context.Context, id uuid.UUID, reason FailureReason) (Payment, error) {
-	if reason != FailureDeclined && reason != FailureInvalidRequest {
-		return Payment{}, ErrInvalidFailureReason
-	}
-	return transition(ctx, s.pool, id, Failed, nil, &reason)
-}
-
 // from lists the states each target may be reached from. Every edge moves
 // forward; settled and failed are terminal. A same-state call is not an edge,
 // so it fails with ErrInvalidTransition (subtask 10 decides how to treat it).
+//
+// Failed is reached only from settling, through markFailedByRail (settle.go).
+// No exported method fails a payment directly: CreateIdempotent, Recover and
+// Webhook reach it only on the rail's answer (SPEC-002 19, Ivan 2026-11-20;
+// the method set is pinned by TestService_ExportedMethods). created → failed
+// has no caller yet: P2 adds that edge, its own reason value and its
+// migration with the caller that needs it, if it needs one.
 var from = map[State][]State{
 	Settling: {Created},
 	Settled:  {Settling},
-	Failed:   {Created, Settling},
+	Failed:   {Settling},
 }

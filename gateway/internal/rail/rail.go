@@ -10,8 +10,8 @@
 //     response, a crash) means the outcome is unknown: the money may have
 //     moved. The caller leaves the payment settling and asks Status(ref)
 //     later. Only an explicit Declined result means nothing moved, and only it
-//     may lead to payments.MarkFailed. Treating a timeout as a failure is how
-//     a settled payment gets retried into a second one.
+//     may lead to a failed payment. Treating a timeout as a failure is how a
+//     settled payment gets retried into a second one.
 //   - The one exception is ErrInvalidRequest: the request is wrong in itself,
 //     nothing was attempted, and it fails the same way every time. Retrying
 //     it forever is a bug, not caution; the caller decides how to end it

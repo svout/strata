@@ -356,24 +356,27 @@ func TestRecover_OwnRailOnly(t *testing.T) {
 	}
 }
 
-// MarkFailed rejects a reason that isn't one of the two before the
+// markFailedByRail rejects a reason that isn't one of the two before the
 // database sees it (review should 3): no raw CHECK violation, and the
-// payment is unchanged.
-func TestMarkFailed_RejectsUnknownReason(t *testing.T) {
+// settling payment is unchanged.
+func TestMarkFailedByRail_RejectsUnknownReason(t *testing.T) {
 	t.Parallel()
 	pool := testutil.Postgres(t)
 	svc := New(pool)
 	p, err := svc.create(t.Context(), CreateInput{Amount: 1250, Currency: Currency,
 		PayerAccountID: newAccount(t.Context(), t, pool), PayeeAccountID: newAccount(t.Context(), t, pool)})
+	if err == nil {
+		_, err = svc.MarkSettling(t.Context(), p.ID, "rail-ref")
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, reason := range []FailureReason{"", "timeout", "Declined"} {
-		if _, err := svc.MarkFailed(t.Context(), p.ID, reason); !errors.Is(err, ErrInvalidFailureReason) {
-			t.Errorf("MarkFailed(%q) = %v, want ErrInvalidFailureReason", reason, err)
+		if err := svc.markFailedByRail(t.Context(), p.ID, reason); !errors.Is(err, ErrInvalidFailureReason) {
+			t.Errorf("markFailedByRail(%q) = %v, want ErrInvalidFailureReason", reason, err)
 		}
 	}
-	assertState(t, svc, p.ID, Created, nil)
+	assertState(t, svc, p.ID, Settling, nil)
 }
 
 // When another writer finishes the payment while the rail is answering, the
@@ -394,11 +397,16 @@ func TestSettle_FirstWriterWins(t *testing.T) {
 			pool := testutil.Postgres(t)
 			tc.r.Adapter = rail.NewFake(pool)
 			svc, logs := newSettleService(t, pool, tc.r)
-			// The other writer: the payment is failed (declined) while the
-			// rail call is in progress.
+			// The other writer: another settle attempt's finish records a
+			// decline while this one's rail call is in progress.
 			tc.r.onSettle = func(req rail.Request) {
-				if _, err := svc.MarkFailed(t.Context(), req.PaymentID, FailureDeclined); err != nil {
-					t.Errorf("MarkFailed: %v", err)
+				p, err := svc.Get(t.Context(), req.PaymentID)
+				if err != nil {
+					t.Errorf("Get: %v", err)
+					return
+				}
+				if got := svc.finish(t.Context(), p, Failed, FailureDeclined); got != outcomeFailed {
+					t.Errorf("other writer's finish = %v, want outcomeFailed", got)
 				}
 			}
 			res := createFor(t, svc, "k", newAccount(t.Context(), t, pool), newAccount(t.Context(), t, pool))
