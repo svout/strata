@@ -277,6 +277,23 @@ func (s *Service) markSettled(ctx context.Context, id uuid.UUID) error {
 	})
 }
 
+// markFailedByRail moves a settling payment to failed, recording why. Its
+// only non-test caller is finish, which apply calls on the rail's answer
+// (Declined, or ErrInvalidRequest), never on an error whose outcome is
+// unknown (ADR-120 §3; ErrInvalidRequest is SPEC-002 10a-i's exception). It
+// is unexported for the same kind of reason as markSettled: an exported path
+// to failed that doesn't go through the rail is how a payment whose money
+// moved gets marked failed (SPEC-002 19). An unknown reason is
+// ErrInvalidFailureReason, checked before the database, so it never surfaces
+// as a raw CHECK violation naming the table.
+func (s *Service) markFailedByRail(ctx context.Context, id uuid.UUID, reason FailureReason) error {
+	if reason != FailureDeclined && reason != FailureInvalidRequest {
+		return ErrInvalidFailureReason
+	}
+	_, err := transition(ctx, s.pool, id, Failed, nil, &reason)
+	return err
+}
+
 // finish moves p to settled or failed. If another settle attempt got there
 // first, the transition is refused (ErrInvalidTransition) and the first
 // writer wins: the payment keeps what was recorded first. The same final
@@ -290,7 +307,7 @@ func (s *Service) finish(ctx context.Context, p Payment, to State, reason Failur
 	if to == Settled {
 		err = s.markSettled(ctx, p.ID)
 	} else {
-		_, err = s.MarkFailed(ctx, p.ID, reason)
+		err = s.markFailedByRail(ctx, p.ID, reason)
 	}
 	if errors.Is(err, ErrInvalidTransition) {
 		cur, gerr := s.Get(ctx, p.ID)

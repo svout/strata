@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -323,7 +325,7 @@ func countPayments(ctx context.Context, t interface{ Fatal(...any) }, pool *pgxp
 var rank = map[State]int{Created: 0, Settling: 1, Settled: 2, Failed: 2}
 
 // pathTo lists the legal steps from created to each state.
-var pathTo = map[State][]State{Created: nil, Settling: {Settling}, Settled: {Settling, Settled}, Failed: {Failed}}
+var pathTo = map[State][]State{Created: nil, Settling: {Settling}, Settled: {Settling, Settled}, Failed: {Settling, Failed}}
 
 func terminal(s State) bool { return s == Settled || s == Failed }
 
@@ -336,7 +338,9 @@ func allowed(start, to State) bool {
 	case Settled:
 		return start == Settling
 	case Failed:
-		return start == Created || start == Settling
+		// Not from created: a payment fails only on the rail's answer
+		// (SPEC-002 19).
+		return start == Settling
 	}
 	return false
 }
@@ -350,7 +354,32 @@ func apply(ctx context.Context, svc *Service, id uuid.UUID, to State) (Payment, 
 		// the state machine test reaches behind the API on purpose.
 		return transition(ctx, svc.pool, id, Settled, nil, nil)
 	default:
-		return svc.MarkFailed(ctx, id, FailureDeclined)
+		// Likewise unexported: outside tests, only finish fails a payment,
+		// on the rail's answer.
+		if err := svc.markFailedByRail(ctx, id, FailureDeclined); err != nil {
+			return Payment{}, err
+		}
+		return svc.Get(ctx, id)
+	}
+}
+
+// The exported methods of *Service, pinned. None of them moves a payment to
+// settled or failed by itself: CreateIdempotent, Recover and Webhook reach
+// markSettled and markFailedByRail only on the rail's answer (SPEC-002
+// 10a-ii-a2 and 19). A new exported method fails this test on purpose, so its
+// review asks whether it opens a path to a final state that doesn't go through
+// the rail. The list is not a claim that every method on it is safe:
+// MarkSettling takes any railRef, which is open question 14.
+func TestService_ExportedMethods(t *testing.T) {
+	t.Parallel()
+	want := []string{"CreateIdempotent", "Get", "Handler", "MarkSettling", "Recover", "Webhook", "WebhookShed"}
+	typ := reflect.TypeFor[*Service]()
+	var got []string
+	for i := range typ.NumMethod() {
+		got = append(got, typ.Method(i).Name)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("exported methods of *Service = %v, want %v", got, want)
 	}
 }
 
